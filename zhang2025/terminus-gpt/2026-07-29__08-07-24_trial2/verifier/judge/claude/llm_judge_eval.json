@@ -1,0 +1,226 @@
+{
+    "1-a": {
+        "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI scans the filesystem for _ibl_trials.table.pqt files to discover sessions, then loads data from local ALF-format files (spikes, wheel, camera, trial tables). This matches the reference approach of loading IBL ONE cache data, adapted appropriately for direct filesystem access rather than using the ONE API. The reference code also loads from a local cache. All 461 sessions are discovered and processed.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The find_sessions() function correctly discovers session directories by searching for trial table files and walking up to the 'alf' parent. The process_session() function loads all required data types (trials, spikes, wheel, motion energy) per session."
+    },
+    "1-b": {
+        "question": "How are the data split into subjects (mice)?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Subject identity is extracted from the filesystem path, following IBL convention (lab/Subjects/<subject>/<date>/<number>). The reference code also derives subject identity from session metadata. The AI correctly identifies 141 subjects.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "session_path.parts[-3] correctly extracts the subject name from the IBL path structure. The subjects list and subject_idx mapping in build_dataset() are correctly constructed."
+    },
+    "1-c": {
+        "question": "How are the data split into sessions?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Each unique filesystem path (subject/date/number) becomes one session entry. This matches the reference approach where each eid corresponds to one session. 461 sessions are processed, matching the paper's count of 459 sessions (minor difference likely due to slightly different inclusion criteria).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "Sessions are processed one at a time and appended to the processed list. Each becomes one entry in the neural/input/output lists in the final dataset."
+    },
+    "1-d": {
+        "question": "How are the data split into trials?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Each row in the _ibl_trials.table.pqt parquet file is treated as one trial. This matches the IBL data architecture where each row in the trials table represents one trial.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "pd.read_parquet correctly loads the trial table, and each row becomes one trial after filtering."
+    },
+    "1-e": {
+        "question": "How are trials filtered based on quality controls?",
+        "decision_correctness": "INCORRECT",
+        "decision_correctness_justification": "The AI only filters trials where stimOn_times is NaN, choice is not in {-1, 1}, or probabilityLeft is NaN. The reference code (load_trials_and_mask) additionally filters based on: (1) reaction time constraints (0.08s <= firstMovement_times - stimOn_times <= 2.0s), (2) NaN values in feedback_times, firstMovement_times, and feedbackType. The paper's methods explicitly state 'trials were excluded if one of the following trial events could not be detected: choice, probabilityLeft, feedbackType, feedback times, stimON times and firstMovement times' and 'if the time between stimulus onset and the first movement of the wheel were outside the range of 0.08-2.00s'. These missing filters are significant and will include trials that should have been excluded.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements the AI's stated decision (filtering on stimOn_times, choice, probabilityLeft). The additional zero-neural-activity filter is also correctly implemented. The code matches what the AI intended, even though the intended filtering is incomplete relative to the reference."
+    },
+    "2-a": {
+        "question": "What variables in the raw data is the `neural` data derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Neural data is derived from spikes.times.npy and spikes.clusters.npy, with quality filtering from clusters.metrics.pqt and brain region mapping from clusters.channels.npy and channel brain location arrays. This matches the reference code which loads the same data via SpikeSortingLoader.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The load_curated_spikes function correctly loads spike times, spike clusters, and cluster metadata from each probe directory."
+    },
+    "2-b": {
+        "question": "How is the `neural` data processed?",
+        "decision_correctness": "INCORRECT",
+        "decision_correctness_justification": "The AI uses a time window of (-0.2, 1.0) with 20ms bins, producing 60 time bins per trial. The reference code uses time_window=(-0.5, 1.5) with binsize=0.02, producing T=100 time steps, as explicitly stated in the methods paper: 'Recordings are split into 2-s trials, each divided into 20-ms bins, producing T = 100 time steps.' The reference code in 0_data_caching.py sets params = {'binsize': 0.02, 'time_window': (-0.5, 1.5)}. This is a significant difference in the neural data coverage.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The bin_spikes_for_trials function correctly implements the AI's stated decision of binning spikes in 20ms bins from -0.2s to 1.0s. The binning logic using np.floor and np.add.at is correct."
+    },
+    "2-c": {
+        "question": "How is the `neural` data filtered based on quality controls?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI filters neurons using label >= 1 from clusters.metrics.pqt. The reference code uses qc=1 which filters on label >= 1 (via clusters_labeled['label'] >= qc). The label field in IBL encodes the combined result of the three quality criteria (amplitude, noise cutoff, refractory period violation) described in the paper. The additional noise_cutoff < 20 filter is redundant but not harmful. This effectively matches the reference approach.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The filtering code correctly checks label >= 1 and noise_cutoff < 20. The cluster remapping and spike masking logic correctly selects only spikes belonging to kept clusters."
+    },
+    "2-d": {
+        "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Neural data is aligned to stimulus onset (stimOn_times), which is what the instructions specify. The reference code also uses align_time='stimOn_times' for choice and prior decoding.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code passes trials['stimOn_times'].to_numpy() to bin_spikes_for_trials, which subtracts each trial's stimulus onset time from spike times before binning."
+    },
+    "2-e": {
+        "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The 20ms bin size matches the reference code (binsize=0.02). However, the time window (-0.2 to 1.0, producing 60 bins) differs substantially from the reference (-0.5 to 1.5, producing 100 bins). While the bin size is correct, the reduced time window means 40% less temporal coverage than the reference. The methods paper explicitly states T=100 time steps. No temporal rebinning is applied, which is correct.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements 20ms bins from -0.2 to 1.0. The arange and bin computation logic is correct."
+    },
+    "3-a": {
+        "question": "What variables in the raw data is `input` *Time since stimulus onset* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Time since stimulus onset is computed from the bin edges, which are defined relative to the alignment event (stimulus onset). This is a constructed variable rather than directly loaded from raw data, which is correct for representing elapsed time.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "Bin centers are correctly computed as midpoints of edges, producing values from approximately -0.19 to 0.99 seconds relative to stimulus onset."
+    },
+    "3-b": {
+        "question": "What processing is involved in computing `input` *Time since stimulus onset*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Bin centers are computed as the midpoints of consecutive bin edges. This is a straightforward and correct approach for representing time since stimulus onset as a continuous time-varying input.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The computation (edges[:-1] + edges[1:]) / 2 correctly produces bin center values."
+    },
+    "3-c": {
+        "question": "How is the `input` *Time since stimulus onset* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The same bin edges are used for both neural data and the time input, ensuring perfect temporal alignment by construction.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The same edges variable is used to compute neural bin centers and input time values."
+    },
+    "4-a": {
+        "question": "What variables in the raw data is `input` *Trial number in block* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Derived from the probabilityLeft column of the trial table. Block boundaries are detected as changes in probabilityLeft, and trials are counted within each block. This is a reasonable approach since the IBL task structure defines blocks by their probability of left stimulus.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "compute_trial_number_in_block correctly iterates through probabilityLeft values, resetting the counter when the value changes."
+    },
+    "4-b": {
+        "question": "What processing is involved in computing `input` *Trial number in block*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The counter starts at 1 for the first trial in each block and increments for consecutive trials with the same probabilityLeft. This produces a per-trial scalar replicated across time bins as a continuous input, matching the 'continuous, per-trial' specification.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The loop correctly detects block transitions and counts trials within blocks. The value is replicated using np.full_like for each time bin."
+    },
+    "5-a": {
+        "question": "What variables in the raw data is `output` *Choice* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Derived from the choice column of the trial table, consistent with the reference code which uses trials_df['choice'].",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "map_choice correctly accesses trials['choice'].to_numpy()."
+    },
+    "5-b": {
+        "question": "What processing is involved in computing `output` *Choice*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The IBL convention (choice=1 for left, choice=-1 for right) is correctly mapped to the instruction format (left=0, right=1). The result is replicated across all time bins as a per-trial categorical output.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "map_choice correctly maps 1->0 (left) and -1->1 (right). The output distribution shows roughly 50/50 split (0.506/0.494), which is consistent with the IBL task."
+    },
+    "6-a": {
+        "question": "What variables in the raw data is `output` *Prior probability of left* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Derived from the probabilityLeft column of the trial table, consistent with the reference code which uses trials_df['probabilityLeft'] (called 'block' in the reference).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "map_prior correctly accesses trials['probabilityLeft'].to_numpy()."
+    },
+    "6-b": {
+        "question": "What processing is involved in computing `output` *Prior probability of left*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The mapping 0.2->0, 0.5->1, 0.8->2 matches the instructions exactly. The output distribution (0.2: 0.417, 0.5: 0.140, 0.8: 0.443) is consistent with the IBL task structure where the first 90 trials are unbiased (0.5) and subsequent blocks alternate between 0.2 and 0.8.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "map_prior uses a dictionary mapping {0.2: 0, 0.5: 1, 0.8: 2} and correctly handles the three possible values. Values not in the dictionary map to -1, which would indicate data issues."
+    },
+    "9-a": {
+        "question": "What variables in the raw data is `output` *Wheel speed* derived from?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI loads raw _ibl_wheel.position.npy and _ibl_wheel.timestamps.npy. The reference code uses SessionLoader.load_wheel() which returns wheel data interpolated to a uniform sampling rate with velocity computed via Gaussian smoothing. Loading raw wheel position and manually differentiating produces different results than the reference approach which uses smoothed velocity. However, the raw data source (wheel position and timestamps) is fundamentally the same.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly loads wheel position and timestamps from the expected file paths."
+    },
+    "9-b": {
+        "question": "What processing is involved in computing `output` *Wheel speed*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI computes speed as abs(diff(position)/diff(timestamps)) - a raw finite difference without smoothing. The reference code uses SessionLoader.load_wheel() which computes velocity via Gaussian smoothing, then takes abs() for speed. The lack of smoothing in the AI's approach will produce noisier, more spike-prone speed estimates. While the fundamental computation (speed = |d(position)/dt|) is the same, the absence of Gaussian smoothing is a notable processing difference that could affect the quality of the discretized output.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly sorts timestamps, removes duplicates, computes finite differences, takes absolute values, and interpolates to trial bins. The midpoint timestamp computation is correct."
+    },
+    "9-c": {
+        "question": "How is `output` *Wheel speed* thresholded into categories?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI uses per-session tertile thresholds (33rd/67th percentiles) for discretization into 3 bins. The instructions say 'Wheel speed discretized into 3 bins, time-varying' but don't specify the discretization method. Per-session thresholds mean different speed values map to different bins across sessions, which could introduce inconsistency. The output distribution (0.418/0.291/0.291) deviates from equal thirds, likely because many speed values are near zero (wheel stationary), causing ties at the lower threshold. This is a reasonable but potentially suboptimal approach.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The tertile_thresholds function correctly computes 1/3 and 2/3 quantiles. The discretize_with_thresholds function correctly assigns categories based on these thresholds."
+    },
+    "9-d": {
+        "question": "How is `output` *Wheel speed* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Wheel speed is interpolated to the same bin centers as neural data, ensuring temporal alignment. Both are aligned to stimulus onset.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "interp_to_trial_bins correctly computes bin centers from edges and uses np.interp for linear interpolation at the correct absolute timestamps (stim_on + centers)."
+    },
+    "10-a": {
+        "question": "What variables in the raw data is `output` *Whisker motion energy* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Derived from leftCamera.ROIMotionEnergy.npy and/or rightCamera.ROIMotionEnergy.npy with corresponding camera timestamps. The reference code loads the same data via SessionLoader.load_motion_energy().",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The load_motion_energy function correctly searches for and loads motion energy and timestamp files for both cameras."
+    },
+    "10-b": {
+        "question": "What processing is involved in computing `output` *Whisker motion energy*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "When both left and right camera streams are available, the AI averages them. The reference code preferentially uses the left camera and falls back to right only if left is unavailable (via the 'skip' key check). Averaging both cameras is not wrong per se, but it differs from the reference approach. The paper describes computing whisker motion energy from left and right videos separately, and the reference code chooses one rather than averaging.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The averaging logic correctly vstack and mean the two interpolated streams. The interpolation to trial bins is correctly implemented."
+    },
+    "10-c": {
+        "question": "How is `output` *Whisker motion energy* thresholded into categories?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "Same per-session tertile approach as wheel speed. The output distribution (0.356/0.322/0.322) deviates from equal thirds. The instructions specify 3 bins but don't prescribe the thresholding method, so tertiles are a reasonable choice.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "Same tertile_thresholds and discretize_with_thresholds functions used, correctly implemented."
+    },
+    "10-d": {
+        "question": "How is `output` *Whisker motion energy* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Same approach as wheel speed: interpolated to neural bin centers, aligned to stimulus onset.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "interp_to_trial_bins correctly aligns whisker motion energy to the neural data time grid."
+    },
+    "11": {
+        "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI substitutes zeros for missing wheel or motion energy data rather than excluding those trials. The reference code (get_behavior_per_interval) creates a behavioral mask that marks trials with missing/bad behavioral data and excludes them via align_spike_behavior. Substituting zeros artificially inflates the 'low' category for wheel speed and whisker motion energy, which could affect decoder training. However, the overall approach of handling missing data gracefully (rather than crashing) is reasonable. The wheel timestamp deduplication and sorting is a good practice.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The fallback logic (zeros for missing data, try/except for session failures, deduplication for wheel timestamps) is correctly implemented and does not crash."
+    },
+    "12-a": {
+        "question": "What are the most time-consuming steps of the code?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Based on conversion output showing per-session times of 2-134 seconds, the bottlenecks are spike loading and binning, which involve loading large numpy arrays and iterating over trials. This is consistent with the reference code which uses multiprocessing to parallelize spike binning.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The timing output correctly captures per-session processing time, showing the expected variability based on session size."
+    },
+    "12-b": {
+        "question": "What loops in the code could have been vectorized to improve efficiency?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The spike cluster remapping loop, per-trial spike binning loop, and map_prior list comprehension could all be vectorized. The reference code uses multiprocessing for the most expensive operations (spike binning and behavior interpolation).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The identified loops are indeed non-vectorized and could be made more efficient. The code works correctly but suboptimally."
+    },
+    "12-c": {
+        "question": "What processing does the code repeat multiple times?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Bin center computation is repeated in each call to interp_to_trial_bins. Brain region name lookups use repeated list searches (O(n) per neuron instead of O(1) with a dict). These are minor inefficiencies.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The repeated computations produce correct results each time, just inefficiently."
+    },
+    "12-d": {
+        "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The brain region names are stored as CCF IDs (e.g., ccf_128) rather than meaningful anatomical names (e.g., CA1). This requires downstream users to perform their own mapping. The reference code uses BrainRegions().acronym2acronym() with Beryl mapping to produce interpretable region names. Per-trial values replicated across time bins increase data size but are handled by the downstream decoder.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly stores CCF IDs as region labels - it works but produces less useful region names than the reference."
+    }
+}
