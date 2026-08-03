@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent loads session metadata from `ophys_experiment_table.csv`, matches it to locally present NWB files, drops passive experiments, and then opens each NWB directly with `h5py`. Trials, stimulus presentations, neural events, running, and pupil data are then pulled from NWB groups on demand during a two-pass conversion.
+i. The agent loads session metadata from `project_metadata/ophys_experiment_table.csv`, intersects that with locally present NWB files, excludes metadata rows marked `passive`, and then opens each kept `behavior_ophys_experiment_<id>.nwb` file with `h5py`. It does this in two passes: one pass to collect global running and pupil statistics and a second pass to build the converted trials.
 
 ii. ```python
 def get_local_session_metadata(data_root: Path) -> list[SessionMeta]:
@@ -14,67 +14,59 @@ def get_local_session_metadata(data_root: Path) -> list[SessionMeta]:
 ```
 
 ```python
-with h5py.File(session.filepath, "r") as f:
-    trials = get_trial_table(f)
-    presentations = get_task_presentations(f)
-    ophys_time, events = get_neural_data(f)
-    running_time, running_speed = get_running_data(f)
-    pupil_time, pupil_diameter = get_pupil_data(f)
+for idx, session in enumerate(sessions, start=1):
+    with h5py.File(session.filepath, "r") as f:
+        ...
 ```
 
-iii. In `CONVERSION_NOTES.md`, the agent says it bypassed high-level AllenSDK loading because of an environment mismatch and instead mirrored the processed NWB contents directly with `h5py`.
+iii. `CONVERSION_NOTES.md` says the agent chose “local active experiment NWBs only,” treated the processed NWB contents as authoritative, and used a two-pass design to compute global quantile bins before conversion.
 
-## 1-b. How are the data split into subjects (mice)?
+## 1-b. How are the data split into subjects?
 
-i. Subjects are split by `mouse_id` from the experiment metadata table. The converted dataset stores unique sorted mouse IDs in `subjects`, and each converted session gets a `subject_idx`.
+i. Subjects are defined from the per-session `mouse_id` stored in metadata. The agent makes a sorted unique `subjects` list and a per-session `subject_idx`.
 
 ii. ```python
-SessionMeta(
-    ...
-    mouse_id=str(row.mouse_id),
-    ...
-)
-```
-
-```python
 subjects = sorted({session.mouse_id for session in kept_sessions})
 subject_to_idx = {subject: idx for idx, subject in enumerate(subjects)}
 ...
 subject_idx[idx - 1] = subject_to_idx[session.mouse_id]
 ```
 
-iii. The notes explicitly state that `mouse_id` from `ophys_experiment_table.csv` is the source for subject identity.
+iii. The notes say subject identity comes from `mouse_id` in `ophys_experiment_table.csv`, matching the Allen project metadata rather than being inferred from filenames or NWB internals.
 
 ## 1-c. How are the data split into sessions?
 
-i. The agent treats each local `behavior_ophys_experiment_<ophys_experiment_id>.nwb` file as one session. That means the converted session unit is an `ophys_experiment_id`, not a multi-plane `ophys_session_id`.
+i. Each local `ophys_experiment_id` NWB file is treated as one session in the output. Session order is the order of the filtered metadata rows, sorted by `ophys_experiment_id`.
 
 ii. ```python
-for row in exp_table.itertuples(index=False):
-    sessions.append(
-        SessionMeta(
-            ophys_experiment_id=int(row.ophys_experiment_id),
-            ophys_session_id=int(row.ophys_session_id),
-            ...
-            filepath=available_files[int(row.ophys_experiment_id)],
-        )
-    )
+available_files = {
+    int(path.stem.split("_")[-1]): path
+    for path in sorted(experiment_dir.glob("behavior_ophys_experiment_*.nwb"))
+}
+...
+exp_table = exp_table.sort_values("ophys_experiment_id")
 ```
 
-iii. In the notes, the agent justifies this as matching AllenSDK `BehaviorOphysExperiment` granularity: one imaging plane / one neuron set per file.
+```python
+for idx, session in enumerate(kept_sessions, start=1):
+    neural_trials, output_trials, brain_region_idx = convert_session(...)
+    neural_all.append(neural_trials)
+```
+
+iii. The notes justify this by matching the AllenSDK `BehaviorOphysExperiment` granularity: one imaging plane / one neuron set / one targeted structure per `ophys_experiment_id`.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are taken from the processed NWB `intervals/trials` table. Each retained trial is defined by the table’s `start_time` and `stop_time`, and a fixed 30 Hz grid is built inside those bounds.
+i. Trials come from the processed NWB `intervals/trials` table. After filtering, each remaining row becomes one trial, and the trial’s time axis is reconstructed from `start_time` to `stop_time`.
 
 ii. ```python
 def get_trial_table(f: h5py.File) -> pd.DataFrame:
     columns = [
-        "id", "start_time", "stop_time", "go", "catch",
-        "aborted", "auto_rewarded", "hit", "miss",
-        "false_alarm", "correct_reject", "change_time",
-        "initial_image_name", "change_image_name",
+        "id", "start_time", "stop_time", "go", "catch", "aborted",
+        "auto_rewarded", "hit", "miss", "false_alarm", "correct_reject",
+        "change_time", "initial_image_name", "change_image_name",
     ]
+    trials = read_interval_table(f["intervals"]["trials"], columns)
 ```
 
 ```python
@@ -82,14 +74,16 @@ for trial_idx, trial in trials.iterrows():
     centers = build_trial_bins(float(trial["start_time"]), float(trial["stop_time"]))
 ```
 
-iii. The notes say the NWB `trials` table is treated as the authoritative Allen-processed trial definition rather than reconstructing trials from lower-level logs.
+iii. The notes say the agent intentionally used the already processed Allen-style trial table instead of re-deriving trial structure from lower-level logs.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The agent keeps only `go` or `catch` trials, excludes `aborted` and `auto_rewarded`, skips sessions with fewer than 2 kept trials, and skips sessions lacking stimulus presentations or eye tracking.
+i. Trials are filtered to `(go | catch) & ~aborted & ~auto_rewarded`. Sessions are also skipped if they have fewer than two kept trials, lack task stimulus presentations, or lack eye tracking.
 
 ii. ```python
-trials = trials[(trials["go"] | trials["catch"]) & (~trials["aborted"]) & (~trials["auto_rewarded"])].copy()
+trials = trials[(trials["go"] | trials["catch"]) &
+                (~trials["aborted"]) &
+                (~trials["auto_rewarded"])].copy()
 if len(trials) < 2:
     continue
 ...
@@ -100,11 +94,11 @@ except KeyError as exc:
     print(f"... skip ...: {exc}")
 ```
 
-iii. `CONVERSION_NOTES.md` ties this to contingent-trial logic from AllenSDK and to the task requirement that pupil output is required, so sessions without eye tracking are dropped.
+iii. The notes justify the trial mask from Allen contingent-trial logic and the extra session filters from decoder-format constraints: at least two trials are required, and pupil output requires eye-tracking data.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` is derived from `processing/ophys/event_detection/data` with timestamps from `processing/ophys/event_detection/timestamps`.
+i. `neural` is derived from the NWB event-detection matrix and its timestamps, specifically `processing/ophys/event_detection/data` and `processing/ophys/event_detection/timestamps`.
 
 ii. ```python
 def get_neural_data(f: h5py.File) -> tuple[np.ndarray, np.ndarray]:
@@ -114,31 +108,29 @@ def get_neural_data(f: h5py.File) -> tuple[np.ndarray, np.ndarray]:
     return timestamps, events
 ```
 
-iii. The notes say the agent chose event traces because the paper’s neural analyses use extracted calcium events rather than raw fluorescence.
+iii. The notes explicitly say the agent chose event traces instead of dF/F because the reference paper’s neural analyses use extracted calcium events.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The event matrix is linearly interpolated from native ophys timestamps onto a common 30 Hz trial grid. The resulting trial matrix is transposed to neuron-by-time format and stored as `float32`.
+i. The agent does not recompute dF/F or event detection. It linearly interpolates the event matrix from native ophys timestamps onto a common 30 Hz per-trial grid and transposes the result to neuron-by-time.
 
 ii. ```python
-DT = 1.0 / 30.0
-...
-def linear_resample_matrix(src_time, src_value, dst_time):
+def linear_resample_matrix(src_time, src_value, dst_time) -> np.ndarray:
     ...
     interp = src_value[idx_lo] * (1.0 - w[:, None]) + src_value[idx_hi] * w[:, None]
     return interp.T.astype(np.float32, copy=False)
 ```
 
 ```python
-centers = build_trial_bins(float(trial["start_time"]), float(trial["stop_time"]))
 neural_trial = linear_resample_matrix(ophys_time, events, centers)
+neural_trials.append(neural_trial.astype(np.float32, copy=False))
 ```
 
-iii. The notes describe this as a common 30 Hz grid chosen to harmonize mixed native ophys rates with the 30 Hz behavioral streams.
+iii. The notes justify this as a compromise between the reference data and the decoder requirement that all sessions share one bin size. They also say `filtered_events` were avoided because those are for visualization in AllenSDK.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. There is no explicit neuron-level filtering in `convert_data.py`. The script uses whatever rows are present in the NWB event matrix and only uses the cell table to count neurons for `brain_region_idx`.
+i. The code applies no explicit ROI-level filter. It uses all rows present in the NWB event matrix and assumes the stored NWB contents already reflect Allen ROI curation.
 
 ii. ```python
 def get_cell_count_and_region_idx(f: h5py.File, region_index: int) -> np.ndarray:
@@ -150,34 +142,32 @@ def get_cell_count_and_region_idx(f: h5py.File, region_index: int) -> np.ndarray
 ```python
 ophys_time, events = get_neural_data(f)
 ...
-neural_trial = linear_resample_matrix(ophys_time, events, centers)
+brain_region_idx = get_cell_count_and_region_idx(f, region_to_idx[session.targeted_structure])
 ```
 
-iii. The agent’s notes argue that the included files were already effectively curated and that no additional filtering was needed beyond the processed NWB contents.
+iii. The notes say the agent checked local files and concluded all listed ROIs were already `valid_roi`, so it did not add an explicit `valid_roi` mask in conversion.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. The agent samples neural activity on absolute ophys timestamps but segments it into per-trial bins defined from `trial.start_time` to `trial.stop_time`. In metadata, it labels the alignment event as `trial start`.
+i. Neural data are aligned in absolute ophys time and then segmented by trial bounds. Within each trial, bins are centered from trial `start_time` to `stop_time`.
 
 ii. ```python
+def build_trial_bins(start_time: float, stop_time: float) -> np.ndarray:
+    n_bins = max(1, int(np.ceil((stop_time - start_time) / DT)))
+    centers = start_time + (np.arange(n_bins, dtype=np.float64) + 0.5) * DT
+    return centers[valid]
+```
+
+```python
 centers = build_trial_bins(float(trial["start_time"]), float(trial["stop_time"]))
 neural_trial = linear_resample_matrix(ophys_time, events, centers)
 ```
 
-```python
-"metadata": {
-    ...
-    "temporal_alignment_event": "trial start",
-    "off_start": 0.0,
-    "off_end": None,
-}
-```
-
-iii. The notes say the streams are first aligned in absolute ophys time and then cut into trials, but the explicit chosen trial anchor is trial start.
+iii. The notes describe this as “align by absolute ophys time, then cut into trials,” and the saved metadata labels the alignment event as `trial start`.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted data use a fixed 30 Hz grid, i.e. `33.333... ms` bins. Yes: the native data are resampled onto this common grid.
+i. The converted data use a 30 Hz grid with `DT = 1/30 s`, i.e. `33.333... ms` bins. Native streams are resampled or interpolated onto that common grid.
 
 ii. ```python
 DT = 1.0 / 30.0
@@ -185,33 +175,36 @@ TIME_BIN_MS = DT * 1000.0
 ```
 
 ```python
-"time_bin_size": TIME_BIN_MS,
-"sampling_grid_hz": 30.0,
+"metadata": {
+    ...
+    "time_bin_size": TIME_BIN_MS,
+    "sampling_grid_hz": 30.0,
+}
 ```
 
-iii. The notes justify this as a compromise between mixed native ophys rates and the 30 Hz behavioral streams.
+iii. The notes justify this as a harmonization choice because native ophys rates differ across sessions, while the target decoder format requires one consistent bin size.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. Image identity is derived from task stimulus-presentation tables in NWB intervals, mainly `image_name`, `omitted`, `start_time`, `stop_time`, and `trials_id`.
+i. Image identity is derived from task stimulus-presentation rows, mainly `image_name`, `start_time`, `stop_time`, `omitted`, and `trials_id`.
 
 ii. ```python
 columns = [
     "start_time", "stop_time", "image_name", "omitted",
-    "is_change", "trials_id", "stimulus_block_name",
-    "active", "duration",
+    "is_change", "trials_id", "stimulus_block_name", "active", "duration",
 ]
+df = read_interval_table(group, columns)
 ```
 
 ```python
 trial_presentations = presentations[presentations["trials_id"] == int(trial["id"])].copy()
 ```
 
-iii. The notes say the agent used the stimulus-presentation tables rather than only trial-level image fields so the output could be truly time-varying.
+iii. The notes say the agent preferred the processed stimulus-presentation tables for time-varying stimulus outputs and used trial fields only as sanity checks.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. The agent initializes each time bin to `gray`, then overwrites bins belonging to each stimulus flash with that flash’s image code. Omitted flashes are mapped back to `gray`.
+i. Each trial is initialized as `gray` everywhere. For bins overlapping a presentation interval, the code writes that interval’s `image_name`; omitted stimuli are also mapped to `gray`.
 
 ii. ```python
 image_identity = np.full(centers.shape[0], image_value_to_idx["gray"], dtype=np.int64)
@@ -222,11 +215,11 @@ else:
     image_identity[mask] = image_value_to_idx[str(row.image_name)]
 ```
 
-iii. The notes explicitly mention a `gray` category for inter-stimulus and omission periods.
+iii. The notes say the agent explicitly introduced a `gray` category so the full trial timeline could be labeled, including inter-stimulus and omitted periods.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Image identity is aligned on the same per-trial bin centers used for neural data; each bin is assigned according to whether its center falls inside a stimulus presentation interval.
+i. It is written on the same per-trial `centers` grid used for `neural`, by masking bins whose centers fall inside each presentation’s `[start_time, stop_time)`.
 
 ii. ```python
 mask = (centers >= float(row.start_time)) & (centers < float(row.stop_time))
@@ -234,17 +227,16 @@ mask = (centers >= float(row.start_time)) & (centers < float(row.stop_time))
 image_identity[mask] = image_value_to_idx[str(row.image_name)]
 ```
 
-iii. The notes describe all outputs as sampled onto the same 30 Hz ophys-aligned trial grid as the neural data.
+iii. The notes say all streams are aligned on one trial grid so decoder inputs and outputs share the same time axis as the neural matrix.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. Image change is derived from the same stimulus-presentation tables, specifically the `is_change` flag and flash timing.
+i. Image change is derived from the task-presentation `is_change` flag together with each presentation interval’s `start_time` and `stop_time`.
 
 ii. ```python
 columns = [
-    ...,
-    "is_change",
-    ...
+    "start_time", "stop_time", "image_name", "omitted",
+    "is_change", "trials_id", "stimulus_block_name", "active", "duration",
 ]
 ```
 
@@ -253,11 +245,11 @@ if bool(row.is_change):
     image_change[mask] = 1
 ```
 
-iii. The notes cite processed stimulus presentations as the source for a time-varying change indicator.
+iii. The notes say the change label came from processed stimulus presentations rather than being re-derived from neighboring image names inside the converter.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. The agent creates a zero vector and sets bins to 1 for any presentation interval marked `is_change`.
+i. The code initializes a zero vector and sets it to `1` for bins inside any presentation interval marked `is_change`.
 
 ii. ```python
 image_change = np.zeros(centers.shape[0], dtype=np.int64)
@@ -266,25 +258,27 @@ if bool(row.is_change):
     image_change[mask] = 1
 ```
 
-iii. The notes say this is meant to mark the change-image flash itself, not an entire post-change trial epoch.
+iii. The notes justify this as aligning the “change” indicator to the actual change flash rather than to a trial-wide label.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. It is treated as a binary categorical variable with no numeric thresholding: `0 = no_change`, `1 = change`.
+i. There is no continuous thresholding step. The agent directly encodes the processed boolean change flag as binary categories `0` and `1`.
 
 ii. ```python
 "output_values": [
     image_values,
     ["no_change", "change"],
-    ...
+    RUNNING_BIN_NAMES,
+    PUPIL_BIN_NAMES,
+    OUTCOME_NAMES,
 ]
 ```
 
-iii. The agent’s notes treat image change as an already discrete event from the processed stimulus table.
+iii. The notes treat image change as already categorical in the source tables, so no discretization beyond integer coding was needed.
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. It is assigned on the same trial bin centers as neural data using each presentation’s `start_time` and `stop_time`.
+i. It is aligned exactly like image identity: bins on the shared 30 Hz trial grid are marked by overlap with each change presentation interval.
 
 ii. ```python
 mask = (centers >= float(row.start_time)) & (centers < float(row.stop_time))
@@ -292,7 +286,7 @@ if bool(row.is_change):
     image_change[mask] = 1
 ```
 
-iii. The notes say all outputs share the common 30 Hz trial grid used for neural interpolation.
+iii. The notes say image and change traces were both built directly on the neural trial grid for one-to-one temporal alignment.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
@@ -306,49 +300,50 @@ def get_running_data(f: h5py.File) -> tuple[np.ndarray, np.ndarray]:
     return timestamps, speed
 ```
 
-iii. The notes say the agent uses the filtered running-speed stream already stored in NWB.
+iii. The notes say the code uses the stored processed running-speed stream rather than recomputing speed from wheel deltas.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Running speed is linearly interpolated onto trial bins, then discretized using global five-quantile edges estimated in pass 1 across all kept sessions and trials.
+i. Running speed is interpolated onto the trial grid, then later converted to quantile bins. A first pass concatenates all kept-trial running samples to compute dataset-wide edges.
 
 ii. ```python
 running_trial = linear_resample_vector(running_time, running_speed, centers)
-running_bin = digitize_with_edges(running_trial, running_edges)
-```
-
-```python
+running_values.append(running_trial)
+...
 running_edges = compute_quantile_edges(running_all[np.isfinite(running_all)], 5)
 ```
 
-iii. The notes say global percentile bins were chosen so categories have consistent meaning across the dataset.
+iii. The notes justify the two-pass design because global percentile bins require seeing all included sessions before final conversion.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. It is thresholded into five equal-percentile bins using global quantile edges. Categories are named `q1` to `q5`.
+i. The code computes five equal-quantile bin edges globally across all finite running samples from all kept sessions, then digitizes each per-trial value into bins `0..4`.
 
 ii. ```python
-RUNNING_BIN_NAMES = [f"q{i}" for i in range(1, 6)]
-...
-running_edges = compute_quantile_edges(..., 5)
+def compute_quantile_edges(values: np.ndarray, nbins: int) -> np.ndarray:
+    probs = np.linspace(0.0, 1.0, nbins + 1)
+    edges = np.quantile(values, probs)
+```
+
+```python
 running_bin = digitize_with_edges(running_trial, running_edges)
 ```
 
-iii. The notes explicitly call these global equal-frequency bins rather than per-session bins.
+iii. The notes explicitly say quantile bins were computed globally, not per session, so the output categories have one dataset-wide meaning.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is interpolated to the same trial-centered 30 Hz grid used for neural activity.
+i. It is linearly interpolated to the same per-trial `centers` grid used for neural data.
 
 ii. ```python
 running_trial = linear_resample_vector(running_time, running_speed, centers)
 ```
 
-iii. The notes say running, pupil, stimulus, and neural streams are all sampled on the same per-trial grid.
+iii. The notes say running, pupil, and stimulus outputs were all sampled onto the neural trial grid to avoid cross-stream timing mismatches.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. Pupil diameter is derived from `acquisition/EyeTracking/eye_tracking/timestamps` and `acquisition/EyeTracking/pupil_tracking/width` and `height`.
+i. Pupil diameter is derived from eye-tracking `timestamps` plus raw `pupil_tracking/width` and `pupil_tracking/height`.
 
 ii. ```python
 timestamps = np.asarray(eye_group["eye_tracking"]["timestamps"][:], dtype=np.float64)
@@ -356,46 +351,42 @@ width = np.asarray(eye_group["pupil_tracking"]["width"][:], dtype=np.float64)
 height = np.asarray(eye_group["pupil_tracking"]["height"][:], dtype=np.float64)
 ```
 
-iii. The notes say the agent computed a diameter-like scalar from pupil-tracking geometry rather than using a precomputed pupil-area field.
+iii. The notes say the agent chose the geometric pupil fields because the requested decoder output was specifically pupil diameter rather than pupil area.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. The agent computes `diameter = 2 * max(width, height)` per frame, fills NaNs by time interpolation, interpolates onto the 30 Hz trial grid, and then digitizes with global five-quantile edges.
+i. The code computes `diameter = 2 * max(width, height)` at each eye-tracking frame, fills NaNs by time interpolation, resamples onto the trial grid, and later bins the values globally.
 
 ii. ```python
 diameter = 2.0 * np.maximum(width, height)
 diameter = fill_nan_by_time(timestamps, diameter)
-```
-
-```python
+...
 pupil_trial = linear_resample_vector(pupil_time, pupil_diameter, centers)
-pupil_bin = digitize_with_edges(pupil_trial, pupil_edges)
 ```
 
-iii. The notes justify interpolation as a way to handle blink-related or missing eye-tracking samples and to keep a time-varying output.
+iii. The notes justify the geometry-based conversion as matching the pupil ellipse fields, and the interpolation step as a way to handle blink-related missing samples while preserving a time-varying output for every bin.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. It is thresholded into five equal-percentile bins using global quantile edges. Categories are named `q1` to `q5`.
+i. Like running speed, the code computes five global quantile bins over all finite pupil samples from kept sessions and digitizes each trial’s resampled values into bins `0..4`.
 
 ii. ```python
-PUPIL_BIN_NAMES = [f"q{i}" for i in range(1, 6)]
-...
 pupil_edges = compute_quantile_edges(pupil_all[np.isfinite(pupil_all)], 5)
+...
 pupil_bin = digitize_with_edges(pupil_trial, pupil_edges)
 ```
 
-iii. The notes explicitly state that pupil bins are global, not session-specific.
+iii. The notes say pupil bins were intentionally global so the categories are comparable across sessions.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Pupil values are interpolated onto the exact same per-trial 30 Hz bin centers used for neural data.
+i. The continuous pupil trace is linearly interpolated onto the same per-trial `centers` grid used for the neural matrix.
 
 ii. ```python
 pupil_trial = linear_resample_vector(pupil_time, pupil_diameter, centers)
 ```
 
-iii. The notes say eye tracking is aligned in absolute time and then sampled on the common trial grid.
+iii. The notes treat pupil alignment the same way as running alignment: absolute timestamps first, then trial-grid resampling.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
@@ -413,46 +404,39 @@ def trial_outcome_index(trial_row: pd.Series) -> int:
         return 3
 ```
 
-iii. The notes say the outcome labels come directly from the Allen-processed `trials` table rather than being re-derived.
+iii. The notes say the agent relied on the Allen-processed trial outcomes already stored in NWB rather than reconstructing outcome logic again.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. The script maps the mutually exclusive booleans to integer classes and repeats that class across every time bin in the trial, making trial outcome a static-per-trial but time-broadcast output.
+i. The code maps the mutually exclusive trial outcome flags to indices `0..3` and repeats that label across all bins of the trial, producing a constant time series.
 
 ii. ```python
 outcome_idx = trial_outcome_index(trial)
 outcome_trace = np.full(centers.shape[0], outcome_idx, dtype=np.int64)
 ```
 
-iii. The notes say this was done to keep one consistent `(n_output, T)` format for all outputs.
+iii. The notes justify this as keeping all outputs in one `(n_output, T)` format even though trial outcome is semantically static per trial.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Missing string/integer fields in interval tables are tolerated by reading only present columns. Missing pupil samples are filled by interpolation if some finite values exist. Sessions missing the entire `EyeTracking` group are skipped. Trials with invalid or zero-length time windows are skipped. If a session ends up with fewer than two usable trials, it is discarded.
+i. Missing eye tracking for a whole session causes the session to be skipped via `KeyError`. Missing pupil samples within a session are linearly interpolated. Missing trial IDs are synthesized. Empty or invalid trial windows return zero-length bins and are skipped. All-zero neural trials are retained.
 
 ii. ```python
-for column in columns:
-    if column not in group:
-        continue
-```
-
-```python
+if "EyeTracking" not in f["acquisition"]:
+    raise KeyError("Missing EyeTracking acquisition")
+...
 if finite.sum() == 0:
     raise ValueError("All values are NaN")
 ...
-values[~finite] = np.interp(...)
+if "id" not in trials:
+    trials["id"] = np.arange(len(trials), dtype=np.int64)
 ```
 
-```python
-if "EyeTracking" not in f["acquisition"]:
-    raise KeyError("Missing EyeTracking acquisition")
-```
-
-iii. The notes describe this as pragmatic handling: interpolate partial eye-tracking dropouts, but drop sessions that cannot support the required pupil output at all.
+iii. `CONVERSION_NOTES.md` explicitly records these as edge-case rules: skip sessions without required pupil data, interpolate blink-related pupil gaps, and keep zero-event trials because they exist in the source event data.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. The most expensive work is the two-pass scan over NWB files, especially repeated disk reads and per-trial interpolation of neural, running, and pupil time series.
+i. The most expensive work is opening every NWB file twice, reading large event matrices from disk, and interpolating them onto trial grids during conversion.
 
 ii. ```python
 print("Pass 1: collecting global running/pupil statistics")
@@ -463,11 +447,11 @@ for idx, session in enumerate(kept_sessions, start=1):
     neural_trials, output_trials, brain_region_idx = convert_session(...)
 ```
 
-iii. The notes explicitly call out that full conversion is I/O-heavy and that global binning forces every file to be read twice.
+iii. The notes explicitly identify full-dataset I/O and the mandatory two-pass design as the main runtime costs.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The main remaining vectorization opportunities are the Python loop over trials inside each session and the nested per-presentation loop used to paint `image_identity` and `image_change`.
+i. The code still loops over trials in both passes, loops over trial presentations within each trial, and loops over byte strings in `decode_str_array`. Those loops could be reduced further, especially the per-trial resampling in pass 1 and the per-presentation masking in pass 2.
 
 ii. ```python
 for trial in trials.itertuples(index=False):
@@ -479,14 +463,13 @@ for trial in trials.itertuples(index=False):
 ```python
 for row in trial_presentations.itertuples(index=False):
     mask = (centers >= float(row.start_time)) & (centers < float(row.stop_time))
-    ...
 ```
 
-iii. The notes say neural interpolation was vectorized, but these trial- and presentation-level loops were left in straightforward Python.
+iii. The notes mention that the agent vectorized neural interpolation, but the rest of the session/trial logic remains largely loop-based.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. The script repeats file opening and data loading across two passes, rebuilds trial bins twice, and resamples running/pupil twice: once to compute global quantiles and again during final conversion.
+i. The converter reads each kept NWB file twice. It also rebuilds trial bins twice conceptually: once in pass 1 for global running/pupil statistics and again in pass 2 for final data creation.
 
 ii. ```python
 running_edges, pupil_edges, kept_sessions, image_names = collect_global_statistics(sessions)
@@ -495,23 +478,26 @@ for idx, session in enumerate(kept_sessions, start=1):
     neural_trials, output_trials, brain_region_idx = convert_session(...)
 ```
 
-iii. The notes explicitly describe this as a two-pass design, chosen to get global running and pupil bin edges before final conversion.
+iii. The notes explicitly call out the two-pass workflow as necessary for global bin edges but acknowledge that it repeats file I/O and trial-grid construction.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The code generates optional diagnostic plots, stores empty `input` arrays for every trial, and expands static trial outcome into a full time series even though it is constant within a trial.
+i. The converter stores several metadata fields in `SessionMeta` that are not used in the final dataset, optionally builds diagnostic plots that are not part of the decoder input, and performs plotting-only extraction of raw windows when `--show-processing` is enabled.
 
 ii. ```python
-input_trials = [np.zeros((0, trial.shape[1]), dtype=np.float32) for trial in neural_trials]
-```
-
-```python
-outcome_trace = np.full(centers.shape[0], outcome_idx, dtype=np.int64)
+@dataclass(frozen=True)
+class SessionMeta:
+    ...
+    session_type: str
+    experience_level: str
+    project_code: str
 ```
 
 ```python
 if show_processing and not plotted:
+    ...
+    raw_window = events[start:stop].T.astype(np.float32, copy=False)
     make_processing_plot(...)
 ```
 
-iii. The notes frame these as format-compliance and debugging conveniences rather than information that changes the downstream decoder task.
+iii. The notes say the plotting path exists only for manual validation, and those artifacts are not used by `train_decoder.py` or preserved inside `converted_data.pkl`.

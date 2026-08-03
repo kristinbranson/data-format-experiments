@@ -2,16 +2,14 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent hard-codes the 7 mouse IDs, loads one preprocessed `joblib` file per mouse from `/app/data/{animal}`, unwraps the nested `{animal: data}` dict, and then iterates over all days and all generated trials to build the dataset.
+i. The agent hard-codes the 7 animal IDs, loads one joblib file per animal from `/app/data/<animal>`, unwraps the nested dictionary with `dat[animal]`, and then iterates over every day in `d['trace']` as a session. Trials are not stored in the raw data; they are created later by slicing each session into fixed frame windows.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 ANIMALS = [
     "QLAK-CA1-08", "QLAK-CA1-30", "QLAK-CA1-50", "QLAK-CA1-51",
     "QLAK-CA1-56", "QLAK-CA1-74", "QLAK-CA1-75"
 ]
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 def load_animal_data(animal):
     filepath = os.path.join(DATA_DIR, animal)
@@ -19,43 +17,37 @@ def load_animal_data(animal):
     return dat[animal]
 
 for animal in animals:
-    neural, inp, out, sess_info = process_animal(animal, show_processing=show_processing)
+    neural, inp, out, sess_info = process_animal(animal, ...)
 ```
 
-iii. The agent justified this by matching the reference `load_dat(..., format="joblib")` path and by noting in `CONVERSION_NOTES.md` that the no-extension files in `data/` are the preprocessed Python/joblib versions of the dataset.
+iii. In `CONVERSION_NOTES.md`, the agent says the reference code uses `load_dat`/`joblib.load`, and the trajectory shows it inspected `main.py` where the same 7 animals are enumerated and `load_dat(animal, p, format="joblib")` is called.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are split by iterating through the fixed `ANIMALS` list. Each processed session is assigned a subject index using `ANIMALS.index(animal)`, and the dataset stores both the full subject name list and per-session `subject_idx`.
+i. Subjects are split by file: each animal-specific joblib file corresponds to one mouse. Session-to-subject mapping is tracked by appending `ANIMALS.index(animal)` for each retained session.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 for animal in animals:
-    neural, inp, out, sess_info = process_animal(animal, show_processing=show_processing)
-
+    neural, inp, out, sess_info = process_animal(animal, ...)
     subject_id = ANIMALS.index(animal)
-
     for s_idx in range(len(neural)):
-        all_neural.append(neural[s_idx])
         ...
         subject_idx_list.append(subject_id)
 
 data = {
-    ...
     'subjects': ANIMALS,
     'subject_idx': np.array(subject_idx_list, dtype=np.int64),
 }
 ```
 
-iii. The notes say the dataset contains 7 mice with known IDs, and the trajectory shows the agent chose to preserve that ordering exactly so session-to-subject mapping stayed explicit and simple.
+iii. The notes state there are 7 mice stored as separate joblib files, and the trajectory excerpt from `main.py` shows the same animal list used by the reference code.
 
 ## 1-c. How are the data split into sessions?
 
-i. The agent treats each recording day as one session. It reads `n_days = d['trace'].shape[0]` and loops `for day in range(n_days)`, pulling one session’s `trace`, `position`, and `envs` entry per day.
+i. The agent treats each recording day as one session. It uses the first dimension of `d['trace']`, `d['position']`, and `d['envs']`, iterating `for day in range(n_days)`.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 n_days = d['trace'].shape[0]
 envs = d['envs'].squeeze()
@@ -66,56 +58,52 @@ for day in range(n_days):
     position = d['position'][day]
 ```
 
-iii. The agent’s notes explicitly say one session was recorded per day and that the reference paper reports 207 sessions total, so it mapped “day” to “session”.
+iii. `CONVERSION_NOTES.md` documents `trace` as `(n_days, n_cells, n_frames)` and `position` as `(n_days, 2, n_frames)`. The trajectory shows the agent read reference functions that index sessions by day in the same way.
 
 ## 1-d. How are the data split into trials?
 
-i. Each day/session is split into consecutive 1-minute trial chunks at the native 30 Hz frame rate, so each full trial is 1800 frames. Trial boundaries are `[0, 1800, 3600, ...]` within each session.
+i. The agent creates synthetic trials by chopping each session into contiguous 1-minute windows at 30 Hz, starting at frames `0, 1800, 3600, ...`. It keeps full 1800-frame windows and also keeps the final shorter window if it is at least 900 frames long.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 FPS = 30
 TRIAL_DURATION_S = 60
 FRAMES_PER_TRIAL = FPS * TRIAL_DURATION_S
+MIN_TRIAL_FRAMES = FPS * 30
 
 trial_starts = list(range(0, n_frames, FRAMES_PER_TRIAL))
-
 for start in trial_starts:
     end = min(start + FRAMES_PER_TRIAL, n_frames)
     trial_len = end - start
-    neural_trial = trace_registered[:, start:end].astype(np.float32)
-    output_trial = pos_bins[start:end].astype(np.int64).reshape(1, -1)
+    if trial_len < MIN_TRIAL_FRAMES:
+        continue
 ```
 
-iii. The trajectory and notes say this came from the task instructions, which explicitly required splitting long sessions into 1-minute trials for decoder evaluation.
+iii. The justification in the notes is that the decoder instructions said to split the long sessions into 1-minute trials. The notes list “Trial definition: 1-minute segments (1800 frames at 30Hz), ~40 trials per session.”
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The agent does not use any paper-specific trial quality control. It only skips short trailing partial trials under 30 s and drops sessions that would end up with fewer than 2 trials.
+i. There is almost no trial-quality filtering. The code only drops trailing partial trials shorter than 30 seconds and then drops any session left with fewer than 2 trials. It does not inspect movement, missing behavior, or any per-trial signal-quality metric.
 
-ii. <Code snippets>
-
+ii. 
 ```python
-MIN_TRIAL_FRAMES = FPS * 30
-
 if trial_len < MIN_TRIAL_FRAMES:
     continue
 
+...
 n_trials = len(neural_trials)
 if n_trials < 2:
     print(f"  Day {day} ({env_name}): Only {n_trials} trial(s), skipping (need >=2)")
     continue
 ```
 
-iii. In `CONVERSION_NOTES.md` the agent says “No trial filtering” relative to the paper, but it added these checks to satisfy the decoder format requirements that need usable trials and at least two trials per session.
+iii. The notes explicitly say “Trial curation rules: No trial filtering,” but the actual code does apply the two length/count checks above. The trajectory and notes do not mention any other trial QC decision.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` is derived directly from the per-day calcium event matrix `d['trace'][day]`, after removing cells that are unregistered on that day.
+i. `neural` comes directly from the raw `trace` array for each day, after masking out cells that are not registered on that day.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 trace = d['trace'][day]
 registered_mask = ~np.isnan(trace[:, 0])
@@ -123,50 +111,46 @@ trace_registered = trace[registered_mask]
 neural_trial = trace_registered[:, start:end].astype(np.float32)
 ```
 
-iii. The agent’s notes cite the paper’s preprocessing description: the stored `trace` is already the binarized rising-phase event vector used as the firing-rate-like signal in later analyses.
+iii. The notes say `trace` contains binary calcium events with `NaN` for unregistered cells. The trajectory shows the agent inspected reference functions like `get_rate_maps(position, trace, ...)` and `decode_position_within(..., traces, ...)`, both of which use `trace` directly.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The agent leaves the neural signal essentially as-is: binary event traces are sliced by trial and cast to `float32`. It does not compute rate maps, smooth in time, rebin in time, or infer spikes.
+i. The agent does almost no additional neural preprocessing. It assumes the joblib `trace` is already the processed signal of interest, filters to registered cells, slices it into trials, and casts it to `float32`. It does not compute dF/F, smooth the traces, deconvolve further, or convert to rate maps.
 
-ii. <Code snippets>
-
+ii. 
 ```python
-# Extract registered cells' traces
+# Identify registered cells (non-NaN on this day)
+registered_mask = ~np.isnan(trace[:, 0])
 trace_registered = trace[registered_mask]
 
 # Neural: (n_registered, trial_len)
 neural_trial = trace_registered[:, start:end].astype(np.float32)
 ```
 
-iii. The notes state “No delta F/F computation needed - trace is already binarized” and “The final binarized rising-phase vector was then set to 1... This binary vector was treated as the firing rate in all further analyses.”
+iii. `CONVERSION_NOTES.md` says “Data is already preprocessed: binary calcium trace (0/1 for significant events from rising-phase extraction)” and “No delta F/F computation needed.” The trajectory shows the agent read the reference code around `get_rate_maps`, which treats `trace` as the already-prepared calcium-event signal.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. The agent only filters out unregistered cells by testing whether the first frame is NaN. It does not apply place-cell filtering, movement filtering, or the reference decoder’s active-cell threshold.
+i. The only neural QC the code applies is removing cells whose first sample on a given day is `NaN`, treating those cells as unregistered for that session. It does not apply place-cell filtering, split-half reliability thresholds, movement-based frame filtering, or the decoder code’s `cell_threshold > 5` active-cell filter.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 registered_mask = ~np.isnan(trace[:, 0])
 n_registered = np.sum(registered_mask)
-
 if n_registered == 0:
-    print(f"  Day {day} ({env_name}): No registered cells, skipping")
-    continue
+    ...
+trace_registered = trace[registered_mask]
 ```
 
-iii. The notes say “Use ALL registered cells on each day (non-NaN trace). No place-cell filtering” and also explicitly record that the reference decoder had a velocity filter and `cell_threshold > 5`, but the agent chose not to apply them.
+iii. The notes justify this with “Use ALL registered cells on each day (non-NaN trace). No place-cell filtering.” The same notes also mention that the reference decoder uses a velocity filter and `cell_threshold > 5`, but the agent chose not to reproduce those filters in the converted dataset.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Trials are aligned to the start of each 1-minute segment. Within a trial, neural samples keep their original frame order relative to that segment start.
+i. The agent aligns neural data to the artificial trial boundary it created itself: frame 0 of each 1-minute chunk is treated as the alignment event. No task event from the paper is used.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 trial_starts = list(range(0, n_frames, FRAMES_PER_TRIAL))
-
 for start in trial_starts:
     end = min(start + FRAMES_PER_TRIAL, n_frames)
     neural_trial = trace_registered[:, start:end].astype(np.float32)
@@ -176,42 +160,42 @@ for start in trial_starts:
 'off_end': float(TRIAL_DURATION_S),
 ```
 
-iii. The agent’s metadata names the alignment event directly. Its rationale was that the instructions define trials as 1-minute segments, not stimulus-locked epochs.
+iii. The notes say the decoder task required 1-minute trials and record the alignment event as “Start of each 1-minute trial segment within a 40-minute recording session.”
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted data stays at the native 30 Hz sampling rate, i.e. about 33.33 ms per time bin. No temporal rebinning is applied.
+i. The converted data stays at the native imaging frame rate, 30 Hz, which the metadata reports as `1000 / 30 = 33.33 ms` per sample. No temporal rebinning is applied.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 FPS = 30
-...
+
 'time_bin_size': 1000.0 / FPS,  # ~33.33 ms
+
+neural_trial = trace_registered[:, start:end].astype(np.float32)
+output_trial = pos_bins[start:end].astype(np.int64).reshape(1, -1)
 ```
 
-iii. The notes repeatedly state that recordings were acquired at 30 Hz and that the agent kept the native sampling because the stored traces and positions are already frame-aligned.
+iii. The notes say “Time bin: 30Hz native sampling (33.33ms)” and the trajectory/reference excerpts mention the original data and reference decoder both operate at 30 Hz.
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. Environment geometry is derived from the session’s environment label, `d['envs'][day]`, not from the `blocked` array.
+i. The input is derived from the session’s environment label string in `d['envs']`. The code does not use `blocked`; it maps the environment name directly to a hard-coded binary geometry template.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 envs = d['envs'].squeeze()
 env_name = envs[day]
 env_mat = get_env_mat(env_name).flatten()
 ```
 
-iii. The notes say the agent followed the reference `get_env_mat` helper and treated the string environment name as the authoritative input to that mapping.
+iii. The notes say the mapping is “Environment geometry 3x3 | `get_env_mat(env)` -> flatten to 9 values,” and the trajectory shows the agent copied `get_env_mat` from the reference `utils.py`.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The agent copies the reference `get_env_mat` lookup table, converts each named environment into a binary 3x3 occupancy matrix, then flattens it into a 9-element vector and stores it as `float32`.
+i. The environment name is converted to a binary 3x3 occupancy/blockage matrix with `get_env_mat`, then flattened to a 9-element vector and reused as a static per-trial input.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 def get_env_mat(env):
     if env == 'square':
@@ -224,45 +208,26 @@ env_mat = get_env_mat(env_name).flatten()
 input_trial = env_mat.astype(np.float32)
 ```
 
-iii. The trajectory shows the agent read the reference `get_env_mat` code and reused it verbatim because the task input was “which part of the arena is blocked”.
-
-## 3-c. How is the `input` *Environment geometry* aligned with the neural data?
-
-i. Input is static within a trial. For every neural trial slice from a session, the same 9-element environment vector is attached to that trial.
-
-ii. <Code snippets>
-
-```python
-env_mat = get_env_mat(env_name).flatten()
-
-for start in trial_starts:
-    ...
-    input_trial = env_mat.astype(np.float32)
-    input_trials.append(input_trial)
-```
-
-iii. The notes call the environment input “static per trial”, and the trajectory shows the agent chose this because geometry does not change within a recording session.
+iii. The notes call this out as copied from the reference code. The trajectory confirms the agent inspected `/app/code/georepca1/src/utils.py` where `get_env_mat` is defined.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. `output` is derived from the per-day tracked position array `d['position'][day]`, which stores x and y coordinates over time.
+i. The output comes directly from the raw `position` array for each day.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 position = d['position'][day]  # (2, n_frames)
 pos_bins = bin_position_3x3(position)
 output_trial = pos_bins[start:end].astype(np.int64).reshape(1, -1)
 ```
 
-iii. The notes cite the paper’s methods stating that position was generated from DeepLabCut head tracking and was recorded in sync with calcium imaging.
+iii. The notes document `position` as `(n_days, 2, n_frames)` in centimeters and identify it as the source for the decoder output.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The agent bins continuous x,y position into a 3x3 grid using a fixed 75 cm arena size, flooring each coordinate into one of 3 bins and clipping to `[0, 2]`.
+i. The agent bins continuous x and y coordinates into a 3x3 grid over a fixed 75 cm square arena, clips indices to `[0, 2]`, converts the two bin coordinates into a single class index, and then slices the resulting time series per trial. There is no smoothing, velocity filtering, or masking to accessible locations.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 def bin_position_3x3(position, env_size=ENV_SIZE_CM):
     buffer = 1e-5
@@ -273,121 +238,87 @@ def bin_position_3x3(position, env_size=ENV_SIZE_CM):
     return bin_idx
 ```
 
-iii. The trajectory shows the agent inspected the position range, confirmed it spans roughly `0-75 cm`, and justified the skewed occupancy histogram as natural behavior rather than a binning bug.
+iii. The notes justify this as the decoder-task-required discretization: “Position discretization: 3x3 grid, row-major ordering.” The trajectory shows the agent compared this to reference functions that bin position spatially, but the 3x3 scheme is its own adaptation.
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. Categories are the 9 cells of the 3x3 grid. The category index is encoded row-major as `x_bin * 3 + y_bin`, yielding class IDs 0-8 labeled `x0y0` through `x2y2`.
+i. The agent creates 9 categories by thresholding x and y into 3 equal-width spatial bins each and then combining them with row-major indexing: `0..8 = x_bin * 3 + y_bin`.
 
-ii. <Code snippets>
-
+ii. 
 ```python
+x_bin = np.clip(np.floor(position[0] / bin_size).astype(int), 0, N_POS_BINS - 1)
+y_bin = np.clip(np.floor(position[1] / bin_size).astype(int), 0, N_POS_BINS - 1)
 bin_idx = x_bin * N_POS_BINS + y_bin
-...
+
 output_values = [
     [f"x{r}y{c}" for r in range(N_POS_BINS) for c in range(N_POS_BINS)]
 ]
 ```
 
-iii. The notes explicitly list “Position discretization: 3x3 grid, row-major ordering” as a key design choice made to satisfy the decoder output specification.
+iii. The notes explicitly state “3x3 grid, row-major ordering (bin_idx = x_bin*3 + y_bin),” matching the output labels written into the dataset.
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. Output uses the same frame indices and trial boundaries as the neural slices. For a given trial, `output_trial[t]` corresponds to the same original recording frame as `neural_trial[:, t]`.
+i. Output and neural data are aligned by using the same day index and identical `start:end` frame slices. The code first bins the full session’s position time series and then slices each trial with the same boundaries used for neural traces.
 
-ii. <Code snippets>
-
-```python
-for start in trial_starts:
-    end = min(start + FRAMES_PER_TRIAL, n_frames)
-    neural_trial = trace_registered[:, start:end].astype(np.float32)
-    output_trial = pos_bins[start:end].astype(np.int64).reshape(1, -1)
-```
-
-iii. The agent’s rationale was that the methods say behavior and imaging were recorded simultaneously at 30 Hz and frame-timestamp aligned.
-
-## 5-a. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. The temporal resolution is 33.33 ms per sample (30 Hz), and there is no temporal rebinning.
-
-ii. <Code snippets>
-
-```python
-FPS = 30
-'time_bin_size': 1000.0 / FPS,
-```
-
-iii. The notes cite the 30 Hz acquisition rate from the paper and state that the agent kept native sampling.
-
-## 5-b. How are the neural, input, and output data temporally aligned?
-
-i. Neural and output are aligned by shared session frame index and identical trial slices. Input is session-static and attached once per trial, so it is aligned at the trial level rather than frame-by-frame.
-
-ii. <Code snippets>
-
+ii. 
 ```python
 trace = d['trace'][day]
 position = d['position'][day]
-env_mat = get_env_mat(env_name).flatten()
 pos_bins = bin_position_3x3(position)
 
 for start in trial_starts:
     end = min(start + FRAMES_PER_TRIAL, n_frames)
     neural_trial = trace_registered[:, start:end].astype(np.float32)
-    input_trial = env_mat.astype(np.float32)
     output_trial = pos_bins[start:end].astype(np.int64).reshape(1, -1)
 ```
 
-iii. The notes say the streams are all derived from the same synchronized 30 Hz session data; the environment geometry is constant for the whole session, so the agent stored it as a per-trial constant input.
+iii. The notes say the conversion should show “no temporal misalignments,” and the trajectory includes a sanity check where the agent recomputed the original `pos_bins[start:end]` and verified it matched the converted output exactly.
 
-## 6. How are minor issues in the data (e.g., missing data, malformed entries) handled?
+## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Missing/unregistered cells are handled by removing rows whose first trace sample is `NaN`. Sessions with no registered cells are skipped. Unknown environment labels raise an error. There is no broader repair logic for malformed positions or partially missing behavioral samples.
+i. Handling is minimal. Missing neural data are treated as unregistered cells via `NaN` masking on `trace[:, 0]`. Entire days are skipped if no cells are registered. Very short trailing partial trials are skipped. There is no explicit repair or imputation of missing position samples, no gap-filling, and no special handling of `blocked` or other metadata inconsistencies.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 registered_mask = ~np.isnan(trace[:, 0])
+n_registered = np.sum(registered_mask)
 if n_registered == 0:
-    print(f"  Day {day} ({env_name}): No registered cells, skipping")
     continue
 
-else:
-    raise ValueError(f"Unknown environment: {env}")
+if trial_len < MIN_TRIAL_FRAMES:
+    continue
 ```
 
-iii. The notes emphasize that NaNs indicate cells not registered on a given day, so the agent treated that as the main data-integrity case that needed explicit handling.
+iii. The notes say the raw `trace` contains `NaN` for unregistered cells, and the rest of the writeup assumes the data are otherwise already clean. No stronger missing-data strategy appears in the trajectory or script.
 
-## 7-a. What are the most time-consuming steps of the code?
+## 6-a. What are the most time-consuming steps of the code?
 
-i. The expensive parts are loading each large animal `joblib` file, iterating through every session and trial to slice data into Python lists, and writing the final ~20 GB pickle. Optional plotting also adds overhead when enabled.
+i. The expensive parts are loading each large animal file with `joblib.load`, slicing and appending thousands of trial arrays to nested Python lists, and then serializing the final multi-gigabyte dataset with `pickle.dump`. The per-session timings in `conversion_full_out.txt` show the compute inside each day loop is relatively cheap compared with total per-animal runtime.
 
-ii. <Code snippets>
-
+ii. 
 ```python
-dat = joblib.load(filepath)
+d = load_animal_data(animal)
 ...
-for day in range(n_days):
+for start in trial_starts:
     ...
-    for start in trial_starts:
-        ...
-        neural_trials.append(neural_trial)
+    neural_trials.append(neural_trial)
+    input_trials.append(input_trial)
+    output_trials.append(output_trial)
 ...
 with open(args.outfile, 'wb') as f:
     pickle.dump(data, f, protocol=4)
 ```
 
-iii. The conversion logs and notes report per-animal runtimes and a large output file, which is consistent with I/O and repeated slicing dominating runtime rather than arithmetic.
+iii. The notes mention timing output and runtime estimation, and `conversion_full_out.txt` shows 11-29 seconds per animal plus a 19+ GB final pickle output.
 
-## 7-b. What loops in the code could have been vectorized to improve efficiency?
+## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The per-trial slicing loop could be more vectorized by reshaping full-session arrays into `(n_trials, ..., 1800)` blocks when trials are full length, and the repeated per-trial appending of identical static inputs could be generated more directly. The subject/session accumulation loop also remains pure Python.
+i. The repeated Python loop over trials could have been reduced by reshaping or pre-splitting full-session arrays once, especially for the full 1800-frame trials. The `build_dataset` loop that appends one session at a time and the output-distribution concatenation at the end also do avoidable Python-level work. The plotting loops are also non-vectorized, though they are optional.
 
-ii. <Code snippets>
-
+ii. 
 ```python
 for start in trial_starts:
-    end = min(start + FRAMES_PER_TRIAL, n_frames)
     ...
     neural_trials.append(neural_trial)
     input_trials.append(input_trial)
@@ -397,131 +328,49 @@ for s_idx in range(len(neural)):
     all_neural.append(neural[s_idx])
     all_input.append(inp[s_idx])
     all_output.append(out[s_idx])
-```
-
-iii. The agent described the implementation as “efficient vectorized operations” in the notes, but these loops are still straightforward candidates for reshaping/broadcasting rather than repeated Python appends.
-
-## 7-c. What processing does the code repeat multiple times?
-
-i. It repeatedly casts the same environment vector to `float32` once per trial, repeats the same session-static input for every trial of a session, and repeatedly appends per-session structures into global lists. It also recomputes summary statistics by concatenating all outputs after building the dataset.
-
-ii. <Code snippets>
-
-```python
-input_trial = env_mat.astype(np.float32)
-input_trials.append(input_trial)
 
 all_out = np.concatenate([
     np.concatenate([t[0] for t in sess]) for sess in data['output']
 ])
 ```
 
-iii. This follows directly from the code structure: even though `env_mat` is constant within a session, it is regenerated as a separate object for every trial.
+iii. The notes claim the code uses “efficient vectorized operations,” but the implementation still relies on several large Python loops for trial/session packaging and summary-stat computation.
 
-## 7-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+## 6-c. What processing does the code repeat multiple times?
 
-i. Optional visualization in `plot_processing`, runtime/summary printing, and some metadata bookkeeping (`session_info`) are not used by `train_decoder.py` for model fitting. The post-save output-distribution summary is also purely diagnostic.
+i. It repeatedly casts the same static environment vector to `float32` once per trial, repeatedly stores identical environment geometry for every trial in a session, and repeatedly slices arrays trial by trial even though most sessions share the same fixed trial structure. It also recomputes whole-dataset output summaries after the dataset has already been built.
 
-ii. <Code snippets>
+ii. 
+```python
+env_mat = get_env_mat(env_name).flatten()
 
+for start in trial_starts:
+    ...
+    input_trial = env_mat.astype(np.float32)
+    ...
+
+all_out = np.concatenate([
+    np.concatenate([t[0] for t in sess]) for sess in data['output']
+])
+```
+
+iii. The notes focus on correctness and runtime, but the code itself shows this repetition clearly. The repeated per-trial copying of the same session-level input is the clearest example.
+
+## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+
+i. Optional plotting generates large visualization files but is not used by the decoder. The end-of-run output-distribution summary concatenates all outputs only for printing. `session_info` is stored in metadata even though the downstream decoder primarily uses `neural`, `input`, `output`, and indexing fields. These steps are useful for inspection but not for model training itself.
+
+ii. 
 ```python
 if show_processing and len(all_neural) > 0:
     plot_processing(animal, d, all_neural, all_input, all_output, session_info)
 
 'session_info': all_session_info,
 
-print(f"\nOutput distribution (position_bin):")
-for u, c in zip(unique, counts):
-    print(f"  Bin {int(u)} ({data['output_values'][0][int(u)]}): {c/len(all_out)*100:.1f}%")
-```
-
-iii. The notes describe these as validation and documentation aids rather than part of the converted representation itself.
-
-## 8. How are minor mistakes in the data, e.g. missing data, handled?
-
-i. Same as 6: NaN-marked unregistered cells are removed, zero-cell sessions are skipped, and unknown environment labels raise an exception. The code does not attempt interpolation or repair of behavioral traces.
-
-ii. <Code snippets>
-
-```python
-registered_mask = ~np.isnan(trace[:, 0])
-if n_registered == 0:
-    ...
-    continue
-
-else:
-    raise ValueError(f"Unknown environment: {env}")
-```
-
-iii. The agent consistently treated registration NaNs as the main expected data issue and otherwise assumed the preprocessed files were clean.
-
-## 9-a. What are the most time-consuming steps of the code?
-
-i. Same as 7-a: loading large `joblib` files, looping over all day/trial slices, and serializing the final pickle dominate runtime; plotting is extra overhead when turned on.
-
-ii. <Code snippets>
-
-```python
-dat = joblib.load(filepath)
-...
-for day in range(n_days):
-    ...
-    for start in trial_starts:
-        ...
-with open(args.outfile, 'wb') as f:
-    pickle.dump(data, f, protocol=4)
-```
-
-iii. The runtime logs in `CONVERSION_NOTES.md` and `conversion_full_out.txt` support that interpretation.
-
-## 9-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. Same as 7-b: the trial-splitting/appending loops and the cross-session accumulation loops could be reduced with reshaping or preallocation.
-
-ii. <Code snippets>
-
-```python
-for start in trial_starts:
-    ...
-    neural_trials.append(neural_trial)
-    input_trials.append(input_trial)
-    output_trials.append(output_trial)
-
-for s_idx in range(len(neural)):
-    all_neural.append(neural[s_idx])
-    ...
-```
-
-iii. These are the main pure-Python loops left in the implementation.
-
-## 9-c. What processing does the code repeat multiple times?
-
-i. Same as 7-c: static environment inputs are regenerated per trial, session outputs are re-concatenated for summaries, and list appends repeat the same structural work across all sessions.
-
-ii. <Code snippets>
-
-```python
-input_trial = env_mat.astype(np.float32)
-...
 all_out = np.concatenate([
     np.concatenate([t[0] for t in sess]) for sess in data['output']
 ])
+unique, counts = np.unique(all_out, return_counts=True)
 ```
 
-iii. The repetition is a direct consequence of storing session-static inputs as one object per trial and doing an extra diagnostic pass after conversion.
-
-## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. Same as 7-d: optional plots, verbose summaries, and extra metadata/diagnostic calculations are not consumed by downstream decoder training.
-
-ii. <Code snippets>
-
-```python
-plot_processing(animal, d, all_neural, all_input, all_output, session_info)
-...
-'session_info': all_session_info,
-...
-print(f"\nOutput distribution (position_bin):")
-```
-
-iii. The agent added these for inspection and validation rather than because the target format required them.
+iii. The notes emphasize sanity checks, plotting, and reporting. Those are reasonable for validation, but they are not needed by downstream decoding once the converted pickle has been produced.

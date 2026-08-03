@@ -2,204 +2,148 @@
   "1-a": {
     "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The agent loads one per-animal joblib file at a time, which matches the reference repository's loading pattern and is consistent with the source data organization.",
+    "decision_correctness_justification": "The agent loads the same per-animal joblib files the reference code uses and iterates through the day/session dimension inside each animal record. That matches the dataset organization and the reference `load_dat(..., format=\"joblib\")` path.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code enumerates `QLAK-CA1-*` files, loads them with `joblib.load`, and iterates through each day's session before trializing."
+    "code_correctness_justification": "The code does exactly that: `get_animals()` finds the animal files and `load_animal()` loads each one with `joblib.load(...)[animal]` before iterating over `animal_data[\"trace\"].shape[0]`."
   },
   "1-b": {
     "question": "How are the data split into subjects (mice)?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using one source file per `QLAK-CA1-*` animal as one subject is consistent with the raw dataset and paper.",
+    "decision_correctness_justification": "One file corresponds to one mouse in the reference dataset, so using the sorted animal file names as subjects is consistent with the raw data and reference code.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The script builds `subjects` from sorted filenames and maps sessions back to those subject indices."
+    "code_correctness_justification": "The script sets `subjects = animals` and records each session's mouse with `subject_idx` derived from `subject_to_idx[animal]`."
   },
   "1-c": {
     "question": "How are the data split into sessions?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Treating each day index as one session matches the released data structure and the paper's one-session-per-day design.",
+    "decision_correctness_justification": "The reference dataset stores one session per day for each animal, and the agent treats each day index as one session. That matches the paper and the reference code.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code iterates over `day_idx` in `animal_data['trace'].shape[0]` and assigns one `SessionRecord` per day."
+    "code_correctness_justification": "The code iterates over `day_idx in range(ndays)` and indexes `trace`, `position`, `envs`, and `blocked` by that same day index."
   },
   "1-d": {
     "question": "How are the data split into trials?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The instructions explicitly require splitting continuous sessions into 1-minute trials, and the agent does that uniformly across sessions.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The source dataset has no native trials, so imposing 1 minute trials follows the decoder-task instructions. The concerning part is that the code still forces 40 chunks even for slightly short sessions, so some final trials are shorter than 1 minute, which is only an approximation to the requested structure.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code creates consecutive 1800-frame slices over the first nominal 40 minutes of each session."
+    "code_correctness_justification": "The implementation matches the documented choice: it creates 60 second slices at 30 Hz, caps sessions at 40 minutes, and keeps a short final slice if it has at least 3 frames."
   },
   "1-e": {
     "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The agent applies almost no trial QC beyond minimum length. That is not plainly forbidden, but it omits the stronger frame/cell curation used by the reference decoder pipeline.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Relative to the reference decoder path, the exported trials omit the key curation step that low-velocity frames should be excluded and that low-activity cells should be excluded during decoding. The script effectively performs no meaningful trial/frame QC beyond minimum length.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code behaves exactly as described: it keeps all nominal chunks except those too short to make one 3-frame bin."
+    "code_correctness_justification": "The code implements that no-QC decision faithfully: it only excludes slices shorter than one temporal bin."
   },
   "2-a": {
     "question": "What variables in the raw data is the `neural` data derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the released `trace` field as the neural signal is consistent with the paper and repository, which operate on binarized calcium-event traces rather than recomputed fluorescence.",
+    "decision_correctness_justification": "Using the released `trace` field is consistent with the paper and the reference code, which operate on the preprocessed binarized calcium-event traces rather than recomputing fluorescence features.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The script derives neural data directly from `animal_data['trace'][day]`."
+    "code_correctness_justification": "The neural stream is taken directly from `animal_data[\"trace\"][day]`, then session-invalid cells are removed."
   },
   "2-b": {
     "question": "How is the `neural` data processed?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The agent averages 3-frame bins but does not apply the Gaussian temporal smoothing that the reference decoder functions apply before pooling. That is a substantive mismatch from the cited reference code path.",
+    "decision_correctness_justification": "The agent keeps the correct source signal, but it does not reproduce the full reference decoder preprocessing. In the reference `fit_decoder` and `test_decoder`, traces are Gaussian-smoothed with `gaussian_filter1d(..., sigma=temporal_bin_size)` before `AvgPool1d` pooling. The export script only does raw 3-frame averaging.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code correctly implements the agent's own simpler decision: direct mean pooling without the reference smoothing step."
+    "code_correctness_justification": "The code consistently implements the agent's actual choice: direct 3-frame mean pooling of the released trace without temporal smoothing."
   },
   "2-c": {
     "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Dropping only NaN/unregistered cells is defensible, but the reference decoding code also filters low-velocity frames and low-activity cells. Omitting those filters is a notable divergence that should be checked.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The script only removes NaN/unregistered cells. The reference decoder additionally filters frames by velocity (`v_thresh=5`) and cells by event count (`cell_threshold=5`) before fitting and testing. Those reference curation steps are missing.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code only applies the NaN-based valid-cell mask, exactly as documented."
+    "code_correctness_justification": "The implementation matches the simplified decision: `get_valid_cell_mask()` is the only neural QC filter applied in conversion."
   },
   "2-d": {
     "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "With no trial event in the raw data, aligning to the start of each imposed 1-minute chunk is consistent with the task instructions.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "There is no natural trial event in the source experiment, so aligning to the start of imposed 1 minute chunks is understandable. It is still a synthetic alignment, not a reference experimental event, so a human should verify that this is acceptable for the downstream task.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The trial slices start at each chunk boundary and the metadata explicitly names trial start as the alignment event."
+    "code_correctness_justification": "The metadata and trial slicing both use chunk onset as the alignment point."
   },
   "2-e": {
     "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using 3 raw frames per time bin matches the reference decoder's temporal bin size and the instructions' need for common trial bins.",
+    "decision_correctness_justification": "Choosing 100 ms bins from 3 original frames matches the temporal bin size used by the reference decoder and is the correct rebinning scale for this task. The missing trace smoothing is a separate issue captured in 2-b.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code pools both neural and position streams over `TEMPORAL_BIN_FRAMES = 3` and records `TIME_BIN_MS = 100.0`."
+    "code_correctness_justification": "The code sets `TEMPORAL_BIN_FRAMES = 3`, `TIME_BIN_MS = 100.0`, and rebins both neural and position streams accordingly."
   },
   "3-a": {
     "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The agent uses raw `blocked` rather than the repository's `envs -> get_env_mat()` path. That may be reasonable, but it is a deviation from the cleaner reference code representation.",
+    "decision_correctness_justification": "The reference code represents geometry via `envs` and `get_env_mat(env)`, but the agent instead uses the raw `blocked` field. That is defensible because the task explicitly asks for blocked geometry and the trajectory shows the helper templates do not exactly match the raw blocked layouts for some shapes, but it is still a departure from the reference code path.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code consistently derives geometry from `animal_data['blocked'][day]`."
+    "code_correctness_justification": "The code consistently derives geometry from `animal_data[\"blocked\"][day]`."
   },
   "3-b": {
     "question": "What processing is involved in computing `input` *Environment geometry*?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The open-mask conversion and transpose are internally coherent, but the use of raw blocked indices instead of the reference geometry helper makes the representation choice uncertain relative to the intended solution.",
+    "decision_correctness_justification": "Converting blocked indices into a 9-element binary mask is reasonable for the decoder specification, but the transpose/flatten convention is an agent choice rather than something directly specified in the reference code. Because the reference uses named environments instead, this mapping should be checked by a human.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code correctly converts blocked indices to a 9-element open/closed vector and transposes it to the chosen output-class ordering."
-  },
-  "3-c": {
-    "question": "How is the `input` *Environment geometry* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Treating geometry as static contextual input per trial is appropriate because arena geometry does not vary within the session.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same `open_mask` is copied into every trial within a session."
+    "code_correctness_justification": "The implementation matches the documented decision exactly: initialize all-open, zero the blocked indices unless the code is `-1`, then reshape-transpose-flatten."
   },
   "4-a": {
     "question": "What variables in the raw data is `output` *Mouse position* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Deriving output from the raw `position` stream matches the repository and methods.",
+    "decision_correctness_justification": "The paper and reference code use the raw x-y `position` stream for spatial analyses and decoding, so deriving the decoder output from `position` is correct.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The script uses `animal_data['position'][day]` directly."
+    "code_correctness_justification": "The code reads `animal_data[\"position\"][day]` and uses it for per-trial output construction."
   },
   "4-b": {
     "question": "What processing is involved in computing `output` *Mouse position*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The agent bins position in the same 3-frame windows as neural data and uses session-wise maxima for scaling, which is consistent with the reference decoder's spatial binning logic adapted to 3x3 classes.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "Averaging behavior into 3-frame bins is consistent with the reference decoder, but the exact spatial scaling is not. The reference within-session decoder uses a single `bin_down` computed from the largest axis maximum across the session, whereas the agent uses separate x and y maxima. That is a plausible adaptation to 3x3 bins, but it is not the same processing.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code computes `session_max_xy`, pools position by 3 frames, and then discretizes from those pooled x-y values."
+    "code_correctness_justification": "The code does what the agent chose: same trial slices as neural, 3-frame averaging, and per-axis session maxima for later discretization."
   },
   "4-c": {
     "question": "How is `output` *Mouse position* thresholded into categories?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The floor-and-clip conversion based on session-wise maxima is the same style of discretization the reference code uses, with bin count changed from 15 to 3 per dimension as required by the task.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The floor-and-clip discretization is a reasonable 3x3 adaptation, but it is only approximately based on the reference code because the reference decoder bins into a 15x15 grid using a global spatial scale and then one-hot encodes position. The agent's 9-class scalar encoding is acceptable for the task but not a literal replica of the reference processing.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The discretization function implements the stated floor, clip, and `x_bin * 3 + y_bin` class mapping."
+    "code_correctness_justification": "The implementation matches the decision: divide by one-third of the axis maximum, floor, clip to 0..2, then map to `x_bin * 3 + y_bin`."
   },
   "4-d": {
     "question": "How is `output` *Mouse position* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using identical trial boundaries and temporal bins for neural and position is the correct alignment choice.",
+    "decision_correctness_justification": "Using the same frames, same imposed trial boundaries, and same 3-frame temporal bins for neural and position is the correct way to preserve alignment given the simultaneous 30 Hz recordings described in the paper.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Both streams are sliced by the same `start, end` pairs and pooled with the same function."
+    "code_correctness_justification": "The code slices `trace_valid` and `position_valid` with the same `(start, end)` pairs and rebins both with `temporal_bin_mean`."
   },
-  "5-a": {
-    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "100 ms bins from non-overlapping 3-frame windows are consistent with the reference decoder's temporal bin size.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The constants and pooling implementation match the stated 100 ms resolution."
-  },
-  "5-b": {
-    "question": "How are the neural, input, and output data temporally aligned?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Neural and position are jointly binned, and the static geometry input is aligned at the trial level, which is appropriate for a non-time-varying contextual variable.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation uses shared trial slices for neural/output and duplicates the static geometry per trial."
-  },
-  "6": {
-    "question": "How are minor issues in the data (e.g., missing data, malformed entries) handled?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The handling is minimal and assumes the released data are mostly clean. That is plausible, but there is little protection against malformed entries beyond NaNs and short segments.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly the limited handling described: NaN-cell removal, short-segment dropping, truncation to nominal session length, and `-1` handling for `blocked`."
-  },
-  "7-a": {
-    "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identifying joblib decompression/loading and repeated session/trial processing as the main costs is accurate for this script.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those are in fact the dominant loops and I/O paths in the implementation."
-  },
-  "7-b": {
-    "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The per-trial loop is the clearest remaining vectorization opportunity.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code currently loops over trial slices rather than reshaping whole sessions into trial blocks."
-  },
-  "7-c": {
-    "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Repeated temporal binning per trial and repeated copying of static geometry are genuine sources of repeated work.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those repeated operations are plainly present in `convert_session`."
-  },
-  "7-d": {
-    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The optional plots and debug bookkeeping are useful for validation but not needed by the downstream decoder.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code stores debug metadata and constructs plotting-specific intermediates that downstream training does not consume."
-  },
-  "8": {
+  "5": {
     "question": "How are minor mistakes in the data, e.g. missing data, handled?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Same reasoning as question 6: the handling is lightweight and mostly assumes clean inputs.",
+    "decision_correctness_justification": "Treating NaN traces as absent/unregistered cells is consistent with the reference data organization. The concern is that the script adds little else: it assumes position data are clean, uses `np.nanmax` but not `nanmean`, and has no explicit strategy for sporadic missing behavioral samples or other minor corruptions.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code's limited safeguards match the documented behavior."
+    "code_correctness_justification": "The implementation matches that limited handling strategy: NaN-based cell exclusion, session-length clipping, and otherwise no extra missing-data logic."
   },
-  "9-a": {
+  "6-a": {
     "question": "What are the most time-consuming steps of the code?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as 7-a.",
+    "decision_correctness_justification": "The trajectory and notes support that joblib loading/decompression of the large per-animal files is the dominant cost, followed by repeated per-session conversion over long recordings.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Same as 7-a."
+    "code_correctness_justification": "Those expensive steps are present in the code: repeated `joblib.load` calls and nested animal/session/trial conversion loops."
   },
-  "9-b": {
+  "6-b": {
     "question": "What loops in the code could have been vectorized to improve efficiency?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as 7-b.",
+    "decision_correctness_justification": "The remaining per-trial loop inside `convert_session()` is the main vectorization opportunity because the actual temporal pooling kernel is already vectorized. Repeating the static input append is also unnecessary overhead.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Same as 7-b."
+    "code_correctness_justification": "The described loops do exist exactly as stated in the script."
   },
-  "9-c": {
+  "6-c": {
     "question": "What processing does the code repeat multiple times?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as 7-c.",
+    "decision_correctness_justification": "The code does repeat static geometry per trial, trial-level pooling for every slice, and session bookkeeping in parallel metadata lists. That is an accurate description of the implementation.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Same as 7-c."
+    "code_correctness_justification": "The script repeatedly appends `open_mask.copy()` for each trial and repeatedly stores per-session metadata fields."
   },
-  "9-d": {
+  "6-d": {
     "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as 7-d.",
+    "decision_correctness_justification": "The optional processing plots, debug structures, and rich session metadata are not consumed by the downstream decoder training. They are useful for human verification but unnecessary for the exported learning problem itself.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Same as 7-d."
+    "code_correctness_justification": "Those optional and auxiliary computations are present in the script and are separate from the actual `neural`/`input`/`output` arrays used for decoder training."
   }
 }
