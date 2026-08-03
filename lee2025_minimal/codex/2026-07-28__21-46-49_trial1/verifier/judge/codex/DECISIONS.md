@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI did not load the original `.mat` files. It hard-coded the seven animal IDs, loaded the repository's extensionless joblib files from `/app/data/QLAK-CA1-*`, and then iterated through each animal's per-day arrays to build sessions and trials.
+i. The AI does not load the original `.mat` files. It hardcodes the seven animal IDs, loads one joblib file per animal from `/app/data`, and then iterates through each animal's per-day arrays inside the loaded dictionary. Sessions and trials are constructed later inside `build_dataset()`.
 
 ii.
 ```python
@@ -15,66 +15,76 @@ ANIMALS = [
     "QLAK-CA1-74",
     "QLAK-CA1-75",
 ]
-
+...
+DATA_DIR = "/app/data"
+...
 def load_animal(animal: str) -> dict[str, Any]:
     return joblib.load(os.path.join(DATA_DIR, animal))[animal]
-
+...
 for animal in ANIMALS:
     dat = load_animal(animal)
 ```
 
-iii. In `CONVERSION_NOTES.md`, the AI justified this by saying the joblib files are the repository's own converted form of the MATLAB data and preserve the paper fields directly. Trajectory step 57 also states that it chose the joblib animals as the "source of truth."
+iii. The justification given in `CONVERSION_NOTES.md` and the trajectory is that the repository's animal-level joblib files were treated as the "source of truth" because they already expose the paper fields directly. The agent explicitly said: "Reuse the repository’s animal-level joblib files as the source of truth" and described them as preserving `envs`, `blocked`, `position`, and `trace`.
 
 ## 1-b. How are the data split into subjects?
 
-i. Each subject is one hard-coded animal ID. The output `subjects` list is just the `ANIMALS` list, and each session gets a `subject_idx` pointing back to that list.
+i. Subjects are the seven hardcoded animal IDs in `ANIMALS`. The script copies that list into `subjects` and uses a lookup table to assign each session to a subject index.
 
 ii.
 ```python
 subjects = list(ANIMALS)
 subject_lookup = {animal: idx for idx, animal in enumerate(subjects)}
-
+...
 data: dict[str, Any] = {
     ...
     "subjects": subjects,
     "subject_idx": [],
     ...
 }
-
+...
 data["subject_idx"].append(subject_lookup[animal])
 ```
 
-iii. `CONVERSION_NOTES.md` says subject ordering follows the repository animal IDs. No additional justification was given beyond matching the repository's subject ordering.
+iii. The justification in `CONVERSION_NOTES.md` is that subject ordering should follow the repository animal IDs, which it lists explicitly. The trajectory also says the conversion should "mirror its conventions for ... session ordering."
 
 ## 1-c. How are the data split into sessions?
 
-i. The AI treated each recording day in the joblib structure as one session. It iterated over `envs` day indices, and each day produced one session in the output dataset.
+i. Each recording day within one animal file becomes one session. The script iterates over `envs` by `day_idx`, and for each day it reads the corresponding `blocked`, `position`, and `trace` entries and appends one session to the output lists.
 
 ii.
 ```python
-envs = [parse_env_label(v) for v in dat["envs"]]
-...
-for day_idx, env in enumerate(envs):
+for animal in ANIMALS:
+    dat = load_animal(animal)
+    envs = [parse_env_label(v) for v in dat["envs"]]
     ...
-    data["neural"].append(session_neural)
-    data["input"].append(session_input)
-    data["output"].append(session_output)
+    for day_idx, env in enumerate(envs):
+        blocked_mask = parse_blocked_mask(dat["blocked"][day_idx])
+        position = np.asarray(dat["position"][day_idx], dtype=np.float64).T
+        trace = np.asarray(dat["trace"][day_idx], dtype=np.float32)
+        ...
+        data["neural"].append(session_neural)
+        data["input"].append(session_input)
+        data["output"].append(session_output)
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly says "Sessions are recording days" and cites the resulting 207 sessions as matching the paper and repository summaries.
+iii. The justification in the notes is: "Sessions are recording days. This yields 207 sessions total, matching the paper and repository summaries." The trajectory also says: "Convert each recording day into one decoder session."
 
 ## 1-d. How are the data split into trials?
 
-i. The AI forced each session into 40 nominal one-minute trials of 1800 frames each. It kept a shorter final trial if the session was under 72,000 frames and truncated frames beyond 72,000 if the session was longer.
+i. The AI imposes 40 nominal 1-minute trials per session at 30 Hz. It defines `TRIAL_FRAMES = 1800`, truncates sessions longer than 40 minutes to 72,000 frames, and creates 40 consecutive slices. If a session is shorter than 72,000 frames, the final slice may be shorter than 1,800 frames rather than being dropped.
 
 ii.
 ```python
 FPS = 30.0
 TRIAL_SECONDS = 60.0
 TRIAL_FRAMES = int(FPS * TRIAL_SECONDS)
+NOMINAL_SESSION_SECONDS = 40.0 * 60.0
 NOMINAL_SESSION_FRAMES = int(FPS * NOMINAL_SESSION_SECONDS)
 N_TRIALS_PER_SESSION = 40
-
+...
+keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
+...
 def build_trial_slices(n_timepoints: int) -> list[slice]:
     if n_timepoints < (N_TRIALS_PER_SESSION - 1) * TRIAL_FRAMES + 2:
         raise ValueError(f"Session too short for 40 nominal trials: {n_timepoints} frames")
@@ -82,67 +92,62 @@ def build_trial_slices(n_timepoints: int) -> list[slice]:
     for trial_idx in range(N_TRIALS_PER_SESSION):
         start = trial_idx * TRIAL_FRAMES
         end = min((trial_idx + 1) * TRIAL_FRAMES, n_timepoints)
-        ...
         trial_slices.append(slice(start, end))
     return trial_slices
-
-keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
-trial_slices = build_trial_slices(keep_frames)
 ```
 
-iii. `CONVERSION_NOTES.md` says the recordings are nominally 40 minutes at 30 Hz and that the AI therefore split each day into 40 consecutive nominal one-minute trials, keeping a short final trial for shorter sessions and truncating longer sessions at 40 minutes.
+iii. The justification from `CONVERSION_NOTES.md` is that recordings are "nominally 40 min at 30 Hz" and therefore each day was split into "40 consecutive nominal 1 min trials." The trajectory says the agent wanted to "split the retained 30 Hz stream into 40 nominal 1-minute trials" and avoid interpolation.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI did not apply trial-quality filtering. Every nominal trial slice was kept once the session passed the minimum-length check, including short final trials.
+i. There is no explicit trial-quality filter based on behavior or signal quality. Instead, the code enforces a length-based convention: sessions longer than 40 nominal minutes are truncated, sessions too short to produce 40 nominal slices raise an error, and shorter-than-full final trials are kept if they exist.
 
 ii.
 ```python
-trial_slices = build_trial_slices(keep_frames)
-session_neural: list[np.ndarray] = []
+keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
+dropped_frames = original_frames - keep_frames
 ...
-for trial_slice in trial_slices:
-    neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
-    output_trial = np.asarray(spatial_bins[trial_slice][None, :], dtype=np.int64)
-    input_trial = blocked_mask.astype(np.float32).copy()
-    ...
-    session_neural.append(neural_trial)
+if n_timepoints < (N_TRIALS_PER_SESSION - 1) * TRIAL_FRAMES + 2:
+    raise ValueError(f"Session too short for 40 nominal trials: {n_timepoints} frames")
+...
+if neural_trial.shape[1] < TRIAL_FRAMES:
+    stats["short_final_trials"] += 1
 ```
 
-iii. No explicit trial-quality justification was given. The notes only justify the nominal 40-trial segmentation scheme.
+iii. The notes justify this as a decoder-formatting choice rather than a paper-driven quality control: sessions are nominally 40 minutes, shorter final trials are kept, and long sessions are truncated at the nominal boundary.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The AI derived neural data from `dat["trace"][day_idx]` in the joblib animal files.
+i. `neural` is derived from the `trace` field inside each loaded animal dictionary, specifically `dat["trace"][day_idx]` for each day/session.
 
 ii.
 ```python
 trace = np.asarray(dat["trace"][day_idx], dtype=np.float32)
 ```
 
-iii. `CONVERSION_NOTES.md` says the joblib files preserve the paper fields directly and that neural activity uses the paper's `trace` data.
+iii. The justification in `CONVERSION_NOTES.md` is that the conversion uses the repository's preserved paper fields directly, and that neural activity should use the dataset's "rise-extracted binary calcium event traces."
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI kept the session's `trace` values at native frame resolution, cast them to `float32`, removed unregistered neurons, truncated to at most 40 nominal minutes, and then sliced into per-trial `(neurons, time)` arrays. Because the joblib source is already stored as `(neurons, time)`, it did not transpose.
+i. The script casts each session trace to `float32`, removes unregistered neurons, truncates the time axis to the nominal session length, and then slices the `(neurons, time)` matrix into per-trial matrices. It does not rebin or otherwise transform the neural time series.
 
 ii.
 ```python
 trace = np.asarray(dat["trace"][day_idx], dtype=np.float32)
 registered = ~np.isnan(trace).any(axis=1)
+...
 trace = trace[registered]
 ...
-keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
 trace = trace[:, :keep_frames]
 ...
 neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
 ```
 
-iii. `CONVERSION_NOTES.md` says neural activity uses the paper's rise-extracted binary calcium event traces and that no re-smoothing was applied. Trajectory step 39 says it verified 30 Hz position plus binary rise-extracted traces before finalizing the design.
+iii. The notes justify this by claiming the stored `trace` values are already the desired processed neural signal, so the main remaining work is dropping unregistered rows and packaging the data into decoder trials.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. The AI removed neurons that were not registered on that day by dropping any row containing `NaN`, and it asserted that such rows were entirely NaN rather than partially missing.
+i. Neurons are filtered session-by-session using NaN-based registration masks. Any neuron row containing NaNs is treated as unregistered and removed. The code also asserts that there are no partially missing rows by checking that `any NaN` and `all NaN` give the same mask.
 
 ii.
 ```python
@@ -150,13 +155,16 @@ registered = ~np.isnan(trace).any(axis=1)
 if not np.array_equal(registered, ~np.isnan(trace).all(axis=1)):
     raise ValueError(f"Found partially NaN neurons in {animal} day {day_idx}")
 trace = trace[registered]
+...
+if np.isnan(neural_trial).any() or np.isnan(output_trial).any() or np.isnan(input_trial).any():
+    raise ValueError(f"NaNs found after conversion for {animal} day {day_idx}")
 ```
 
-iii. `CONVERSION_NOTES.md` says unregistered neurons are removed session-by-session by dropping rows that are all `NaN` on that day. Trajectory step 39 says the AI verified that per-day neuron registration masks are encoded as `NaN`s.
+iii. The trajectory says the agent "verified the raw session streams are ... traces, with per-day neuron registration masks encoded as `NaN`s." The notes say: "Unregistered neurons are removed session-by-session by dropping rows that are all `NaN` on that day."
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. The AI did not align neural data to an experimental event. It treated the start of each consecutive one-minute segment as the alignment event and reported that in metadata.
+i. The AI does not use a biological or task event. It aligns each trial to the start of each artificial consecutive 1-minute segment within a recording day, and records that in metadata.
 
 ii.
 ```python
@@ -169,27 +177,34 @@ ii.
 }
 ...
 trial_slices = build_trial_slices(keep_frames)
+for trial_slice in trial_slices:
+    neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
 ```
 
-iii. The notes say these one-minute trials are decoder-specific formatting decisions rather than paper-defined events. No stronger event-based justification was given.
+iii. The justification is implicit in the notes and trajectory: trials were artificial 1-minute segments, so the agent chose the segment start as the alignment event for metadata purposes.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted data stays at 30 Hz, so the time bin size is `1000/30` ms, about 33.33 ms. No temporal rebinning is applied.
+i. The converted data remain at 30 Hz, with `time_bin_size = 1000 / 30` ms (`33.333...` ms). No temporal rebinning is applied.
 
 ii.
 ```python
 FPS = 30.0
 TIME_BIN_MS = 1000.0 / FPS
 ...
-"time_bin_size": TIME_BIN_MS,
+"metadata": {
+    ...
+    "time_bin_size": TIME_BIN_MS,
+    "fps": FPS,
+    ...
+}
 ```
 
-iii. `CONVERSION_NOTES.md` says the recordings are 30 Hz and describes trialization only, not any temporal downsampling or rebinning.
+iii. The trajectory explicitly says the agent wanted to "split into true 1-minute trials without inventing interpolation," and the notes describe the recordings as 30 Hz streams used directly.
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. The actual decoder input is derived from `dat["blocked"][day_idx]`. The AI also read `dat["envs"][day_idx]`, but only to sanity-check that the blocked mask matches the named geometry.
+i. The environment-geometry input is derived from the per-day `blocked` field. The script also consults `envs` to check that the blocked mask matches the named environment geometry, but the actual decoder input comes from `blocked_mask`.
 
 ii.
 ```python
@@ -201,16 +216,18 @@ if not np.array_equal(blocked_mask, expected_mask):
     stats["blocked_env_mismatches"].append(...)
 ```
 
-iii. `CONVERSION_NOTES.md` says the decoder input is a blocked-partition mask and that `blocked` values were checked against the environment labels and matched the expected geometry masks.
+iii. The trajectory says "`blocked` is the exact 3x3 occlusion descriptor that should drive the decoder input." The notes say the mask uses the dataset's partition numbering and is the decoder input.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The AI flattened the raw blocked entry, interpreted `[-1]` as "no blocked bins," converted the remaining blocked partition indices into a 9D binary mask, and used bottom-up row-major numbering.
+i. The script flattens the blocked specification, converts `[-1]` to an all-zero 9-vector, maps blocked indices to a 9D float mask, and then copies that same static mask into every trial for the session.
 
 ii.
 ```python
 def parse_blocked_mask(value: Any) -> np.ndarray:
     flat = np.array(flatten_numeric(value), dtype=float)
+    if flat.size == 0:
+        raise ValueError("Blocked entry was empty")
     if flat.size == 1 and np.isclose(flat[0], -1.0):
         return np.zeros(9, dtype=np.float32)
     blocked = np.unique(flat.astype(int))
@@ -218,38 +235,27 @@ def parse_blocked_mask(value: Any) -> np.ndarray:
     mask = np.zeros(9, dtype=np.float32)
     mask[blocked] = 1.0
     return mask
+...
+input_trial = blocked_mask.astype(np.float32).copy()
+session_input.append(input_trial)
 ```
 
-iii. `CONVERSION_NOTES.md` says the mask uses the dataset's bottom-up row-major partition numbering and is intended to represent which partitions are blocked in the 3x3 arena.
-
-## 3-c. How is the `input` *Environment geometry* aligned with the neural data?
-
-i. The input is not time-varying. The AI copied the same 9D blocked-mask vector into every trial for that session, so alignment is at the session/trial level rather than frame-by-frame.
-
-ii.
-```python
-for trial_slice in trial_slices:
-    ...
-    input_trial = blocked_mask.astype(np.float32).copy()
-    session_input.append(input_trial)
-```
-
-iii. `CONVERSION_NOTES.md` explicitly describes the geometry input as a static per-trial mask.
+iii. The notes justify this as a decoder-formatting decision: "Decoder input is a 9D static blocked-partition mask per trial."
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. The output position labels are derived from `dat["position"][day_idx]` in the joblib source.
+i. The output position is derived from the `position` field for each day/session, i.e. `dat["position"][day_idx]`.
 
 ii.
 ```python
 position = np.asarray(dat["position"][day_idx], dtype=np.float64).T
 ```
 
-iii. `CONVERSION_NOTES.md` says the spatial output is derived from the position stream and transformed into a 3x3 spatial-bin readout.
+iii. The trajectory says the agent verified the raw session streams were "30 Hz position plus binary rise-extracted traces," and the notes describe the spatial output as being computed from the tracked position stream.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The AI first calibrated an animal-specific absolute arena frame from that animal's square sessions, then shifted positions into that frame, divided each axis into three equal bins, clipped the result to `0..2`, converted `(x_bin, y_bin)` into a single class `y * 3 + x`, and finally snapped any positions that fell into blocked bins to the nearest open-bin center.
+i. The AI first calibrates an animal-specific absolute arena frame from all square sessions, using the minimum square-session coordinates as origin and the maximum shifted extent as arena size. For each session it shifts positions into that frame, bins them into a 3x3 grid, clips out-of-range values, and then snaps any frame that lands in a blocked bin to the nearest open bin center.
 
 ii.
 ```python
@@ -262,22 +268,23 @@ def calibrate_animal_arena(dat: dict[str, Any]) -> tuple[np.ndarray, float, floa
     shifted = all_square - arena_min[None, :]
     arena_side = float(np.nanmax(shifted))
     return arena_min.astype(np.float64), arena_side / N_POSITION_BINS, arena_side
-
+...
 def position_to_bins(position_xy, arena_min, bin_size):
     shifted = position_xy - arena_min[None, :]
     coords = np.floor(shifted / bin_size).astype(np.int64)
     coords = np.clip(coords, 0, N_POSITION_BINS - 1)
     bin_ids = coords[:, 1] * N_POSITION_BINS + coords[:, 0]
     return coords, bin_ids
-
+...
+_, spatial_bins = position_to_bins(position, arena_min, bin_size)
 spatial_bins, snapped = clean_blocked_bins(position, spatial_bins, blocked_mask, arena_min, bin_size)
 ```
 
-iii. `CONVERSION_NOTES.md` says this was done to preserve translated geometries such as `rectangle`, which the AI believed would be misaligned by per-session min-shifting. It further justified snapping blocked-bin frames as mirroring the reference code's geometry masking.
+iii. The trajectory justifies this as a geometry-alignment fix: per-session min-shifting was said to break translated geometries such as `rectangle`, so the agent switched to an animal-level square-session calibration. The notes further justify snapping blocked-bin frames as a geometry-consistency cleaning step.
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. Each frame is assigned to one of 9 categories by thresholding x and y into three bins each and converting the 2D bin pair into a single bottom-up row-major class ID. Frames assigned to blocked categories are reassigned to the nearest open category.
+i. Position is thresholded into three bins per axis, then converted to a single class ID with bottom-up row-major indexing: `class_id = y_bin * 3 + x_bin`. The thresholds come from the calibrated animal-specific arena origin and bin size rather than direct fixed `[0, 25, 50, 75]` edges. Values outside the arena are clipped into the nearest valid bin, and blocked-bin assignments may then be reassigned to the nearest open class.
 
 ii.
 ```python
@@ -290,11 +297,11 @@ for idx in np.flatnonzero(bad):
     cleaned[idx] = int(open_ids[int(np.argmin(d2))])
 ```
 
-iii. The notes justify the class IDs as bottom-up row-major 3x3 bins and justify the blocked-bin reassignment as a geometry-consistency cleaning step.
+iii. The notes say the output classes use bottom-up row-major indexing and that the animal-level square-session calibration produces an effective 25 cm bin size while preserving translated geometries. The trajectory says the agent "brute-forc[ed] the simple flip/swap conventions" to make input and output share partition IDs.
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. The AI kept neural and position data frame-synchronous by truncating both to the same `keep_frames`, converting position to bin IDs at frame resolution, and then slicing both streams with the same trial slices.
+i. Neural and position streams are aligned by truncating both to the same `keep_frames` value, then slicing both with the same `trial_slices`. The code also checks that each neural trial and output trial have matching time lengths.
 
 ii.
 ```python
@@ -303,108 +310,93 @@ trace = trace[:, :keep_frames]
 if trace.shape[1] != position.shape[0]:
     raise ValueError(f"Trace/position length mismatch for {animal} day {day_idx}")
 ...
-for trial_slice in trial_slices:
-    neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
-    output_trial = np.asarray(spatial_bins[trial_slice][None, :], dtype=np.int64)
-```
-
-iii. The notes present the good sample-decoder accuracy as a sanity check that the neural/activity alignment and spatial output formatting are coherent.
-
-## 5-a. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. The temporal resolution is still the native 30 Hz sampling rate, so each bin is about 33.33 ms. No rebinning is applied.
-
-ii.
-```python
-FPS = 30.0
-TIME_BIN_MS = 1000.0 / FPS
-```
-
-iii. No separate justification beyond preserving the native frame rate appears in the notes or trajectory.
-
-## 5-b. How are the neural, input, and output data temporally aligned?
-
-i. Neural and output streams are aligned frame-by-frame by applying the same truncation and the same one-minute `slice` objects. The input stream is static per trial and is copied once for each trial in the same session.
-
-ii.
-```python
-keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
-position = position[:keep_frames]
-trace = trace[:, :keep_frames]
-...
 trial_slices = build_trial_slices(keep_frames)
 for trial_slice in trial_slices:
     neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
     output_trial = np.asarray(spatial_bins[trial_slice][None, :], dtype=np.int64)
-    input_trial = blocked_mask.astype(np.float32).copy()
+    ...
+    if neural_trial.shape[1] != output_trial.shape[1]:
+        raise ValueError(f"Trial length mismatch for {animal} day {day_idx}")
 ```
 
-iii. The AI relied on shared frame indices and verification/training success as justification that alignment was coherent.
+iii. The justification is operational rather than textual: both arrays are sliced using the same frame count and the same per-trial indices.
 
-## 6. How are minor issues in the data (e.g., missing data, malformed entries) handled?
+## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI added defensive handling for multiple cases: flattening nested blocked entries, treating `[-1]` as no blocked bins, checking blocked indices for range errors, asserting that NaN neurons are entirely NaN rather than partially missing, truncating overly long sessions, keeping short final trials, and snapping blocked-bin position labels to nearby open bins.
+i. The code handles several edge cases explicitly. Empty `blocked` entries raise an error; `blocked == [-1]` becomes an all-open mask; out-of-range blocked indices raise an error; neurons with NaN-marked registration gaps are removed; partially NaN neuron rows raise an error; sessions longer than the nominal 40-minute length are truncated; sessions too short for 40 nominal slices raise an error; blocked/environment mismatches are recorded in stats; and position samples that land in blocked bins are snapped to the nearest open bin.
 
 ii.
 ```python
 if flat.size == 0:
     raise ValueError("Blocked entry was empty")
+if flat.size == 1 and np.isclose(flat[0], -1.0):
+    return np.zeros(9, dtype=np.float32)
 ...
 if np.any((blocked < 0) | (blocked > 8)):
     raise ValueError(f"Blocked indices out of range: {blocked.tolist()}")
 ...
+registered = ~np.isnan(trace).any(axis=1)
 if not np.array_equal(registered, ~np.isnan(trace).all(axis=1)):
     raise ValueError(f"Found partially NaN neurons in {animal} day {day_idx}")
 ...
 keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
 ...
+if n_timepoints < (N_TRIALS_PER_SESSION - 1) * TRIAL_FRAMES + 2:
+    raise ValueError(f"Session too short for 40 nominal trials: {n_timepoints} frames")
+...
 spatial_bins, snapped = clean_blocked_bins(position, spatial_bins, blocked_mask, arena_min, bin_size)
 ```
 
-iii. The notes justify these changes as decoder-specific formatting and geometry-consistency cleaning. There is no separate justification specifically framed as "minor issue" handling.
+iii. The notes justify the truncation and snapping as decoder-formatting and geometry-consistency choices. The trajectory shows the agent actively looking for missing position samples, NaNs, and geometry mismatches before deciding on these rules.
 
-## 7-a. What are the most time-consuming steps of the code?
+## 6-a. What are the most time-consuming steps of the code?
 
-i. The most expensive parts appear to be loading each large joblib animal file and then scanning many frame-wise arrays during arena calibration and blocked-bin cleaning. Those are the dominant whole-dataset operations in the script.
+i. The most time-consuming parts are loading the large animal joblib files, looping over all animals and days to process traces and positions, snapping blocked-bin frames inside `clean_blocked_bins`, and serializing the full converted dataset. The trajectory also says the conversion runtime was dominated by the heavy animal files and serializing the full trialized dataset.
 
 ii.
 ```python
 def load_animal(animal: str) -> dict[str, Any]:
     return joblib.load(os.path.join(DATA_DIR, animal))[animal]
+...
+for animal in ANIMALS:
+    dat = load_animal(animal)
+    ...
+    for day_idx, env in enumerate(envs):
+        ...
+        spatial_bins, snapped = clean_blocked_bins(position, spatial_bins, blocked_mask, arena_min, bin_size)
+        ...
+        for trial_slice in trial_slices:
+            neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
+```
 
-square_positions = [np.asarray(dat["position"][day], dtype=np.float64).T for day in square_days]
-all_square = np.concatenate(square_positions, axis=0)
+iii. The trajectory explicitly mentions that "the heavy part is the seven large animal files" and later that the conversion was slow partly because it was "serializing the full trialized dataset."
+
+## 6-b. What loops in the code could have been vectorized to improve efficiency?
+
+i. The clearest vectorization target is `clean_blocked_bins`, which loops once over open-bin IDs to build centers and then once over every blocked frame to compute nearest-center distances. Trial construction also uses Python loops over slices even though much of the session data could be reshaped or split more directly.
+
+ii.
+```python
+centers = []
+for open_id in open_ids:
+    y_bin = open_id // N_POSITION_BINS
+    x_bin = open_id % N_POSITION_BINS
+    centers.append(...)
 ...
 for idx in np.flatnonzero(bad):
     d2 = np.sum((centers - position_xy[idx][None, :]) ** 2, axis=1)
     cleaned[idx] = int(open_ids[int(np.argmin(d2))])
-```
-
-iii. The AI did not explicitly discuss runtime hotspots in the notes or trajectory. This is inferred from the implementation.
-
-## 7-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. The clearest vectorizable loop is the blocked-bin reassignment loop over every bad frame. The repeated Python loops over trial creation and over trial/session copying could also be reduced.
-
-ii.
-```python
-for open_id in open_ids:
-    ...
-for idx in np.flatnonzero(bad):
-    d2 = np.sum((centers - position_xy[idx][None, :]) ** 2, axis=1)
-    cleaned[idx] = int(open_ids[int(np.argmin(d2))])
-
-for trial_idx in range(N_TRIALS_PER_SESSION):
-    ...
+...
 for trial_slice in trial_slices:
-    ...
+    neural_trial = np.asarray(trace[:, trial_slice], dtype=np.float32)
+    output_trial = np.asarray(spatial_bins[trial_slice][None, :], dtype=np.int64)
 ```
 
-iii. No explicit efficiency justification was given. This is inferred from the code structure.
+iii. This is inferred from the code structure rather than directly argued in the notes. The agent's runtime comments about the conversion being heavy are consistent with these loops being avoidable overhead.
 
-## 7-c. What processing does the code repeat multiple times?
+## 6-c. What processing does the code repeat multiple times?
 
-i. The AI repeatedly copies the same static blocked mask once per trial, repeatedly builds and appends trial lists session by session, and repeatedly deep-copies session objects again when constructing the sample dataset.
+i. The code repeatedly copies the same static blocked mask into every trial of a session, recomputes per-session trial slicing and trial packaging, and recomputes open-bin centers each time `clean_blocked_bins` is called. It also deep-copies the already-built full dataset when constructing the sample subset.
 
 ii.
 ```python
@@ -412,119 +404,36 @@ for trial_slice in trial_slices:
     ...
     input_trial = blocked_mask.astype(np.float32).copy()
     session_input.append(input_trial)
-
-def deep_subset_dataset(data: dict[str, Any], session_indices: list[int]) -> dict[str, Any]:
-    ...
-    if key in {"neural", "input", "output", "brain_region_idx"}:
-        subset[key] = [deepcopy(value[idx]) for idx in session_indices]
-```
-
-iii. No explicit justification was given for these repeated copies. The notes only say the sample dataset is a subset of the full dataset.
-
-## 7-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. The code computes extensive stats and session metadata, checks environment/blocked consistency, calibrates square-session arena bounds, and performs blocked-bin snapping. Most of that is used only for reporting and validation rather than by the decoder itself.
-
-ii.
-```python
-stats: dict[str, Any] = {
-    "animals": {},
-    ...
-    "blocked_env_mismatches": [],
-    "session_env_counts": Counter(),
-    "arena_side_lengths": {},
-}
 ...
-data["metadata"]["session_info"].append(
-    {
-        "animal": animal,
-        "day_index_within_animal": day_idx,
-        "environment": env,
+def clean_blocked_bins(...):
+    ...
+    centers = []
+    for open_id in open_ids:
         ...
-        "snapped_blocked_frames": snapped,
-        "arena_min_xy": arena_min.tolist(),
-        "arena_side_length": arena_side,
-        "bin_size": bin_size,
-    }
-)
+...
+sample_data = deep_subset_dataset(data, sample_session_indices)
 ```
 
-iii. The notes justify these computations as sanity checks against the paper and code. They are not justified as necessary for downstream decoding.
+iii. This is mostly evident from the implementation. The trajectory indicates the agent cared about validation and artifact generation more than minimizing repeated work.
 
-## 8. How are minor mistakes in the data, e.g. missing data, handled?
+## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. Same handling as 6: the AI validates malformed blocked entries, removes NaN neurons, checks for partially missing neuron rows, truncates overly long sessions, keeps short final trials, and snaps blocked-bin labels to open bins.
+i. Several computed values are not used by the decoder itself: `coords` returned from `position_to_bins` are immediately discarded; extensive `stats` bookkeeping and `metadata["session_info"]` are accumulated only for reporting; blocked/environment mismatch tracking is diagnostic only; and the built-in verification inside the conversion script is not part of the saved dataset contents.
 
 ii.
 ```python
-blocked_mask = parse_blocked_mask(dat["blocked"][day_idx])
-...
-registered = ~np.isnan(trace).any(axis=1)
-if not np.array_equal(registered, ~np.isnan(trace).all(axis=1)):
-    raise ValueError(...)
-...
-keep_frames = min(original_frames, NOMINAL_SESSION_FRAMES)
-...
-spatial_bins, snapped = clean_blocked_bins(position, spatial_bins, blocked_mask, arena_min, bin_size)
-```
-
-iii. The justification is the same as in 6: decoder-specific formatting choices and geometry-consistency cleaning, not an explicit paper-derived missing-data policy.
-
-## 9-a. What are the most time-consuming steps of the code?
-
-i. Same as 7-a: loading the large joblib animal files and then doing whole-session array scans for arena calibration and blocked-bin reassignment are the most expensive steps.
-
-ii.
-```python
-def load_animal(animal: str) -> dict[str, Any]:
-    return joblib.load(os.path.join(DATA_DIR, animal))[animal]
-...
-all_square = np.concatenate(square_positions, axis=0)
-...
-for idx in np.flatnonzero(bad):
-    d2 = np.sum((centers - position_xy[idx][None, :]) ** 2, axis=1)
-```
-
-iii. No explicit runtime justification was given; this is inferred from the implementation.
-
-## 9-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. Same as 7-b: the blocked-bin reassignment loops and trial construction loops are the most obvious candidates for vectorization.
-
-ii.
-```python
-for open_id in open_ids:
+def position_to_bins(...):
     ...
-for idx in np.flatnonzero(bad):
-    ...
-for trial_idx in range(N_TRIALS_PER_SESSION):
-    ...
-```
-
-iii. No explicit efficiency justification was given.
-
-## 9-c. What processing does the code repeat multiple times?
-
-i. Same as 7-c: the code repeats blocked-mask copies per trial, session-by-session list construction, and deep-copying when materializing the sample subset.
-
-ii.
-```python
-input_trial = blocked_mask.astype(np.float32).copy()
+    return coords, bin_ids
 ...
-subset[key] = [deepcopy(value[idx]) for idx in session_indices]
-```
-
-iii. No explicit justification was given.
-
-## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. Same as 7-d: it computes extensive stats and session metadata, geometry sanity checks, and blocked-bin snapping that are not required by the decoder's input/output interface.
-
-ii.
-```python
+_, spatial_bins = position_to_bins(position, arena_min, bin_size)
+...
 stats["blocked_env_mismatches"].append(...)
 ...
 data["metadata"]["session_info"].append(...)
+...
+valid, errors, warnings = run_decoder_verify(data)
+stats["verify_data_format"] = {"valid": valid, "errors": errors, "warnings": warnings}
 ```
 
-iii. The notes frame these as validation and sanity checks rather than decoder necessities.
+iii. This follows directly from the code. The notes make clear that many of these computations were added as sanity checks and documentation support rather than as decoder inputs.

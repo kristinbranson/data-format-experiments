@@ -2,45 +2,38 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads data directly from NWB files on disk using `h5py`, rather than using the Allen SDK's `VisualBehaviorOphysProjectCache`. It first reads metadata from CSV files in `project_metadata/` to identify available experiments, then filters to experiments for which NWB files exist on disk. Each NWB file is opened individually with `h5py.File()` and the relevant data arrays are read directly from the HDF5 structure.
+i. The AI loads data by reading NWB files directly via h5py and experiment metadata from CSV files. It filters the experiment table to active (non-passive) experiments only, then maps available NWB files on disk to experiment IDs. Each NWB file is opened with h5py and data arrays are read directly from the HDF5 groups.
 
 ii.
 ```python
-def get_experiment_metadata():
-    exp_table = pd.read_csv(os.path.join(METADATA_DIR, 'ophys_experiment_table.csv'))
-    nwb_files = glob.glob(os.path.join(NWB_DIR, '*.nwb'))
-    nwb_map = {}
-    for f in nwb_files:
-        eid = int(os.path.basename(f).replace('behavior_ophys_experiment_', '').replace('.nwb', ''))
-        nwb_map[eid] = f
-    our_exps = exp_table[exp_table['ophys_experiment_id'].isin(nwb_map.keys())].copy()
-    active_exps = our_exps[our_exps['passive'] == False].copy()
-    ...
-
+exp_table = pd.read_csv(os.path.join(METADATA_DIR, 'ophys_experiment_table.csv'))
+nwb_files = glob.glob(os.path.join(NWB_DIR, '*.nwb'))
+# ...
+active_exps = our_exps[our_exps['passive'] == False].copy()
+# ...
 with h5py.File(nwb_path, 'r') as f:
     dff_data = f['processing']['ophys']['dff']['traces']['data'][:]
     ophys_ts = f['processing']['ophys']['dff']['traces']['timestamps'][:]
-    ...
 ```
 
-iii. The AI chose to read NWB files directly with h5py rather than using the Allen SDK's cache/API layer. This was documented in the CONVERSION_NOTES step 1, where the agent mapped out the NWB internal structure. The agent noted that the SDK's loading functions ultimately read from the same NWB HDF5 paths, so direct access was considered equivalent.
+iii. The AI chose direct h5py access rather than the Allen SDK to avoid SDK overhead and dependency issues. It filtered to active sessions only because passive sessions lack meaningful behavioral responses (no licking), making trial outcomes meaningless. The 284 available NWB files represent a subset of the full Allen dataset.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are identified by unique `mouse_id` values from the experiment metadata CSV, filtered to only those experiments that have NWB files on disk and are non-passive.
+i. Subjects are identified from unique `mouse_id` values in the experiment metadata CSV, sorted and converted to strings.
 
 ii.
 ```python
 subjects_list = sorted(active_exps['mouse_id'].unique().astype(str).tolist())
-...
+# ...
 subject_idx = subjects_list.index(result['mouse_id'])
 ```
 
-iii. The mouse_id field from the metadata CSV is the standard identifier for each animal. The AI sorts subjects alphabetically for deterministic ordering.
+iii. The `mouse_id` field uniquely identifies each animal. Sorting ensures deterministic ordering across runs.
 
 ## 1-c. How are the data split into sessions?
 
-i. The AI treats each individual NWB experiment file (one imaging plane) as a separate session. It does NOT group multiple imaging planes from the same ophys session together. Each experiment is processed independently.
+i. Each experiment (single imaging plane / NWB file) is treated as a separate session. There is no grouping of multiple imaging planes within the same ophys session.
 
 ii.
 ```python
@@ -48,21 +41,21 @@ for idx, (_, row) in enumerate(active_exps.iterrows()):
     eid = row['ophys_experiment_id']
     nwb_path = nwb_map[eid]
     result = process_experiment(nwb_path, row, collect_stats_only=False)
-    ...
+    # Each experiment becomes one session
     all_sessions_neural.append(result['neural_trials'])
 ```
 
-iii. The AI documented in CONVERSION_NOTES: "Each NWB file is one 'experiment' (one imaging plane) - treat each as a session for the decoder." The reasoning was that each NWB file contains its own distinct set of neurons, so combining planes would require handling dimension mismatches.
+iii. The AI treated each NWB file as an independent session. The CONVERSION_NOTES state "Each NWB file = one imaging plane from one session." The AI did not group experiments by `ophys_session_id` to merge multiple imaging planes recorded simultaneously.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are defined using the NWB `intervals/trials` table. For each valid trial, the AI finds all stimulus presentations belonging to that trial via the `trials_id` field in the stimulus presentations table. Each stimulus presentation becomes one time bin (750ms). This gives variable-length trials measured in number of stimulus presentations.
+i. Trials are identified from the NWB `intervals/trials` table. The AI filters to Go and Catch trials, excluding Aborted and Auto-rewarded trials. Within each trial, stimulus presentations are found by matching `trials_id` in the stimulus presentations table. Each trial consists of the stimulus presentations belonging to that trial.
 
 ii.
 ```python
-trials = f['intervals']['trials']
 trial_mask = (trial_go | trial_catch) & ~trial_aborted & ~trial_auto
-...
+valid_trial_ids = trial_ids[trial_mask]
+# ...
 for trial_idx in np.where(trial_mask)[0]:
     tid = trial_ids[trial_idx]
     trial_stim_indices = np.where(stim_trials_id == tid)[0]
@@ -71,49 +64,48 @@ for trial_idx in np.where(trial_mask)[0]:
     n_bins = len(trial_stim_indices)
 ```
 
-iii. The AI segments trials by finding all stimulus presentations associated with each trial ID. This naturally gives one time bin per 750ms stimulus presentation (250ms image + 500ms grey). The AI noted this as a "natural task unit" that is consistent across equipment types.
+iii. The AI uses stimulus presentations grouped by trial ID to define trial boundaries, rather than using trial `start_time`/`stop_time`. This means each trial has a variable number of stimulus bins (typically ~11 bins of 750ms each).
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are filtered to include only Go and Catch trials, excluding Aborted and Auto-rewarded trials. The filter is `(go | catch) & ~aborted & ~auto_rewarded`. Trials with no stimulus presentations (empty `trial_stim_indices`) are skipped. Sessions with fewer than 2 valid trials are excluded. Additionally, only active (non-passive) experiments are included.
+i. Trials are filtered by: (1) Go or Catch type, (2) not Aborted, (3) not Auto-rewarded, (4) must have at least one stimulus presentation, (5) sessions with fewer than 2 trials are skipped, (6) experiments with 0 valid neurons are skipped.
 
 ii.
 ```python
 trial_mask = (trial_go | trial_catch) & ~trial_aborted & ~trial_auto
-valid_trial_ids = trial_ids[trial_mask]
-...
+# ...
 if len(trial_stim_indices) == 0:
     continue
-...
+# ...
 if result is None or result['n_trials'] < 2:
     skipped += 1
 ```
 
-iii. Per the task instructions, aborted and auto-rewarded trials are excluded. The AI also explicitly checks for go or catch trial types. Active-only filtering ensures meaningful trial outcomes exist (passive sessions have no licking behavior).
+iii. The filtering matches the instructions to include Go and Catch trials while excluding Aborted and Auto-rewarded. Additional quality checks ensure sessions have enough data for decoder evaluation.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data is derived from dF/F traces stored at `processing/ophys/dff/traces/data` in each NWB file.
+i. Neural data is derived from the dF/F (delta F over F) calcium fluorescence traces stored in the NWB file at `processing/ophys/dff/traces/data`.
 
 ii.
 ```python
 dff_data = f['processing']['ophys']['dff']['traces']['data'][:]  # (timepoints, neurons)
 ```
 
-iii. dF/F is the standard neural activity measure for two-photon calcium imaging, pre-computed in the NWB files by the Allen SDK pipeline.
+iii. dF/F is the standard measure of neural activity for two-photon calcium imaging. It is pre-computed in the NWB files with neuropil correction and baseline normalization.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI applies two processing steps: (1) filtering neurons by `valid_roi` from the cell specimen table, and (2) temporally rebinning from native ophys frame rate to 750ms bins by averaging dF/F within each stimulus presentation window. The averaging uses a cumulative sum approach for efficiency.
+i. The AI filters neurons by `valid_roi`, then averages dF/F traces within 750ms stimulus bins using a cumulative-sum approach. Each time bin corresponds to one stimulus presentation (250ms image + 500ms grey period). No additional normalization or filtering is applied.
 
 ii.
 ```python
 valid_roi = cell_table['valid_roi'][:].astype(bool)
 dff_valid = dff_data[:, valid_roi]  # (timepoints, n_valid_neurons)
-...
+# ...
 dff_cumsum = np.cumsum(dff_valid, axis=0)
 dff_cumsum = np.vstack([np.zeros((1, n_neurons), dtype=dff_cumsum.dtype), dff_cumsum])
-...
+# ...
 for bi, si in enumerate(trial_stim_indices):
     s, e = ophys_bin_starts[si], ophys_bin_ends[si]
     n_frames = e - s
@@ -121,11 +113,11 @@ for bi, si in enumerate(trial_stim_indices):
         neural_matrix[:, bi] = (dff_cumsum[e] - dff_cumsum[s]) / n_frames
 ```
 
-iii. The valid_roi filter matches the SDK's default `exclude_invalid_rois=True` behavior. The 750ms binning was chosen to create a consistent temporal resolution across different equipment types (mesoscope ~11Hz vs single-plane ~31Hz) by aligning to the stimulus presentation interval.
+iii. The AI chose 750ms bins to match the natural stimulus presentation cycle and to ensure consistent temporal resolution across equipment types (mesoscope at 11 Hz vs CAM2P at 31 Hz). The cumulative sum approach enables efficient bin averaging.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Neurons are filtered using the `valid_roi` boolean column from the NWB cell specimen table. Only neurons marked as valid ROIs are included.
+i. Neurons are filtered using the `valid_roi` boolean column from the NWB cell specimen table. Only ROIs marked as valid (true cells) are included.
 
 ii.
 ```python
@@ -134,57 +126,50 @@ valid_roi = cell_table['valid_roi'][:].astype(bool)
 dff_valid = dff_data[:, valid_roi]
 ```
 
-iii. The AI documented in CONVERSION_NOTES: "valid_roi filter: excludes unions of cells, duplicates (>70% overlap), edge ROIs, apical dendrites, too small/narrow/dim, ghost cells (crosstalk), negative/zero traces." This matches the SDK's default cell curation.
+iii. The `valid_roi` filter matches the Allen SDK's default behavior (`exclude_invalid_rois=True`), removing non-cell ROIs, duplicates, edge artifacts, and ghost cells.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural data is aligned to stimulus presentation onsets. For each trial, the stimulus presentations belonging to that trial are identified, and dF/F is averaged within each 750ms stimulus window (from stimulus onset to onset + 750ms). This gives one neural data point per stimulus flash.
+i. Neural data is aligned to individual stimulus presentation onsets. For each trial, the stimulus presentations are identified and neural activity is averaged within each 750ms presentation window. The alignment is to stimulus onset times, not to trial start or change time.
 
 ii.
 ```python
+all_stim_starts = stim_start
+all_stim_ends = all_stim_starts + bin_duration  # bin_duration = 0.75s
 ophys_bin_starts = np.searchsorted(ophys_ts, all_stim_starts, side='left')
 ophys_bin_ends = np.searchsorted(ophys_ts, all_stim_ends, side='left')
-...
-for bi, si in enumerate(trial_stim_indices):
-    s, e = ophys_bin_starts[si], ophys_bin_ends[si]
-    n_frames = e - s
-    if n_frames > 0:
-        neural_matrix[:, bi] = (dff_cumsum[e] - dff_cumsum[s]) / n_frames
 ```
 
-iii. The AI aligned to stimulus presentation onset rather than to the trial start_time or change_time, because the 750ms stimulus presentation is the fundamental temporal unit of the task.
+iii. The AI aligned to stimulus presentations because each 750ms bin corresponds to one image flash cycle. The metadata records `temporal_alignment_event: 'Stimulus presentation onset (each 750ms image flash)'`.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The time bin size is 750ms, corresponding to one stimulus presentation cycle (250ms image + 500ms grey screen). This is a significant rebinning from the native ophys frame rate (~93ms at 11Hz for mesoscope, ~32ms at 31Hz for single-plane). The AI explicitly sets `TIME_BIN_MS = 750.0`.
+i. The AI rebins neural data to 750ms bins (one per stimulus presentation). This is a major departure from the native ophys frame rate (~90ms at 11 Hz for mesoscope, ~32ms at 31 Hz for single-plane).
 
 ii.
 ```python
 TIME_BIN_MS = 750.0  # One bin per stimulus presentation (250ms image + 500ms grey)
-...
 bin_duration = TIME_BIN_MS / 1000.0  # 0.75s
-all_stim_ends = all_stim_starts + bin_duration
 ```
 
-iii. The AI chose 750ms bins as the "natural task unit" that provides consistency across equipment types. However, this represents a 8x (mesoscope) to 23x (single-plane) reduction in temporal resolution compared to native ophys frame rate.
+iii. The AI justified 750ms bins as the "natural task unit" — one image flash + grey period. This ensures consistent temporal resolution regardless of equipment type (MESO vs CAM2P). However, it sacrifices significant temporal resolution.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. Image identity is derived from the `image_name` field in the stimulus presentations table (`intervals/<stim_key>/image_name` in NWB).
+i. Image identity is derived from the `image_name` column in the stimulus presentations table (`intervals/<stim_key>/image_name` in the NWB file).
 
 ii.
 ```python
-stim_image_name = np.array([x.decode() if isinstance(x, bytes) else str(x)
-                            for x in stim['image_name'][:]])
-...
+stim_image_name = np.array([x.decode() if isinstance(x, bytes) else str(x) for x in stim['image_name'][:]])
+# ...
 images = stim_image_name[trial_stim_indices].copy()
 ```
 
-iii. The stimulus presentations table contains the image shown at each flash, which directly provides the time-varying image identity.
+iii. The stimulus presentations table has per-flash image names, providing the most granular source of image identity information.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. Image names are mapped to integer codes via a global mapping built from all unique (non-omitted) image names across experiments. Omitted stimulus presentations are forward-filled with the previous non-omitted image name.
+i. Image names are mapped to integer codes via a global sorted mapping. Omitted stimulus presentations (5% of flashes) are forward-filled with the previous image name.
 
 ii.
 ```python
@@ -198,70 +183,67 @@ for bi in range(len(images)):
                 if images[bj] != 'omitted':
                     images[bi] = images[bj]
                     break
+
 image_indices = np.array([img_to_idx.get(img, 0) for img in images], dtype=np.int64)
 ```
 
-iii. Forward-filling for omitted stimuli was chosen because neural and behavioral data are still recorded during omissions, and the image that "should have been shown" is the one from the previous presentation.
+iii. Forward-filling omitted presentations preserves continuity in the image identity signal. The global image name collection is done by sampling up to 10 experiments.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Image identity is directly indexed by stimulus presentation, matching the neural data's 750ms binning. Each time bin in the output corresponds to the same stimulus presentation as the corresponding neural bin.
+i. Image identity is computed per stimulus bin (750ms), using the same stimulus presentation indices as the neural data. Each time bin has a single image identity value.
 
 ii.
 ```python
 images = stim_image_name[trial_stim_indices].copy()
-...
-image_indices = np.array([img_to_idx.get(img, 0) for img in images], dtype=np.int64)
+# Same trial_stim_indices used for neural data
 ```
 
-iii. Since both neural and image identity data are indexed by the same stimulus presentation indices, they are inherently aligned.
+iii. Both neural and image identity use the same stimulus presentation indices, guaranteeing temporal alignment.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. Image change is derived from the `is_change` field in the stimulus presentations table.
+i. Image change is derived from the `is_change` column in the stimulus presentations table.
 
 ii.
 ```python
 stim_is_change = stim['is_change'][:]
-...
+# ...
 change_flags = np.nan_to_num(stim_is_change[trial_stim_indices], nan=0).astype(np.int64)
 ```
 
-iii. The `is_change` field is a pre-computed boolean in the NWB stimulus presentations table that marks the specific presentation where the image identity changed.
+iii. The `is_change` flag is pre-computed in the NWB file, indicating which stimulus flash was the change event.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. The `is_change` values are taken directly from the stimulus presentations, with NaN values (from omitted stimuli) converted to 0. No additional processing beyond type conversion.
+i. The `is_change` flag is used directly as a binary indicator. NaN values are converted to 0 (no change).
 
 ii.
 ```python
 change_flags = np.nan_to_num(stim_is_change[trial_stim_indices], nan=0).astype(np.int64)
 ```
 
-iii. The pre-computed `is_change` field already encodes the binary change/no-change distinction.
+iii. No additional processing is needed since `is_change` is already binary.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. No thresholding is needed. Image change is already binary (0 or 1) from the `is_change` field.
+i. Image change is already binary (0 = no change, 1 = change). No thresholding is applied.
 
-ii. See 4-b above.
+ii. See 4-b.
 
-iii. The `is_change` field is inherently binary.
+iii. The `is_change` flag is inherently binary.
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. Same as image identity -- indexed by stimulus presentation, matching the neural data's 750ms binning.
+i. Same as image identity — per stimulus bin, using the same indices.
 
-ii.
-```python
-change_flags = np.nan_to_num(stim_is_change[trial_stim_indices], nan=0).astype(np.int64)
-```
+ii. Same indexing as 3-c.
 
-iii. Aligned via the same `trial_stim_indices` as neural and image identity data.
+iii. Same temporal alignment as all other per-bin variables.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. Running speed is derived from `processing/running/speed/data` and `processing/running/speed/timestamps` in the NWB file.
+i. Running speed is derived from `processing/running/speed/data` in the NWB file.
 
 ii.
 ```python
@@ -269,11 +251,11 @@ running_speed = f['processing']['running']['speed']['data'][:]
 running_ts = f['processing']['running']['speed']['timestamps'][:]
 ```
 
-iii. This is the Allen SDK's filtered running speed signal, recorded from the running wheel encoder.
+iii. This is the SDK's standard filtered running speed data.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Running speed is averaged within each 750ms stimulus presentation bin using a cumulative sum approach. The binned values are then discretized into 5 equal percentile bins with edges computed globally across all sessions in a first pass.
+i. Running speed is averaged within 750ms stimulus bins using a cumulative sum approach, then discretized into 5 equal percentile bins computed globally across all sessions in a two-pass approach.
 
 ii.
 ```python
@@ -281,117 +263,90 @@ run_bin_starts = np.searchsorted(running_ts, all_stim_starts, side='left')
 run_bin_ends = np.searchsorted(running_ts, all_stim_ends, side='left')
 run_cumsum = np.cumsum(running_speed)
 run_cumsum = np.concatenate([[0], run_cumsum])
-...
+# ...
 for bi, si in enumerate(trial_stim_indices):
     s, e = run_bin_starts[si], run_bin_ends[si]
     n_pts = e - s
     if n_pts > 0:
         running_binned[bi] = (run_cumsum[e] - run_cumsum[s]) / n_pts
-...
-running_disc, _ = discretize_values(ot['running_speed_raw'], N_PERCENTILE_BINS, running_bin_edges)
 ```
 
-iii. The two-pass approach ensures consistent percentile bins across all sessions. Cumulative sum averaging is used for efficiency.
+iii. Averaging within 750ms bins matches the neural data temporal resolution. Global percentile binning ensures balanced class distribution for decoding.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Running speed is discretized into 5 equal percentile bins. Bin edges are computed from all valid running speed values across all sessions. The first and last edges are set to -inf and +inf respectively. Values are clipped to [0, n_bins-1].
+i. Running speed is discretized into 5 equal percentile bins. Bin edges are computed globally from all valid running speed values across all sessions (pass 1), then applied to each trial (pass 2).
 
 ii.
 ```python
-def discretize_values(values, n_bins, bin_edges=None):
-    if bin_edges is None:
-        valid = values[~np.isnan(values)]
-        percentiles = np.linspace(0, 100, n_bins + 1)
-        bin_edges = np.percentile(valid, percentiles)
-        bin_edges[0] = -np.inf
-        bin_edges[-1] = np.inf
-    binned = np.digitize(values, bin_edges[1:-1]).astype(np.int64)
-    binned = np.clip(binned, 0, n_bins - 1)
-    return binned, bin_edges
+_, running_bin_edges = discretize_values(all_running, N_PERCENTILE_BINS)
+# ...
+running_disc, _ = discretize_values(ot['running_speed_raw'], N_PERCENTILE_BINS, running_bin_edges)
 ```
 
-iii. Percentile-based binning ensures roughly equal class counts, which is important for balanced decoding.
+iii. Percentile-based binning ensures roughly equal samples per bin.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is averaged within the same 750ms stimulus windows as the neural data, using `searchsorted` on running timestamps to find frames within each window.
+i. Running speed is averaged into the same 750ms stimulus bins as the neural data, using the same stimulus presentation indices.
 
-ii.
-```python
-run_bin_starts = np.searchsorted(running_ts, all_stim_starts, side='left')
-run_bin_ends = np.searchsorted(running_ts, all_stim_ends, side='left')
-```
+ii. See 5-b.
 
-iii. Both neural and running speed are binned to the same stimulus presentation windows, ensuring temporal alignment.
+iii. Both use the same stimulus presentation timing, ensuring alignment.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. Pupil diameter is derived from `pupil_area` in the eye tracking data (`acquisition/EyeTracking/pupil_tracking/area`), with blinks identified by `acquisition/EyeTracking/likely_blink/data`.
+i. Pupil diameter is derived from `pupil_area` in the eye tracking data (`acquisition/EyeTracking/pupil_tracking/area`), converted to diameter via `d = 2*sqrt(area/pi)`.
 
 ii.
 ```python
 pupil_area_raw = f['acquisition']['EyeTracking']['pupil_tracking']['area'][:]
-pupil_ts = f['acquisition']['EyeTracking']['pupil_tracking']['timestamps'][:]
-likely_blink = f['acquisition']['EyeTracking']['likely_blink']['data'][:].astype(bool)
+# ...
+pupil_diameter = 2.0 * np.sqrt(pupil_area / np.pi)
 ```
 
-iii. The AI chose pupil area as the source variable, noting it is "the standard measure from DeepLabCut ellipse fitting."
+iii. The AI chose to compute diameter from area assuming a circular pupil. Blink frames (from `likely_blink`) and negative/zero values are set to NaN before conversion.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. Processing involves: (1) setting blink frames to NaN, (2) setting negative/zero values to NaN, (3) converting area to diameter via `d = 2*sqrt(area/pi)`, (4) linearly interpolating NaN values, (5) averaging within 750ms stimulus bins, and (6) discretizing into 5 percentile bins. Remaining NaN pupil values after binning are either interpolated again or assigned the middle bin.
+i. Blink frames are set to NaN, negative/zero areas are set to NaN, diameter is computed from area, NaN values are linearly interpolated, then averaged within 750ms bins, then discretized into 5 equal percentile bins globally.
 
 ii.
 ```python
-pupil_area = pupil_area_raw.copy().astype(float)
 pupil_area[likely_blink] = np.nan
 pupil_area[pupil_area <= 0] = np.nan
 pupil_diameter = 2.0 * np.sqrt(pupil_area / np.pi)
 pupil_diameter = interpolate_nans(pupil_diameter)
-...
-# During discretization:
-if nan_mask.all():
-    pupil_disc = np.full(n_bins, N_PERCENTILE_BINS // 2, dtype=np.int64)
-else:
-    if nan_mask.any():
-        pupil_raw = interpolate_nans(pupil_raw)
-    pupil_disc, _ = discretize_values(pupil_raw, N_PERCENTILE_BINS, pupil_bin_edges)
+# ...
+# bin averaging and discretization follow
 ```
 
-iii. Blink removal prevents corrupted data from affecting the diameter computation. The area-to-diameter conversion assumes a circular pupil approximation. NaN interpolation was preferred over assigning a default bin value.
+iii. Interpolating NaN values before binning prevents gaps in the signal. The two-pass approach computes global percentile edges, then applies them.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Same as running speed: 5 equal percentile bins computed globally across all sessions. All-NaN bins default to the middle bin (bin 2). Remaining NaN values are interpolated before discretization.
+i. Same as running speed — 5 equal percentile bins computed globally.
 
 ii.
 ```python
-if nan_mask.all():
-    pupil_disc = np.full(n_bins, N_PERCENTILE_BINS // 2, dtype=np.int64)
-else:
-    if nan_mask.any():
-        pupil_raw = interpolate_nans(pupil_raw)
-    pupil_disc, _ = discretize_values(pupil_raw, N_PERCENTILE_BINS, pupil_bin_edges)
+_, pupil_bin_edges = discretize_values(valid_pupil, N_PERCENTILE_BINS)
+# ...
+pupil_disc, _ = discretize_values(pupil_raw, N_PERCENTILE_BINS, pupil_bin_edges)
 ```
 
-iii. The middle-bin default for all-NaN cases is a conservative choice. NaN interpolation before discretization preserves the temporal continuity of the signal.
+iii. Same rationale as running speed discretization.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Same approach as running speed -- averaged within the same 750ms stimulus presentation bins as the neural data.
+i. Same approach as running speed — averaged into 750ms stimulus bins.
 
-ii.
-```python
-pup_bin_starts = np.searchsorted(pupil_ts, all_stim_starts, side='left')
-pup_bin_ends = np.searchsorted(pupil_ts, all_stim_ends, side='left')
-```
+ii. See 6-b.
 
-iii. Aligned via the same stimulus presentation binning scheme as all other variables.
+iii. Same temporal alignment as all other variables.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. Trial outcome is derived from the boolean columns `hit`, `miss`, `false_alarm`, and `correct_reject` (read as `catch`) in the NWB trials table.
+i. Trial outcome is derived from the boolean columns `hit`, `miss`, `false_alarm`, and `correct_reject` in the NWB trials table.
 
 ii.
 ```python
@@ -401,11 +356,11 @@ trial_fa = trials['false_alarm'][:].astype(bool)
 trial_cr = trials['correct_reject'][:].astype(bool)
 ```
 
-iii. These are the standard trial outcome labels from the Allen SDK's change detection task.
+iii. These four columns are the standard trial outcome classifications for the change detection task.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. Trial outcomes are mapped to integer codes: hit=0, miss=1, false_alarm=2, correct_rejection=3. A priority check is used (if hit, then miss, then false alarm, then correct rejection). Trials matching none default to miss (code 1). The outcome is replicated across all time bins within the trial.
+i. Trial outcomes are mapped to integer codes (hit=0, miss=1, false_alarm=2, correct_rejection=3). If none of the four flags is set, the default is miss (code 1). The outcome is constant across all time bins within a trial.
 
 ii.
 ```python
@@ -419,56 +374,49 @@ elif trial_cr[trial_idx]:
     outcome = 3  # Correct Rejection
 else:
     outcome = 1  # Default to Miss
-...
-np.full(n_bins, ot['trial_outcome'], dtype=np.int64),
+# ...
+np.full(n_bins, ot['trial_outcome'], dtype=np.int64)
 ```
 
-iii. The mapping order follows the standard signal detection theory categories. Defaulting to miss for unclassified trials is a conservative choice. The outcome is replicated across time bins to create a time-varying representation as required by the output format.
+iii. The if/elif chain checks outcomes in priority order. Defaulting to miss was chosen as a safe fallback, though in practice all valid Go/Catch trials should match one of the four outcomes.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
 i. Several cases are handled:
-- **Missing eye tracking**: If no `EyeTracking` in NWB, pupil data is set to NaN and assigned the middle bin.
-- **Blink frames**: Set to NaN, then linearly interpolated before computing diameter.
-- **Negative/zero pupil area**: Set to NaN.
-- **Omitted stimuli**: Image name forward-filled from previous presentation; is_change NaN converted to 0.
-- **No stimulus presentations for a trial**: Trial is skipped.
-- **Sessions with <2 trials**: Skipped entirely.
-- **Failed experiment processing**: Returns None, experiment is skipped.
-- **NaN in running/pupil after binning**: Interpolated before discretization or assigned middle bin.
+- **Missing eye tracking**: Sessions without eye tracking get NaN pupil values, which are filled with the median bin during discretization.
+- **Blink frames**: Set to NaN and linearly interpolated before diameter computation.
+- **Negative/zero pupil area**: Set to NaN and interpolated.
+- **Omitted stimuli**: Image identity is forward-filled from the previous presentation.
+- **Empty trials**: Trials with no stimulus presentations are skipped.
+- **Zero valid neurons**: Experiments with 0 valid ROIs are skipped.
+- **Few trials**: Sessions with <2 trials are skipped.
+- **All-NaN pupil**: Assigned to middle bin.
 
 ii.
 ```python
-pupil_area[likely_blink] = np.nan
-pupil_area[pupil_area <= 0] = np.nan
-pupil_diameter = interpolate_nans(pupil_diameter)
-...
-if result is None or result['n_trials'] < 2:
-    skipped += 1
-...
-change_flags = np.nan_to_num(stim_is_change[trial_stim_indices], nan=0).astype(np.int64)
+if not has_eye_tracking:
+    pupil_diameter = None
+# ...
+if nan_mask.all():
+    pupil_disc = np.full(n_bins, N_PERCENTILE_BINS // 2, dtype=np.int64)  # middle bin
+# ...
+if n_neurons == 0:
+    return None
 ```
 
-iii. The general strategy is to interpolate where possible and use conservative defaults otherwise. Missing data is documented in the conversion notes.
+iii. The AI documented multiple edge cases and handling strategies, prioritizing data preservation while avoiding propagation of invalid values.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. The most time-consuming steps are (1) reading NWB files from disk with h5py (I/O bound), and (2) the two-pass approach means each NWB file is read twice -- once for statistics collection and once for full processing. The AI estimated ~24 minutes for full conversion (202 experiments).
+i. The most time-consuming step is loading each NWB file via h5py, which involves reading large dF/F arrays and behavioral data. This is done twice (pass 1 for statistics, pass 2 for full processing).
 
-ii.
-```python
-# Pass 1: stats collection
-stats = process_experiment(nwb_path, row, collect_stats_only=True)
-...
-# Pass 2: full processing
-result = process_experiment(nwb_path, row, collect_stats_only=False)
-```
+ii. N/A
 
-iii. The agent noted that data loading is I/O bound and dominates runtime. The two-pass approach was chosen to compute global percentile bin edges before the final conversion.
+iii. Each NWB file contains full-session neural data (140K+ timepoints x neurons). The two-pass approach doubles the I/O cost.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The per-bin neural averaging loop iterates over stimulus presentation indices within each trial. While cumulative sums help, the inner loop could potentially be further vectorized. The forward-fill loop for omitted stimuli is also sequential.
+i. The per-bin loops for neural averaging and running speed averaging iterate over stimulus indices. While the cumsum approach avoids per-element operations, the loop itself could be vectorized using advanced indexing.
 
 ii.
 ```python
@@ -479,42 +427,30 @@ for bi, si in enumerate(trial_stim_indices):
         neural_matrix[:, bi] = (dff_cumsum[e] - dff_cumsum[s]) / n_frames
 ```
 
-iii. The cumulative sum approach is already a significant optimization over naive per-frame averaging, but the per-bin loop remains.
+iii. The loops are already partially optimized via cumsum, but the outer trial loop and inner bin loop are sequential.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. The code reads and processes each NWB file twice due to the two-pass approach. Pass 1 (`collect_stats_only=True`) loads neural data, running speed, pupil data, and computes stimulus bins -- essentially all the expensive operations -- just to collect running and pupil values for percentile computation. Pass 2 repeats all of this plus assembles the final output.
+i. The code uses a two-pass approach. Pass 1 loads each NWB file to collect running and pupil statistics for percentile computation. Pass 2 loads each NWB file again for full data extraction. This doubles the NWB file I/O.
 
 ii.
 ```python
 # Pass 1
-for idx, (_, row) in enumerate(active_exps.iterrows()):
-    stats = process_experiment(nwb_path, row, collect_stats_only=True)
-...
+stats = process_experiment(nwb_path, row, collect_stats_only=True)
 # Pass 2
-for idx, (_, row) in enumerate(active_exps.iterrows()):
-    result = process_experiment(nwb_path, row, collect_stats_only=False)
+result = process_experiment(nwb_path, row, collect_stats_only=False)
 ```
 
-iii. The two-pass design is needed to compute global percentile edges before discretization, but it doubles the NWB file I/O.
+iii. The two-pass approach was chosen to compute global percentile bin edges before discretization. A single-pass approach could collect raw values and discretize afterward, avoiding the redundant file reads.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. In Pass 1 (stats collection), the code loads and processes all neural data (dF/F), computes cumulative sums, and builds stimulus bin assignments even though only running speed and pupil values are needed for statistics. The neural data processing in Pass 1 is entirely discarded.
+i. The two-pass processing is partially redundant since pass 1 data is discarded and recomputed in pass 2. Additionally, the `interpolate_nans` function is called on pupil data during both passes. The image name collection step (`collect_all_image_names`) reads up to 10 NWB files separately just to build the image mapping, which could be done during either pass.
 
 ii.
 ```python
-def process_experiment(nwb_path, exp_info, collect_stats_only=False):
-    ...
-    dff_data = f['processing']['ophys']['dff']['traces']['data'][:]  # Always loaded
-    ...
-    dff_cumsum = np.cumsum(dff_valid, axis=0)  # Always computed
-    ...
-    if collect_stats_only:
-        return {
-            'running_values': running_values,
-            'pupil_values': pupil_values,
-        }
+# Separate image name collection
+IMAGE_NAMES_GLOBAL = collect_all_image_names(active_exps, nwb_map)
 ```
 
-iii. The neural data loading and cumsum computation in the stats-only pass is wasted work. A more efficient approach would use a separate lightweight function for statistics collection.
+iii. The separate image name collection adds extra file I/O that could be integrated into the main processing passes.

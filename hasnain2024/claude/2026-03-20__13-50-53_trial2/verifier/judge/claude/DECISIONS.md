@@ -2,78 +2,77 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads data from MATLAB `.mat` files (both v5 and HDF5/v7.3 formats) located in two directories: `data/Ephys_Behavior/` and `data/RandomizedDelay_Ephys_Behavior/`. It uses a hardcoded list of 44 session definitions (`SESSION_DEFS`) specifying animal, date, probe numbers, and data directory. Each session file is `data_structure_<animal>_<date>.mat`. Motion energy is loaded from separate `motionEnergy_<animal>_<date>.mat` files. The AI auto-detects the file format (v5 vs HDF5) and uses the appropriate loader.
+i. Each session is one MATLAB file `data_structure_<anm>_<date>.mat`, located in one of two directories (`Ephys_Behavior` or `RandomizedDelay_Ephys_Behavior`). The 44 sessions and their probes are hard-coded in `SESSION_DEFS`. The file format is detected (HDF5 vs v5), and a separate loader is used for each format (`_load_raw_data_hdf5` and `_load_raw_data_v5`). Motion energy is loaded from a separate `motionEnergy_<anm>_<date>.mat` file. Each session is loaded once via `load_session`.
 
 ii.
 ```python
 SESSION_DEFS = [
     ('EKH1', '2021-08-07', [2], 'ephys'),
-    ('EKH3', '2021-08-11', [2], 'ephys'),
-    # ... 44 sessions total
+    ...
+    ('JEB24', '2023-11-03', [1], 'random'),
 ]
 
-DATA_DIRS = {
-    'ephys': os.path.join(DATA_ROOT, 'Ephys_Behavior'),
-    'random': os.path.join(DATA_ROOT, 'RandomizedDelay_Ephys_Behavior'),
-}
-
-def _detect_file_format(data_fn):
-    try:
-        f = h5py.File(data_fn, 'r')
-        f.close()
-        return 'hdf5'
-    except Exception:
-        return 'v5'
+for i, (anm, date, probes, ddir) in enumerate(session_defs):
+    result = load_session(anm, date, probes, ddir, PARAMS)
 ```
 
-iii. The AI derived the session list from the reference code's loading scripts in `DataLoadingScripts/Recording and video/`. Sessions without corresponding data files (JEB4, JEB5) were excluded. Three data files without loading scripts (JEB23_2023-10-20, JEB24_2023-10-03/04) were also excluded.
+Loading detects format:
+```python
+fmt = _detect_file_format(data_fn)
+if fmt == 'hdf5':
+    raw = _load_raw_data_hdf5(data_fn, probes)
+else:
+    raw = _load_raw_data_v5(data_fn, probes)
+```
 
-## 1-b. How are the data split into subjects (mice)?
+iii. From CONVERSION_NOTES.md: The sessions are derived from the authors' loading scripts. Sessions missing from data (JEB4, JEB5) are excluded, and data files without loading scripts are excluded. Both MATLAB formats are handled.
 
-i. Subjects are identified by the animal name from the session definitions. The AI collects all unique animal names across loaded sessions, sorts them alphabetically, and creates a mapping from animal name to index.
+## 1-b. How are the data split into subjects?
+
+i. The animal name is passed as a separate field from `SESSION_DEFS` (the first element of each tuple). Subjects are collected as a sorted set of unique animal names, and `subject_idx` maps each session to its subject index.
 
 ii.
 ```python
+SESSION_DEFS = [
+    ('EKH1', '2021-08-07', [2], 'ephys'),
+    ...
+]
+
 all_animals = sorted(set(s['animal'] for s in all_sessions))
 animal_to_idx = {a: i for i, a in enumerate(all_animals)}
-# ...
-subject_idx.append(animal_to_idx[sess['animal']])
 ```
 
-iii. The AI identified 14 unique subjects across the 44 sessions. The paper reports 9 mice for DR and 4 for randomized delay (13 unique). The AI noted the extra subject likely comes from a DR animal not explicitly mentioned in the paper but present in the data.
+iii. The animal name is directly available from the session definition tuples.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each `.mat` file corresponds to one recording session. The AI hardcodes 44 sessions: 25 from `Ephys_Behavior` and 19 from `RandomizedDelay_Ephys_Behavior`, matching the session loading scripts in the reference code.
+i. One session is one entry in `SESSION_DEFS`, keyed by `(animal, date)`. Each becomes one element of the neural, input, and output lists. Sessions from both task types (fixed-delay and randomized-delay) are included. The `data_dir_key` field maps each session to its folder.
 
 ii.
 ```python
-for i, (anm, date, probes, ddir) in enumerate(session_defs):
-    result = load_session(anm, date, probes, ddir, PARAMS)
-    if result is not None:
-        all_sessions.append(result)
+data_dir = DATA_DIRS[data_dir_key]
+data_fn = os.path.join(data_dir, f'data_structure_{anm}_{date}.mat')
 ```
 
-iii. The session counts (25 DR + 19 randomized) match the paper exactly. Sessions are processed sequentially, one file per session.
+iii. CONVERSION_NOTES.md documents 44 sessions: 25 fixed-delay and 19 randomized-delay.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are identified from `obj.bp.Ntrials` in each session's data file. Spike data includes trial membership via `obj.clu.trial`. Behavioral variables (hit, miss, R, L, etc.) are arrays of length Ntrials.
+i. Trials are defined by the `Ntrials` field in `obj.bp`. Per-trial fields (`hit`, `miss`, `early`, `R`, `L`, `autowater`, `stim_enable`, event times) are truncated to `Ntrials` entries. Spike data carries trial assignments per spike.
 
 ii.
 ```python
 bp['Ntrials'] = int(bp_group['Ntrials'][()].flat[0])
 ntrials = bp['Ntrials']
-# Each behavioral variable truncated to ntrials:
 for field in ['hit', 'miss', 'no', 'early', 'L', 'R', 'autowater']:
     bp[field] = bp_group[field][()].flatten().astype(np.float64)[:ntrials]
 ```
 
-iii. The AI uses the session's reported trial count to consistently index all per-trial arrays.
+iii. The Bpod table defines trials directly and there is one go cue per trial.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI filters out early lick trials (`early == 1`) and photostimulation trials (`stim.enable == 1`). All other trials are retained, including hit, miss, and ignore/no-response trials.
+i. Two filters are applied: early-lick trials (`bp.early == 1`) and photostimulation trials (`bp.stim.enable == 1`) are dropped. Unlike the reference, trials past the end of the neural recording are **not** explicitly filtered.
 
 ii.
 ```python
@@ -81,197 +80,225 @@ trial_mask = (bp['early'] == 0) & (bp['stim_enable'] == 0)
 valid_trials = np.where(trial_mask)[0] + 1  # 1-indexed
 ```
 
-iii. The AI justified including all non-early, non-stim trials because the decoder needs to predict outcome (correct/incorrect), requiring exposure to both hit and miss trials. However, the AI did not explicitly exclude ignore/no-response trials, which the paper states "were omitted from all analyses."
+iii. CONVERSION_NOTES.md documents: "Exclude early lick and stim/photoinactivation trials (~early, ~stim.enable)". No mention of filtering trials past recording end.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data is derived from `obj.clu` — the sorted spike cluster data. Specifically, `trialtm` (spike times within trial) and `trial` (trial membership) for each unit, from the specified probe(s).
+i. The spike-sorted clusters from `obj.clu`, specifically each cluster's `trialtm` (spike times relative to trial start), `trial` (trial assignment per spike), and `quality` (curation label). Go cue times `bp.ev.goCue` provide alignment.
 
 ii.
 ```python
-# For HDF5:
-trialtm = f[trialtm_refs[i]][()].flatten().astype(np.float64)
-trial = f[trial_refs[i]][()].flatten().astype(np.float64)
-# For v5:
 trialtm = unit['trialtm'].flatten().astype(np.float64)
 trial = unit['trial'].flatten().astype(np.float64)
+...
+spk_times = spike_tm[spk_mask] - align_times[trial_num - 1]
+counts, _ = np.histogram(spk_times, bins=edges)
 ```
 
-iii. This matches the reference code which accesses `obj.clu{prbnum}(clunum).trialtm` and `obj.clu{prbnum}(clunum).trial`.
+iii. Same variables as the reference pipeline.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI aligns spike times to the go cue, bins spikes into 10ms bins over [-2.5, 2.5]s, converts to firing rate (spks/s by dividing by dt), then applies causal Gaussian smoothing with window=15 bins.
+i. Spikes are counted into **10 ms** bins (dt=1/100) spanning -2.5 to 2.5 s (500 bins). Counts are divided by `dt` to get firing rates in Hz. The rates are smoothed with a **causal** Gaussian kernel of window size 15, implemented via `causal_gaussian_smooth` which replicates `mySmooth.m`. The causal kernel zeros out the first half of the Gaussian window.
 
 ii.
 ```python
+PARAMS = {
+    'dt': 1.0 / 100,  # 10 ms bins
+    'smooth_window': 15,
+    ...
+}
+
 edges = np.arange(params['tmin'], params['tmax'] + params['dt'], params['dt'])
-time_axis = edges[:-1] + params['dt'] / 2
-# For each neuron and trial:
-spk_times = spike_tm[spk_mask] - align_times[trial_num - 1]
 counts, _ = np.histogram(spk_times, bins=edges)
 fr = causal_gaussian_smooth(counts.astype(np.float64) / params['dt'],
                            params['smooth_window'],
                            params['smooth_bctype'])
 ```
 
-iii. Parameters match the WorkingWithDataObjs.m tutorial: `dt=1/100` (10ms), `smooth=15`, `bctype='reflect'`, aligned to goCue, time window [-2.5, 2.5]s.
+Causal smoothing:
+```python
+def causal_gaussian_smooth(x, N, bctype='reflect'):
+    kern = np.array(sig_windows.gaussian(N, std=(N - 1) / (2 * 2.5)))
+    kern[:N // 2] = 0  # Make causal
+    kern = kern / kern.sum()
+    ...
+```
+
+iii. CONVERSION_NOTES.md: "dt=1/100 (10ms bins)", "Causal Gaussian kernel, window=15". The AI chose 10ms bins based on `WorkingWithDataObjs.m` tutorial parameter `dt=1/100`, and causal smoothing based on `mySmooth.m`.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Two-stage neuron filtering: (1) Quality filter excludes neurons labeled 'garbage', 'noisy', 'gabrga', 'real?', or with empty/NaN quality. (2) Low firing rate filter removes neurons with mean FR <= 1.0 Hz. Sessions with fewer than 10 remaining units are dropped.
-
-ii.
-```python
-quality_exclude = {'garbage', 'noisy', 'gabrga', 'real?'}
-keep_mask = np.array([q not in quality_exclude and q != '' and q != 'nan'
-                      for q in all_qualities])
-# After binning:
-mean_fr = np.mean(trialdat, axis=(1, 2))
-fr_mask = mean_fr > params['low_fr']
-trialdat = trialdat[fr_mask, :, :]
-```
-
-iii. Quality labels match `findClusters.m` ('all' mode excludes garbage, noisy, gabrga, real?). The lowFR=1.0 Hz matches the tutorial (not getDefaultParams.m which uses 0.5 Hz). However, the FR is computed from mean of single-trial data (`trialdat`), whereas the reference code computes from the condition-averaged `psth`.
-
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
-
-i. Each spike time is aligned to the go cue by subtracting the trial's goCue event time from the spike's within-trial time.
-
-ii.
-```python
-align_times = ev[params['align_event']]  # 'goCue'
-# Per neuron, per trial:
-spk_times = spike_tm[spk_mask] - align_times[trial_num - 1]
-counts, _ = np.histogram(spk_times, bins=edges)
-```
-
-iii. This matches the reference `alignSpikes.m` which creates `trialtm_aligned = trialtm - ev.goCue(trial)`.
-
-## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. The time bin size is 10ms (dt=1/100). Spikes are directly binned at this resolution; no further rebinning is applied after the initial binning.
+i. Three filters. (1) Cluster quality: labels matching `{'garbage', 'noisy', 'gabrga', 'real?'}` are excluded, as well as empty or 'nan' labels. (2) Firing rate: units with mean FR <= 1 Hz are removed. (3) Minimum units: sessions with fewer than 10 units after filtering are skipped entirely.
 
 ii.
 ```python
 PARAMS = {
-    'dt': 1.0 / 100,  # 10 ms bins
-    # ...
+    'quality_exclude': {'garbage', 'noisy', 'gabrga', 'real?'},
+    'low_fr': 1.0,
+    'min_units': 10,
 }
-edges = np.arange(params['tmin'], params['tmax'] + params['dt'], params['dt'])
+
+keep_mask = np.array([q not in quality_exclude and q != '' and q != 'nan'
+                      for q in all_qualities])
+...
+mean_fr = np.mean(trialdat, axis=(1, 2))
+fr_mask = mean_fr > params['low_fr']
+...
+if n_neurons < params['min_units']:
+    return None
 ```
 
-iii. The 10ms bin matches `params.dt = 1/100` in WorkingWithDataObjs.m. The reference `getDefaultParams.m` uses `dt=1/200` (5ms), but the tutorial overrides this. No rebinning is performed.
+iii. CONVERSION_NOTES.md: "Quality filter: Exclude 'garbage', 'noisy', 'gabrga', 'real?'" and "sessions included for analysis only if they had at least 10 units". The label `'poor'` is NOT in the exclusion list (unlike the reference which drops it).
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Spike times are aligned to the go cue by subtracting the go cue time for each trial: `trialtm - goCue[trial]`. This is done per-neuron, per-trial in a nested loop.
+
+ii.
+```python
+align_times = ev[params['align_event']]  # 'goCue'
+...
+spk_times = spike_tm[spk_mask] - align_times[trial_num - 1]
+counts, _ = np.histogram(spk_times, bins=edges)
+```
+
+iii. Aligns to goCue as specified in the instructions and paper.
+
+## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+
+i. The time bin size is **10 ms** (dt = 1/100), producing **500** time bins spanning -2.5 to 2.5 s from the go cue. No rebinning is applied. This differs from the reference which uses 5 ms bins (dt = 1/200, 1000 bins).
+
+ii.
+```python
+'dt': 1.0 / 100,  # 10 ms bins
+edges = np.arange(params['tmin'], params['tmax'] + params['dt'], params['dt'])
+time_axis = edges[:-1] + params['dt'] / 2
+```
+
+iii. CONVERSION_NOTES.md justification: "Neural data time bin: 10ms (dt=1/100) from WorkingWithDataObjs.m params". The AI used the tutorial's `dt=1/100` rather than `getDefaultParams.m`'s `dt=1/200`.
 
 ## 3-a. What variables in the raw data is `input` *Time from go cue onset in seconds* derived from?
 
-i. The input is derived from the time axis itself, which is constructed from the binning parameters (tmin, tmax, dt). It is not derived from a raw data variable but from the processing parameters.
+i. The time axis is defined by the binning parameters (tmin, tmax, dt). It is the center of each time bin, not derived from any raw data variable.
 
 ii.
 ```python
 time_axis = edges[:-1] + params['dt'] / 2
-# Per trial:
+...
 time_input = time_axis.astype(np.float32).reshape(1, -1)
-sess_input.append(time_input)
 ```
 
-iii. The time axis runs from -2.495 to 2.495 seconds relative to goCue, with 500 time points at 10ms resolution. Every trial gets the same input vector.
+iii. Same approach as reference: the time axis is defined by the binning grid.
 
 ## 3-b. What processing is involved in computing `input` *Time from go cue onset in seconds*?
 
-i. No processing is needed — the time from go cue is simply the time axis constructed during spike binning, which is centered on the go cue event (time=0).
+i. No processing needed. The time axis is simply the bin centers of the neural binning grid.
 
-ii.
-```python
-time_input = time_axis.astype(np.float32).reshape(1, -1)
-```
+ii. N/A
 
-iii. Since neural data is aligned to goCue, the time axis directly represents time from go cue onset.
+iii. N/A
 
 ## 3-c. How is the `input` *Time from go cue onset in seconds* aligned with the neural data?
 
-i. The input time axis is identical to the neural data time axis — both use the same `time_axis` array. They are inherently aligned.
+i. It is the neural binning grid itself. Spike times are aligned to the go cue and counted into the bin edges, and the input is the center of those same bins.
 
 ii.
 ```python
-# Same time_axis used for both neural binning and input
+edges = np.arange(params['tmin'], params['tmax'] + params['dt'], params['dt'])
 time_axis = edges[:-1] + params['dt'] / 2
-# Neural: np.histogram(spk_times, bins=edges)
-# Input: time_input = time_axis.reshape(1, -1)
 ```
 
-iii. Perfect alignment because both derive from the same edge/bin definitions.
+iii. Same approach as reference.
 
 ## 4-a. What variables in the raw data is `output` *Lick direction* derived from?
 
-i. Lick direction is derived from `obj.bp.R` (right lick indicator), a binary per-trial variable.
+i. The per-trial field `obj.bp.R` is used directly. A value of 1 means right-instructed, 0 means left-instructed. Unlike the reference, `hit` and `miss` are NOT used to infer actual lick direction.
 
 ii.
 ```python
 lick_direction = bp['R'][valid_trial_indices].copy()
 ```
 
-iii. In the raw data, `bp.R=1` for right trials and `bp.R=0` for left trials. This maps directly to the decoder specification (left=0, right=1).
+iii. CONVERSION_NOTES.md mapping: "obj.bp.R/L -> output[0]: lick_direction, L=0, R=1, per-trial".
 
 ## 4-b. What processing is involved in computing `output` *Lick direction*?
 
-i. No processing — the raw `bp.R` value is used directly. The value is broadcast across all time bins to create a (1, n_timebins) array for each trial.
+i. `bp.R` is used directly as the lick direction: right=1, left=0. This gives the **instructed** direction, not the **actual** lick direction. There is no third class for "no lick" (ignore trials where the animal didn't respond). The output has only 2 classes: `['left', 'right']`.
 
 ii.
 ```python
+lick_direction = bp['R'][valid_trial_indices].copy()
+...
 lick_dir = np.full((1, n_timebins), int(sess['lick_direction'][t]), dtype=np.int64)
 ```
 
-iii. R=1 maps to right=1, R=0 maps to left=0, matching the decoder specification.
+Output values:
+```python
+'output_values': [
+    ['left', 'right'],        # lick_direction
+    ...
+]
+```
+
+iii. The AI treats this as the instructed direction rather than deriving the actual lick from hit/miss + R/L. No "no lick" class is provided.
 
 ## 5-a. What variables in the raw data is `output` *Behavioral context* derived from?
 
-i. Behavioral context is derived from `obj.bp.autowater`, which indicates whether water was auto-delivered (WC task) or not (DR task).
+i. The per-trial field `obj.bp.autowater`. Autowater=1 indicates WC (water-cued) context.
 
 ii.
 ```python
+bp['autowater'] = bp_raw['autowater'][0, 0].flatten().astype(np.float64)[:ntrials]
+...
 behavioral_context = 1.0 - bp['autowater'][valid_trial_indices]
 ```
 
-iii. `autowater=1` indicates WC (water-cued) trials; `autowater=0` indicates DR (delayed-response) trials.
+iii. Same source variable as reference.
 
 ## 5-b. What processing is involved in computing `output` *Behavioral context*?
 
-i. The autowater field is inverted: `1 - autowater`. This maps autowater=1 (WC) to 0 and autowater=0 (DR) to 1, matching the decoder specification (WC=0, DR=1). The value is broadcast across time bins.
+i. `1 - autowater`: autowater=1 maps to WC=0, autowater=0 maps to DR=1. This produces the correct encoding (WC=0, DR=1).
 
 ii.
 ```python
 behavioral_context = 1.0 - bp['autowater'][valid_trial_indices]
-context = np.full((1, n_timebins), int(sess['behavioral_context'][t]), dtype=np.int64)
 ```
 
-iii. The mapping WC=0, DR=1 matches the decoder task specification.
+iii. Matches the instruction's WC=0, DR=1 encoding.
 
 ## 6-a. What variables in the raw data is `output` *Outcome* derived from?
 
-i. Outcome is derived from `obj.bp.hit`, a binary per-trial variable indicating correct responses.
+i. The per-trial field `obj.bp.hit` is used directly. Only hit (correct=1) vs not-hit (incorrect=0) is distinguished. `bp.miss` is not used to separate misses from ignores.
 
 ii.
 ```python
 outcome = bp['hit'][valid_trial_indices].copy()
 ```
 
-iii. `hit=1` for correct trials, `hit=0` for incorrect or ignore trials.
+iii. CONVERSION_NOTES.md: "hit=1 -> correct=1, miss=1 -> incorrect=0".
 
 ## 6-b. What processing is involved in computing `output` *Outcome*?
 
-i. No processing — `bp.hit` maps directly to the decoder specification (incorrect=0, correct=1). The value is broadcast across time bins.
+i. `bp.hit` is used directly: hit=1 becomes correct=1, everything else (miss + ignore) becomes incorrect=0. There is no third "ignore" class. The output has only 2 classes: `['incorrect', 'correct']`.
 
 ii.
 ```python
+outcome = bp['hit'][valid_trial_indices].copy()
+...
 outc = np.full((1, n_timebins), int(sess['outcome'][t]), dtype=np.int64)
 ```
 
-iii. For ignore/no-response trials (where both hit=0 and miss=0), the outcome is 0 (incorrect).
+Output values:
+```python
+['incorrect', 'correct'],  # outcome
+```
+
+iii. The AI maps both miss and ignore trials to "incorrect" (0), collapsing three categories into two.
 
 ## 7-a. What variables in the raw data is `output` *Tongue velocity* derived from?
 
-i. Tongue velocity is derived from `obj.traj{2}` (bottom camera) DLC tracking data for the `top_tongue` feature. Specifically, the x,y position coordinates (`ts`) and video frame times (`frameTimes`) are used.
+i. The DLC tracking in `obj.traj`, specifically the `top_tongue` feature from the bottom camera (view index 1). Only ONE camera view is used. The reference uses both cameras (side `tongue` and bottom `top_tongue`).
 
 ii.
 ```python
@@ -281,35 +308,34 @@ tongue_vel = _compute_feature_velocity_generic(
     time_axis=time_axis, is_tongue=True)
 ```
 
-iii. The reference code uses bottom camera features for tongue tracking. The `top_tongue` feature from the bottom camera corresponds to the tip of the tongue as viewed from below.
+iii. CONVERSION_NOTES.md: "Tongue velocity: Compute from bottom cam DLC features (top_tongue or similar)."
 
 ## 7-b. What processing is involved in computing `output` *Tongue velocity*?
 
-i. Processing steps: (1) Extract x,y positions of `top_tongue` from DLC data. (2) Align video frame times using vidshift and goCue time. (3) Interpolate positions to neural time axis. (4) Compute velocity as gradient of position (separately for x and y). (5) Set NaN velocities to 0 (tongue not visible). (6) Compute Euclidean speed: `sqrt(xvel^2 + yvel^2)`.
+i. The x and y positions are interpolated to the neural time axis using `interp1d`. Then `np.gradient` computes velocity on the interpolated data. For tongue, NaN velocities are set to 0. Speed is `sqrt(xvel^2 + yvel^2)`. No likelihood filtering, no per-run smoothing, no normalization across cameras.
 
 ii.
 ```python
-# Interpolate position to neural time axis
 xpos = interp1d(ft_a[valid], x_r[valid], kind='linear',
                 bounds_error=False, fill_value=np.nan)(time_axis)
 ypos = interp1d(ft_a[valid], y_r[valid], kind='linear',
                 bounds_error=False, fill_value=np.nan)(time_axis)
-# Compute velocity
+
 xvel = np.gradient(xpos)
 yvel = np.gradient(ypos)
-# Tongue: NaN → 0
+
 if is_tongue:
     xvel[np.isnan(xvel)] = 0
     yvel[np.isnan(yvel)] = 0
-# Euclidean speed
+
 speed[:, trix] = np.sqrt(xvel**2 + yvel**2).astype(np.float32)
 ```
 
-iii. The processing matches the reference `findPosition.m` and `findVelocity.m` for tongue: position not smoothed, missing values not filled with nearest (unlike non-tongue features), NaN velocity set to 0 when tongue is not visible. Note: the reference does NOT subtract baseline velocity for tongue features, and the AI matches this.
+iii. The AI interpolates positions to the neural time axis before computing velocity, rather than computing velocity at the camera's frame rate and then binning. NaN filtering replaces missing values with 0 velocity rather than marking as "not visible".
 
 ## 7-c. How is `output` *Tongue velocity* thresholded into categories?
 
-i. The 50th percentile (median) of all non-NaN tongue velocity values across the session is used as the threshold. Values >= threshold are 1 ("high"), < threshold are 0 ("low"). NaN values default to 0.
+i. Two classes split at the 50th percentile of non-NaN values. NaN entries (untracked bins) are mapped to class 0 ("low"). There is no third "not visible" class.
 
 ii.
 ```python
@@ -317,28 +343,37 @@ def _discretize_velocity(data, n_timebins, n_trials):
     valid_vals = data[~np.isnan(data)]
     threshold = np.percentile(valid_vals, 50)
     disc = (data >= threshold).astype(np.int64)
-    disc[np.isnan(data)] = 0
+    disc[np.isnan(data)] = 0  # NaN -> 0 ("low")
     return disc
 ```
 
-iii. This follows the decoder task specification: "discretized into two bins with per-session threshold: 0: < 50th percentile, 1: >= 50th percentile."
+Output values:
+```python
+['low', 'high'],  # tongue_velocity
+```
+
+iii. The AI uses only 2 classes. Untracked bins are assigned to "low" (0) rather than a separate "not visible" class.
 
 ## 7-d. How is `output` *Tongue velocity* aligned with the neural data?
 
-i. Video frame times are corrected by subtracting vidshift (video-neural timing offset) and the trial's goCue time. The position is then interpolated to the neural time axis using linear interpolation.
+i. Frame times are corrected by the video offset (`vidshift`) and aligned to the go cue: `ft - vidshift - align_times[trial]`. The video offset is computed as `nanmedian(bitcode_bitstart/fs) - nanmedian(ev.bitStart)`. Positions are then interpolated directly onto the neural time axis.
 
 ii.
 ```python
+bit_start = np.nanmedian(bp_group['ev']['bitStart'][()].flatten())
+bitcode_bitstart = np.nanmedian(sglx['bitcode']['bitstart'][()].flatten())
+vid_file_offset = bitcode_bitstart / fs
+vidshift = vid_file_offset - bit_start
+...
 ft_aligned = ft - vidshift - align_times[trix]
-xpos = interp1d(ft_aligned[valid], x_r[valid], kind='linear',
-                bounds_error=False, fill_value=np.nan)(time_axis)
+xpos = interp1d(ft_aligned[valid], x_r[valid], ...)(time_axis)
 ```
 
-iii. This matches `findPosition.m`: `interp1(traj(trix).frameTimes - vidshift - obj.bp.ev.(alignEv)(trix), ts, taxis)`.
+iii. The AI uses `nanmedian` for the offset computation, while the reference uses `mode`. Both implement the same concept from `findVideoOffset.m`.
 
 ## 8-a. What variables in the raw data is `output` *Paw velocity* derived from?
 
-i. Paw velocity is derived from `obj.traj{2}` (bottom camera) DLC tracking data for the `top_paw` feature.
+i. The DLC tracking `top_paw` from the bottom camera (view index 1).
 
 ii.
 ```python
@@ -348,203 +383,182 @@ paw_vel = _compute_feature_velocity_generic(
     time_axis=time_axis, is_tongue=False)
 ```
 
-iii. The reference code tracks paw position from the bottom camera. Only `top_paw` is used (not `bottom_paw`).
+iii. Same feature as reference (`top_paw` from bottom camera).
 
 ## 8-b. What processing is involved in computing `output` *Paw velocity*?
 
-i. Processing steps: (1) Extract x,y positions from DLC data. (2) Align and interpolate to neural time axis (same as tongue). (3) Fill missing positions with nearest value. (4) Compute velocity via gradient. (5) Subtract baseline drift velocity (median of position differences). (6) Fill NaN velocities with nearest value. (7) Compute Euclidean speed.
+i. Positions are interpolated to the neural time axis, NaN-filled with nearest-neighbor interpolation, then gradient is computed. A baseline velocity (median of differences) is subtracted. Speed is `sqrt(xvel^2 + yvel^2)`.
 
 ii.
 ```python
 if not is_tongue:
     xpos = _fill_nearest(xpos)
     ypos = _fill_nearest(ypos)
-# ...
+
 xvel = np.gradient(xpos)
 yvel = np.gradient(ypos)
-# Subtract baseline drift
-base_xvel = np.nanmedian(np.diff(xpos))
-base_yvel = np.nanmedian(np.diff(ypos))
-xvel -= (base_xvel if not np.isnan(base_xvel) else 0)
-yvel -= (base_yvel if not np.isnan(base_yvel) else 0)
-xvel = _fill_nearest(xvel)
-yvel = _fill_nearest(yvel)
-speed[:, trix] = np.sqrt(xvel**2 + yvel**2).astype(np.float32)
+
+if not is_tongue:
+    base_xvel = np.nanmedian(np.diff(xpos))
+    base_yvel = np.nanmedian(np.diff(ypos))
+    xvel -= (base_xvel if not np.isnan(base_xvel) else 0)
+    yvel -= (base_yvel if not np.isnan(base_yvel) else 0)
+    xvel = _fill_nearest(xvel)
+    yvel = _fill_nearest(yvel)
 ```
 
-iii. The processing matches the reference `findVelocity.m` pattern: position filled with nearest, baseline subtracted, NaN velocities filled with nearest. However, there is a difference: the reference code subtracts `basederiv(1)` (x-baseline) from BOTH xvel and yvel (lines 13-14 of findVelocity.m), while the AI correctly subtracts x-baseline from xvel and y-baseline from yvel. This appears to be a bug in the reference code that the AI "fixed."
+iii. The AI adds baseline subtraction and nearest-neighbor filling for paw (but not tongue), which differs from the reference's approach of computing velocity within contiguous runs of valid frames.
 
 ## 8-c. How is `output` *Paw velocity* thresholded into categories?
 
-i. Same as tongue velocity: 50th percentile per session, values >= threshold are 1, < threshold are 0.
+i. Same as tongue: two classes at 50th percentile, NaN mapped to 0 ("low"). No "not visible" class.
 
 ii.
 ```python
 paw_vel_disc = _discretize_velocity(paw_vel, n_timebins, n_valid_trials)
 ```
 
-iii. Matches decoder task specification.
+iii. Same approach as tongue velocity discretization.
 
 ## 8-d. How is `output` *Paw velocity* aligned with the neural data?
 
-i. Same alignment method as tongue velocity: video frame times corrected by vidshift and goCue time, then interpolated to neural time axis.
+i. Same alignment as tongue: frame times corrected by vidshift and go cue, then interpolated onto neural time axis.
 
-ii.
-```python
-ft_aligned = ft - vidshift - align_times[trix]
-xpos = interp1d(ft_aligned[valid], x_r[valid], ...)(time_axis)
-```
+ii. Same code path as tongue (see 7-d).
 
-iii. Matches reference alignment approach.
+iii. Same alignment approach.
 
 ## 9-a. What variables in the raw data is `output` *Motion energy* derived from?
 
-i. Motion energy is loaded from separate `motionEnergy_<animal>_<date>.mat` files. The raw data is a cell array (`me.data`) containing per-trial motion energy time series captured at 400 Hz (same as video frame rate).
+i. A separate `motionEnergy_<anm>_<date>.mat` file. The motion energy data is loaded and unwrapped from its container structure.
 
 ii.
 ```python
 me_fn = os.path.join(data_dir, f'motionEnergy_{anm}_{date}.mat')
-# Load via scipy.io or h5py:
+...
 me_struct = me_file['me']
 me_cell = me_struct['data'].item()
 ```
 
-iii. Matches `loadMotionEnergy.m` which loads from `motionEnergy*.mat` files.
+iii. Same source as reference.
 
 ## 9-b. What processing is involved in computing `output` *Motion energy*?
 
-i. Processing steps: (1) Load per-trial ME arrays from .mat file. (2) Get frame times from side camera (view 1) trajectory data. (3) Align frame times by subtracting vidshift and goCue time. (4) Interpolate ME to neural time axis using linear interpolation. (5) Fill remaining NaN values with nearest non-NaN value.
+i. Motion energy values are interpolated to the neural time axis using `interp1d`, then NaN values are filled with nearest-neighbor interpolation. This differs from the reference which bins by averaging frames in each bin.
 
 ii.
 ```python
-ft_aligned = ft - vidshift - align_times[trix]
 me_aligned[:, trix] = interp1d(ft_aligned[valid], me_trial[valid],
                                kind='linear', bounds_error=False,
                                fill_value=np.nan)(time_axis).astype(np.float32)
-# Fill NaNs:
+...
+# Fill NaN with nearest
 me_aligned[:, trix] = _fill_nearest(col)
 ```
 
-iii. This matches `loadMotionEnergy.m` which interpolates ME using `interp1(frameTimes - vidshift - alignTimes(trix), me.data{trix}, taxis)` and then fills NaN with `fillmissing(..., 'nearest')`.
+iii. The AI interpolates rather than averaging frames per bin. It also fills remaining NaN values with nearest-neighbor interpolation.
 
 ## 9-c. How is `output` *Motion energy* thresholded into categories?
 
-i. Same discretization as tongue and paw velocity: 50th percentile per session, >= threshold is 1, < threshold is 0.
+i. Same as tongue and paw: two classes at 50th percentile, NaN mapped to 0 ("low").
 
 ii.
 ```python
 me_disc = _discretize_velocity(me_data, n_timebins, n_valid_trials)
 ```
 
-iii. Matches decoder task specification.
+iii. Same discretization approach as other continuous outputs.
 
 ## 9-d. How is `output` *Motion energy* aligned with the neural data?
 
-i. ME is aligned using side camera frame times, corrected by vidshift and goCue time, then interpolated to the neural time axis. If frame times are unavailable, synthetic frame times are generated at 400 Hz.
+i. Frame times from the side camera are corrected by vidshift and go cue, then motion energy is interpolated onto the neural time axis.
 
 ii.
 ```python
-side_cam = traj_data['views'][0]  # side cam for frame times
-ft = side_cam['trials'][trix]['frameTimes']
 ft_aligned = ft - vidshift - align_times[trix]
-me_aligned[:, trix] = interp1d(ft_aligned[valid], me_trial[valid], ...)(time_axis)
+me_aligned[:, trix] = interp1d(ft_aligned[valid], me_trial[valid],
+                               kind='linear', bounds_error=False,
+                               fill_value=np.nan)(time_axis)
 ```
 
-iii. Matches reference: `loadMotionEnergy.m` uses `obj.traj{1}(trix).frameTimes` (side cam) for ME alignment.
+iii. Uses interpolation rather than binning.
 
 ## 10. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI handles several categories of missing/problematic data:
-- **Missing DLC detections (tongue)**: NaN positions → velocity set to 0 when tongue not visible
-- **Missing DLC detections (non-tongue)**: Positions filled with nearest non-NaN value before computing velocity
-- **Missing frame times**: Synthetic frame times generated at 400 Hz
-- **Corrupted ME files**: Graceful fallback to all-zero ME (4 JEB23 sessions)
-- **All-zero neural data**: Retained as-is (61/13823 trials in late sessions)
-- **Missing data files**: Sessions skipped with warning
-- **NaN in interpolated data**: Filled with nearest non-NaN value
+i. Several cases: (1) Missing frame times: if `frameTimes` is empty or all NaN, a synthetic time axis at 400 Hz is generated. (2) Missing motion energy files: if the file can't be loaded, all-zero motion energy is used. (3) NaN in interpolated data: nearest-neighbor fill is applied for paw and motion energy; for tongue, NaN velocities are set to 0. (4) Sessions that fail to load are skipped with a warning.
 
 ii.
 ```python
-# Tongue velocity NaN handling:
-xvel[np.isnan(xvel)] = 0
-yvel[np.isnan(yvel)] = 0
-# Non-tongue fill nearest:
-xpos = _fill_nearest(xpos)
-# ME fallback for corrupted files:
-if data is None:
-    return np.zeros((n_timebins, n_trials), dtype=np.int64)
-# Missing frame times:
-if ft is None or ft.size == 0:
+if ft is None or ft.size == 0 or np.all(np.isnan(ft)):
     ft = np.arange(1, me_trial.size + 1) / 400.0
+...
+def _fill_nearest(arr):
+    valid_idx = np.where(~nans)[0]
+    nan_idx = np.where(nans)[0]
+    nearest = np.searchsorted(valid_idx, nan_idx).clip(0, len(valid_idx) - 1)
+    arr[nans] = arr[valid_idx[nearest]]
+    return arr
 ```
 
-iii. The approaches match the reference code patterns: `fillmissing(..., 'nearest')` for non-tongue features, tongue NaN → 0, synthetic frame times as fallback.
+iii. CONVERSION_NOTES.md documents: 4 JEB23 sessions have corrupted ME files; some sessions have late trials with all-zero neural data. The AI chose to fill NaN values rather than mark them as a separate class.
 
 ## 11-a. What are the most time-consuming steps of the code?
 
-i. The most time-consuming step is the nested loop over neurons and trials for spike binning and smoothing (lines 460-473 of convert_data.py). For each neuron and each trial, the code: finds matching spikes, computes histogram, applies Gaussian smoothing. This is O(n_neurons * n_trials) per session.
+i. The spike binning loop is the most time-consuming step. Spikes are binned per-neuron, per-trial in a nested Python loop, which is inherently slow. File loading is also significant. Total conversion runs in ~163 seconds.
 
 ii.
 ```python
 for neuron_idx, clu_idx in enumerate(good_indices):
-    spike_tm = all_spike_times[clu_idx]
-    spike_trial = all_spike_trials[clu_idx]
     for t_idx, trial_num in enumerate(valid_trials):
         spk_mask = spike_trial == trial_num
         spk_times = spike_tm[spk_mask] - align_times[trial_num - 1]
         counts, _ = np.histogram(spk_times, bins=edges)
-        fr = causal_gaussian_smooth(counts.astype(np.float64) / params['dt'],
-                                   params['smooth_window'], params['smooth_bctype'])
+        fr = causal_gaussian_smooth(counts / params['dt'], ...)
 ```
 
-iii. The AI estimated ~5s per session, ~220s total for 44 sessions. This is within acceptable limits.
+iii. The nested loop over neurons and trials for spike binning is the main bottleneck.
 
 ## 11-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. Two main loops could be vectorized:
-1. The neuron x trial spike binning loop (lines 460-473): Trial selection (`spike_trial == trial_num`) could be vectorized using numpy advanced indexing or `np.searchsorted`.
-2. The `causal_gaussian_smooth` function loops over columns (line 188-189): `np.convolve` is called per column instead of using `scipy.signal.fftconvolve` or `np.apply_along_axis`.
+i. The spike binning uses a nested loop over neurons and trials (line 460-473), calling `np.histogram` once per neuron per trial. This could be vectorized using `np.histogram2d` over all trials at once per neuron, as the reference does. The velocity computation also loops over trials.
 
 ii.
 ```python
-# Loop over columns in smoothing:
-for j in range(x_filt.shape[1]):
-    out[:, j] = np.convolve(x_filt[:, j], kern, mode='same')
+for neuron_idx, clu_idx in enumerate(good_indices):
+    for t_idx, trial_num in enumerate(valid_trials):
+        spk_mask = spike_trial == trial_num
+        ...
+        counts, _ = np.histogram(spk_times, bins=edges)
 ```
 
-iii. The AI acknowledged efficiency concerns but kept the iterative approach since total runtime was ~3 minutes.
+iii. The reference uses a single `histogram2d` call per neuron over all trials, avoiding the inner trial loop.
 
 ## 11-c. What processing does the code repeat multiple times?
 
-i. Several processing steps are repeated:
-1. The smoothing kernel is reconstructed on every call to `causal_gaussian_smooth` (same parameters each time).
-2. Video offset (`vidshift`) computation is performed per session (same calculation pattern).
-3. The `_fill_nearest` function is called multiple times per trial for different signals.
-4. Format detection (`_detect_file_format`) performs a trial open of each file.
+i. The spike masking `spike_trial == trial_num` is computed for every neuron for every trial. The trial mask could be precomputed once. The smoothing kernel is rebuilt for every neuron-trial combination via `causal_gaussian_smooth`.
 
 ii.
 ```python
-# Kernel rebuilt every call:
-def causal_gaussian_smooth(x, N, bctype='reflect'):
-    kern = np.array(sig_windows.gaussian(N, std=(N - 1) / (2 * 2.5)))
-    kern[:N // 2] = 0
-    kern = kern / kern.sum()
+for neuron_idx, clu_idx in enumerate(good_indices):
+    for t_idx, trial_num in enumerate(valid_trials):
+        spk_mask = spike_trial == trial_num  # recomputed for each neuron
+        ...
+        fr = causal_gaussian_smooth(...)  # kernel rebuilt each call
 ```
 
-iii. The repeated kernel computation is wasteful but has negligible performance impact since the kernel is small.
+iii. The reference builds the Gaussian kernel once and applies it with `gaussian_filter1d`.
 
 ## 11-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The code computes and stores raw (continuous) velocity and motion energy data (`tongue_vel_raw`, `paw_vel_raw`, `me_raw`) per session, but only the discretized versions are included in the final output. These raw values are only used for processing plots in `--show-processing` mode.
+i. (1) The full `obj` structure is loaded including fields never used (e.g., `spkWavs`, `tm`, unused tracked features). (2) Nearest-neighbor filling of NaN values in motion energy and paw velocity is done but then the values are discretized, so exact filled values don't matter much. (3) Baseline subtraction in paw velocity computation adds processing that the reference doesn't do and may not be needed.
 
 ii.
 ```python
-# Raw values stored but not in final output:
-'tongue_vel_raw': tongue_vel,
-'paw_vel_raw': paw_vel,
-'me_raw': me_data,
-# Only discretized versions go into final output:
-tongue_v = sess['tongue_vel_disc'][:, t].astype(np.int64).reshape(1, -1)
+# Unnecessary baseline subtraction for paw
+base_xvel = np.nanmedian(np.diff(xpos))
+base_yvel = np.nanmedian(np.diff(ypos))
+xvel -= (base_xvel if not np.isnan(base_xvel) else 0)
+yvel -= (base_yvel if not np.isnan(base_yvel) else 0)
 ```
 
-iii. This is a minor inefficiency — the raw values consume memory during processing but are discarded when building the final pickle. They serve a useful purpose for diagnostic plots.
+iii. The baseline subtraction is not in the reference code and is not described in the paper.

@@ -2,9 +2,10 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent scans `/app/data` for `sub-*` directories, then scans each subject directory for `.nwb` files. It treats each NWB file as one session candidate, opens it with `NWBHDF5IO`, and reads session contents directly from NWB tables and acquisitions inside `process_session()`.
+i. The AI code enumerates subject folders under `/app/data`, then enumerates `.nwb` files inside each subject folder. Each file is opened with `NWBHDF5IO`, and the script reads trials, units, behavioral events, and tongue tracking directly from the NWB object.
 
-ii. ```python
+ii.
+```python
 def get_nwb_files(data_dir):
     subjects = sorted([d for d in os.listdir(data_dir) if d.startswith('sub-')])
     nwb_files = []
@@ -14,67 +15,84 @@ def get_nwb_files(data_dir):
         for fname in files:
             nwb_files.append((subj, os.path.join(subj_dir, fname)))
     return nwb_files
-
-io = NWBHDF5IO(nwb_path, 'r')
-nwb = io.read()
 ```
 
-iii. In `CONVERSION_NOTES.md`, the agent states that the provided dataset is organized as NWB files by subject, not as the `.mat` exports used by the reference preprocessing code, so it decided to load directly from NWB while trying to mirror the reference logic after loading.
+```python
+io = NWBHDF5IO(nwb_path, 'r')
+nwb = io.read()
+trials = nwb.trials
+events = nwb.acquisition['BehavioralEvents']
+tongue_ts = nwb.acquisition['BehavioralTimeSeries'].time_series['Camera0_side_TongueTracking']
+```
+
+iii. The notes justify this as the NWB-distributed dataset layout: one session per NWB file under `data/sub-*`, with `units`, `trials`, `BehavioralEvents`, and `BehavioralTimeSeries` holding the needed streams.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are defined by the top-level `sub-*` directory names. The script keeps a `subjects_seen` map and assigns each retained session a `subject_idx` pointing into `subjects_list`.
+i. Subjects are inferred from the directory name, e.g. `sub-440956`, not from `nwb.subject.subject_id`. The script appends a subject the first time it encounters that folder and uses the encounter order to build `subjects` and `subject_idx`.
 
-ii. ```python
-if subject_id not in subjects_seen:
-    subjects_seen[subject_id] = len(subjects_seen)
-    subjects_list.append(subject_id)
-subj_idx = subjects_seen[subject_id]
-subject_idx_list.append(subj_idx)
+ii.
+```python
+for i, (subject_id, nwb_path) in enumerate(nwb_files):
+    result = process_session(nwb_path, subject_id)
+    ...
+    if subject_id not in subjects_seen:
+        subjects_seen[subject_id] = len(subjects_seen)
+        subjects_list.append(subject_id)
+    subj_idx = subjects_seen[subject_id]
 ```
 
-iii. The notes say the NWB files are "organized by subject" and that `subject_id` should populate `subjects` / `subject_idx` in the target decoder format.
+```python
+'subjects': subjects_list,
+'subject_idx': np.array(subject_idx_list, dtype=np.int64),
+```
+
+iii. The notes treat the `sub-*` directories as the subject organization of the dataset and report 28 such subjects. There is no separate justification in the code comments for preferring folder names over NWB metadata.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each NWB file is treated as one session. Sessions are kept only if `process_session()` returns usable data; sessions with no good units, no mapped neurons, or fewer than two kept trials are dropped.
+i. Each NWB file is treated as one session. The processing loop handles one file at a time and appends one session record to the output lists.
 
-ii. ```python
+ii.
+```python
 for i, (subject_id, nwb_path) in enumerate(nwb_files):
     result = process_session(nwb_path, subject_id)
-    if result is None:
-        print("SKIPPED (no good units or trials)")
-        continue
+    ...
     all_sessions.append(result)
 ```
 
-iii. In the notes, the agent explicitly chose to "Include all 173 sessions with good units," interpreting the paper's 173 behavioral sessions as the dataset-level session count rather than a behavior-filtered analysis subset.
+```python
+return {
+    ...
+    'session_name': os.path.basename(nwb_path),
+}
+```
+
+iii. The notes explicitly state "Each NWB file = one session" and use the 174 NWB files / 173 kept sessions counts as support.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are defined from rows of `nwb.trials`, then filtered by a boolean `trial_mask`. Trial-specific neural/input/output arrays are built by iterating over the surviving `trial_indices`.
+i. Trials come from the NWB trials table. The code builds a boolean `trial_mask` over the rows of `nwb.trials`, then iterates over the surviving row indices. Trial-aligned event streams are indexed with the same trial index.
 
-ii. ```python
+ii.
+```python
 n_trials_total = len(nwb.trials)
 trials = nwb.trials
-trial_mask = (auto_water == 0) & (free_water == 0)
-recording_mask = np.zeros(n_trials_total, dtype=bool)
-recording_mask[valid_trial_idx] = True
-trial_mask = trial_mask & recording_mask
+...
 trial_indices = np.where(trial_mask)[0]
-
+...
 for ti in trial_indices:
     go_cue = go_start_times[ti]
-    ...
 ```
 
-iii. The notes describe the trial structure as coming from the NWB `trials` table plus event streams, and later note that `obs_intervals` forced an additional recording-coverage filter so only trials with valid neural recording are retained.
+iii. The trajectory and notes describe the NWB file as having one row per behavioral trial, with `go_start_times`, `trial_instruction`, `outcome`, and other per-trial fields all indexed by that same trial number.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The script excludes only `auto_water` and `free_water` trials, then further excludes trials not covered by the retained units' recording intervals (`obs_intervals`). It keeps early-lick, ignore, and photostim trials.
+i. The final code keeps only trials that satisfy three conditions: `auto_water == 0`, `free_water == 0`, and the trial is considered recorded according to `obs_intervals`. The `obs_intervals` handling is stricter than the human reference: it collects one interval set per distinct interval-count among good units and keeps only trials whose start time is within 1 second of an observed interval start for every such set.
 
-ii. ```python
+ii.
+```python
 trial_mask = (auto_water == 0) & (free_water == 0)
 recording_mask = np.zeros(n_trials_total, dtype=bool)
 recording_mask[valid_trial_idx] = True
@@ -82,49 +100,69 @@ trial_mask = trial_mask & recording_mask
 trial_indices = np.where(trial_mask)[0]
 ```
 
-iii. The notes justify this as a deliberate deviation from `get_regular_trial_mask()` in the reference code: early lick is a decoder output, photostimulation is a decoder input, and ignore is a requested outcome class, so the agent kept them and removed only auto/free water plus trials outside valid recording periods.
+```python
+for n_obs, obs in obs_sets.items():
+    obs_starts = obs[:, 0]
+    diffs = np.abs(trial_starts[:, None] - obs_starts[None, :])
+    min_diffs = diffs.min(axis=1)
+    covered = min_diffs < 1.0
+    valid_trials &= covered
+```
+
+iii. The notes initially planned to exclude `auto_water` and `free_water`, then later note that `obs_intervals` filtering was added after finding sessions where recording covered only part of behavior. The trajectory explicitly describes using `obs_intervals` to avoid trials with no spikes.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` is derived from `nwb.units['spike_times']` for units with `classification == 'good'`, after region mapping via `anno_name` and trial-validity filtering via `obs_intervals`.
+i. Neural data is derived from `nwb.units['spike_times']` for units that pass the AI's unit filter, with `go_start_times` providing the alignment event for extracting each trial window.
 
-ii. ```python
+ii.
+```python
 classification = nwb.units['classification'][:]
 good_mask = np.array([c == 'good' for c in classification])
-anno_names = nwb.units['anno_name'][:][good_mask]
 ...
 for idx in good_unit_indices:
     st = nwb.units['spike_times'][idx]
     spike_times_per_unit.append(st)
 ```
 
-iii. The notes repeatedly say the NWB `classification == 'good'` field corresponds to the reference QC classifier output and that spike times are the raw neural variable to convert into per-trial firing-rate features.
+```python
+go_start_times = events.time_series['go_start_times'].timestamps[:]
+...
+fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
+```
+
+iii. The notes state that spike times are absolute in NWB and that `classification == 'good'` corresponds to the QC classifier pass used in the reference work.
 
 ## 2-b. How is the `neural` data processed?
 
-i. For each kept trial, the script takes absolute spike times from each retained neuron, restricts them to the trial window relative to that trial's go cue, bins them into 50 ms non-overlapping bins, and divides by bin width to get firing rates in Hz.
+i. For each surviving trial, the code extracts spikes in `[go + T_START, go + T_END)`, bins them into non-overlapping 50 ms bins, and divides counts by bin width to produce firing rates in Hz. This is done by looping over neurons within each trial.
 
-ii. ```python
-def compute_firing_rates(spike_times_list, go_cue_time, t_start, t_end, bin_size):
-    n_bins = int((t_end - t_start) / bin_size)
-    fr = np.zeros((n_neurons, n_bins), dtype=np.float32)
-    abs_start = go_cue_time + t_start
-    abs_end = go_cue_time + t_end
-    ...
-    np.add.at(fr[i], bin_indices, 1.0)
-    fr /= bin_size
-    return fr
+ii.
+```python
+abs_start = go_cue_time + t_start
+abs_end = go_cue_time + t_end
+...
+mask = (st >= abs_start) & (st < abs_end)
+spikes_in_window = st[mask]
+...
+bin_indices = ((spikes_in_window - abs_start) / bin_size).astype(int)
+np.add.at(fr[i], bin_indices, 1.0)
+...
+fr /= bin_size
 ```
 
-iii. The notes state that the reference code uses `sliding_histogram()` with 40 ms width and 3.4 ms stride, but the agent chose 50 ms non-overlapping bins because the decoder instructions explicitly required 50 ms bins from `-2.5 s` to `1.5 s`.
+iii. The notes justify 50 ms bins and the `-2.5 s` to `+1.5 s` window from the task instructions, while treating firing-rate conversion from spike counts as the direct analogue of the reference preprocessing.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Neurons are kept only if they are NWB-classified as `good`, can be mapped from fine `anno_name` annotations into one of 14 coarse regions, and survive session-level checks. No explicit low-firing-rate threshold is applied.
+i. Units are first filtered by `classification == 'good'`. They are then filtered again by whether `anno_name` can be mapped into one of 14 coarse brain regions; unmapped units are discarded. A session is dropped if no units remain after this filtering.
 
-ii. ```python
+ii.
+```python
 classification = nwb.units['classification'][:]
 good_mask = np.array([c == 'good' for c in classification])
+...
+anno_names = nwb.units['anno_name'][:][good_mask]
 ...
 region = map_anno_to_region(str(anno))
 if region is None:
@@ -134,42 +172,45 @@ good_unit_indices = np.where(good_mask)[0]
 good_unit_indices = good_unit_indices[valid_neuron_mask]
 ```
 
-iii. The notes justify `classification == 'good'` as the NWB analogue of the reference QC classifier. The notes also explicitly say the method-paper 2 Hz cutoff was treated as analysis-specific and therefore not applied here.
+iii. The notes justify `classification == 'good'` from the QC white paper and also say neurons should have histology / `anno_name`. The final code operationalizes the latter as requiring a successful coarse-region mapping.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural activity is aligned to go cue onset. For each trial, the trial's `go_start_times` timestamp defines time zero, and the script extracts `[-2.5, +1.5)` seconds around that go cue.
+i. Neural data is aligned to go cue onset. For each trial index, the code reads `go_start_times[ti]` and defines the neural extraction window relative to that absolute timestamp.
 
-ii. ```python
+ii.
+```python
 go_start_times = events.time_series['go_start_times'].timestamps[:]
 ...
-go_cue = go_start_times[ti]
-fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
+for ti in trial_indices:
+    go_cue = go_start_times[ti]
+    fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
 ```
 
-iii. The notes cite the decoder task requirement to align everything to Go cue onset and treat the reference code's go-cue alignment as conceptually consistent with this choice.
+iii. The notes explicitly describe spike times as already being on the same absolute clock as go-cue events, so only a relative window around the go cue is needed.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted neural data use 50 ms bins over a 4.0 s window, giving 80 time bins per trial. The script does not first create a higher-resolution representation and then rebin it; it bins spikes directly into 50 ms trial bins.
+i. The code uses 50 ms bins and 80 time bins total from `-2.5 s` to `+1.5 s` around the go cue. No additional rebinning or smoothing is applied beyond this direct binning from raw timestamps.
 
-ii. ```python
+ii.
+```python
 BIN_SIZE_S = 0.05
 T_START = -2.5
 T_END = 1.5
-N_TIMEBINS = int((T_END - T_START) / BIN_SIZE_S)  # 80
+N_TIMEBINS = int((T_END - T_START) / BIN_SIZE_S)
 ```
 
-iii. The notes explicitly call out this difference from the reference code's 40 ms / 3.4 ms sliding histogram and say it was chosen to satisfy the decoder task specification.
+iii. The notes explicitly say the reference paper used 40 ms / 3.4 ms stride, but the conversion intentionally switched to 50 ms non-overlapping bins because the decoder task required it.
 
 ## 3-a. What variables in the raw data is `input` *Time from tone onset in seconds* derived from?
 
-i. It is derived from `sample_start_times` and `go_start_times` in `BehavioralEvents`. For each trial, the script finds the last sample onset before that trial's go cue.
+i. This input is derived from `sample_start_times` and `go_start_times`. For each trial, the code takes the last sample start before that trial's go cue.
 
-ii. ```python
+ii.
+```python
 sample_start_times = events.time_series['sample_start_times'].timestamps[:]
-go_start_times = events.time_series['go_start_times'].timestamps[:]
-
+...
 def find_last_sample_before_go(sample_start_times, go_cue_time):
     valid = sample_start_times[sample_start_times < go_cue_time]
     if len(valid) == 0:
@@ -177,183 +218,204 @@ def find_last_sample_before_go(sample_start_times, go_cue_time):
     return valid[-1]
 ```
 
-iii. The notes and trajectory say the agent noticed there are more sample-start events than trials because early licks trigger replays, so it chose the last sample onset before each go cue as the tone onset for that trial.
+iii. The notes and trajectory justify this by observing that `sample_start_times` has more entries than trials because early licks replay the sample epoch, so the relevant tone is the last sample onset before the go cue.
 
 ## 3-b. What processing is involved in computing `input` *Time from tone onset in seconds*?
 
-i. After finding a per-trial tone onset, the script computes the center of each 50 ms go-cue-aligned bin and subtracts the tone onset time relative to go cue. If no earlier sample onset is found, it falls back to `go_cue - 1.85`.
+i. The code computes bin centers relative to go cue, converts the selected tone onset into a go-cue-relative offset, and subtracts that offset from each bin center. If no preceding sample onset exists, it falls back to `go_cue - 1.85`.
 
-ii. ```python
+ii.
+```python
+bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
+tone_rel = tone_onset_time - go_cue_time
+time_from_tone = bin_centers - tone_rel
+```
+
+```python
 tone_onset = find_last_sample_before_go(sample_start_times, go_cue)
 if tone_onset is None:
     tone_onset = go_cue - 1.85
 time_from_tone = compute_time_from_tone(go_cue, tone_onset, T_START, T_END, BIN_SIZE_S)
-
-def compute_time_from_tone(go_cue_time, tone_onset_time, t_start, t_end, bin_size):
-    bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
-    tone_rel = tone_onset_time - go_cue_time
-    time_from_tone = bin_centers - tone_rel
 ```
 
-iii. The notes justify the "last sample start" logic using replayed sample epochs after early licks. The trajectory also shows the agent recognized some timing outliers and kept a hard-coded `1.85 s` fallback as a safety default.
+iii. The notes justify the main rule as "last sample_start before go cue." There is no explicit note-based justification for the hard-coded `1.85 s` fallback; that appears only in the final code.
 
 ## 3-c. How is the `input` *Time from tone onset in seconds* aligned with the neural data?
 
-i. The time-from-tone trace is evaluated on the same 80 bin centers as the neural firing rates, using the same per-trial go cue as time zero.
+i. It is sampled on the same 80 bin centers used for the neural data, with those bin centers defined relative to the same go cue used for neural alignment.
 
-ii. ```python
-input_data = np.stack([time_from_tone, photostim_ts], axis=0)
+ii.
+```python
+bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
 ...
-fr = compute_firing_rates(..., go_cue, T_START, T_END, BIN_SIZE_S)
+fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
 time_from_tone = compute_time_from_tone(go_cue, tone_onset, T_START, T_END, BIN_SIZE_S)
 ```
 
-iii. The notes frame this as one of the central consistency requirements: all streams should be aligned to the same go-cue-based time axis.
+iii. The notes frame this input as a time-varying contextual regressor defined on the same go-cue-aligned grid as the firing rates.
 
 ## 4-a. What variables in the raw data is `input` *Photostimulation* derived from?
 
-i. It is derived from the absolute `photostim_start_times` and `photostim_stop_times` event streams in `BehavioralEvents`.
+i. The final code derives photostimulation from `BehavioralEvents/photostim_start_times` and `BehavioralEvents/photostim_stop_times`, both absolute timestamps. It does not use the trial-table `photostim_onset` or `photostim_duration` fields in the final implementation.
 
-ii. ```python
+ii.
+```python
 photostim_start_abs = events.time_series['photostim_start_times'].timestamps[:]
 photostim_stop_abs = events.time_series['photostim_stop_times'].timestamps[:]
 ```
 
-iii. The trajectory shows the agent inspected both trial-level photostim fields and event-level photostim timestamps, then decided the absolute event timestamps were the safer source for bin-level alignment.
-
-## 4-b. What processing is involved in computing `input` *Photostimulation*?
-
-i. For each trial, the script selects photostim intervals that overlap the trial window and creates a binary time series whose entries are 1 for bin centers inside any overlapping photostim interval and 0 otherwise.
-
-ii. ```python
+```python
 stim_mask = (photostim_stop_abs > trial_abs_start) & (photostim_start_abs < trial_abs_end)
 ps_starts = photostim_start_abs[stim_mask]
 ps_stops = photostim_stop_abs[stim_mask]
-photostim_ts = compute_photostim_timeseries(go_cue, ps_starts, ps_stops,
-                                            T_START, T_END, BIN_SIZE_S)
 ```
 
-iii. The notes say the decoder needs photostimulation as a time-varying input, so the agent kept stimulated trials and encoded photostim as a binary series rather than filtering them out.
+iii. The trajectory notes that the trial table stores `photostim_onset` relative to trial start, while `BehavioralEvents` stores absolute photostim timestamps. The final code chose the absolute event stream because it already lives on the same time axis as the neural data.
+
+## 4-b. What processing is involved in computing `input` *Photostimulation*?
+
+i. For each trial, the code finds all photostim events overlapping the trial-aligned neural window and marks bins whose absolute bin centers fall between each event's start and stop time. The result is a binary time series per trial.
+
+ii.
+```python
+def compute_photostim_timeseries(go_cue_time, photostim_starts, photostim_stops,
+                                  t_start, t_end, bin_size):
+    n_bins = int((t_end - t_start) / bin_size)
+    bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
+    abs_centers = bin_centers + go_cue_time
+
+    stim = np.zeros(n_bins, dtype=np.float32)
+    for start, stop in zip(photostim_starts, photostim_stops):
+        mask = (abs_centers >= start) & (abs_centers <= stop)
+        stim[mask] = 1.0
+    return stim
+```
+
+iii. The notes say photostimulation should be represented as a time-varying binary regressor rather than a per-trial flag. The trajectory also mentions aligning absolute photostim start/stop times to the go-cue-based window.
 
 ## 4-c. How is the `input` *Photostimulation* aligned with the neural data?
 
-i. The script uses the same trial-specific go cue as neural time zero, computes the same 50 ms bin centers, converts them back to absolute time, and checks whether each bin center falls inside any photostim interval.
+i. The code converts neural bin centers to absolute time by adding the trial's `go_cue_time`, then compares those absolute centers to absolute photostim start/stop times. This aligns photostim to the same bins used for the neural data.
 
-ii. ```python
+ii.
+```python
 bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
 abs_centers = bin_centers + go_cue_time
-for start, stop in zip(photostim_starts, photostim_stops):
-    mask = (abs_centers >= start) & (abs_centers <= stop)
-    stim[mask] = 1.0
+...
+photostim_ts = compute_photostim_timeseries(go_cue, ps_starts, ps_stops,
+                                              T_START, T_END, BIN_SIZE_S)
 ```
 
-iii. The notes explicitly say photostim should be "aligned to go cue" using absolute `photostim_start/stop_times`.
+iii. The trajectory explicitly notes that `photostim_start_times` are already absolute timestamps, so alignment reduces to comparing them to absolute bin centers from the go-cue-aligned trial window.
 
 ## 5-a. What variables in the raw data is `output` *Lick direction choice* derived from?
 
-i. The agent did not derive choice from actual lick behavior. It uses `trials['trial_instruction']` and treats that instruction label as the output choice.
+i. In the final code, choice is derived only from `trial_instruction`. It does not use `outcome` to recover the animal's actual lick direction, and it does not create a separate no-lick class for ignored trials.
 
-ii. ```python
+ii.
+```python
 instructions = trials['trial_instruction'][:]
 ...
 choice = 0 if instructions[ti] == 'left' else 1
 ```
 
-iii. The notes map `trial_instruction` to `output[0]: choice`, and the README later describes this output as "Trial instruction (lick direction)," showing the agent consciously equated instructed side with lick choice.
+iii. The notes planned to map `trial_instruction` directly to choice and describe it as "left=0, right=1." There is no later note correcting this to an actual lick-direction derivation using `outcome`.
 
 ## 5-b. What processing is involved in computing `output` *Lick direction choice*?
 
-i. The script performs a direct binary mapping: `'left' -> 0`, anything else -> `1`. It then repeats this scalar across all 80 time bins so the output becomes time-varying in shape, even though the quantity is per-trial.
+i. The instructed side is encoded as `0` for left and `1` for right, then repeated across all 80 bins in the output tensor. The stored `output_values` also contain only two choice labels.
 
-ii. ```python
-choice = 0 if instructions[ti] == 'left' else 1
-...
+ii.
+```python
 full_output = np.zeros((4, N_TIMEBINS), dtype=np.int64)
 full_output[0, :] = out_dict['choice']
 ```
 
-iii. The notes say per-trial outputs were replicated across time because the decoder accepts time-varying outputs, but they do not justify the semantic choice of using instruction instead of observed lick behavior.
+```python
+'output_values': [
+    ['left', 'right'],
+    ['ignore', 'miss', 'hit'],
+    ['no', 'yes'],
+    ['below_40th', '40th_to_60th', 'above_60th'],
+],
+```
+
+iii. The notes justify the `0/1` coding from the task statement. They do not discuss how to handle `ignore` trials when there is no lick.
 
 ## 6-a. What variables in the raw data is `output` *Outcome* derived from?
 
-i. Outcome comes directly from `trials['outcome']`.
+i. Outcome comes directly from the `trials['outcome']` field.
 
-ii. ```python
+ii.
+```python
 outcomes = trials['outcome'][:]
 ...
 outcome_str = outcomes[ti]
 ```
 
-iii. The notes map the NWB `outcome` field to decoder output `ignore / miss / hit`.
+iii. The notes identify NWB `outcome` as already containing the required `hit`, `miss`, and `ignore` categories.
 
 ## 6-b. What processing is involved in computing `output` *Outcome*?
 
-i. The script maps string outcomes to integer classes `ignore=0`, `miss=1`, `hit=2`, with unknown strings defaulting to `0`, and then repeats the trial-level value across all time bins.
+i. The string outcome is mapped with `ignore -> 0`, `miss -> 1`, `hit -> 2`, then repeated across all 80 bins in the output array.
 
-ii. ```python
+ii.
+```python
 outcome_val = {'ignore': 0, 'miss': 1, 'hit': 2}.get(outcome_str, 0)
 ...
 full_output[1, :] = out_dict['outcome']
 ```
 
-iii. The notes say this mapping was chosen to match the decoder specification exactly.
-
-## 6-c. How is `output` *Distance to reward zone* aligned with the neural data?
-
-i. The script does not compute any "distance to reward zone" output. Instead, it stores only per-trial outcome and repeats that outcome label across all neural time bins.
-
-ii. ```python
-full_output = np.zeros((4, N_TIMEBINS), dtype=np.int64)
-full_output[1, :] = out_dict['outcome']
-```
-
-iii. Neither the notes nor the script mention a reward-zone distance variable. This appears to be a mismatch between the evaluation prompt and the actual decoder task, which asked for `Outcome`, not reward-zone distance.
+iii. The notes explicitly planned the same category mapping because it matches the decoder specification.
 
 ## 7-a. What variables in the raw data is `output` *Early lick* derived from?
 
-i. Early lick is taken directly from `trials['early_lick']`.
+i. Early lick comes directly from `trials['early_lick']`.
 
-ii. ```python
+ii.
+```python
 early_lick = trials['early_lick'][:]
 ...
 early_val = 0 if early_lick[ti] == 'no early' else 1
 ```
 
-iii. The notes explicitly say early lick was kept because it is one of the requested decoder outputs, even though reference analysis code usually filters such trials out.
+iii. The notes identify `early_lick` as an explicit NWB trial field and say these trials were intentionally retained because early lick is itself a decoder output.
 
 ## 7-b. What processing is involved in computing `output` *Early lick*?
 
-i. The script maps `'no early'` to 0 and all other values to 1, then repeats the result across all 80 time bins.
+i. The code maps `'no early'` to `0` and anything else to `1`, then repeats that code across all 80 bins.
 
-ii. ```python
+ii.
+```python
 early_val = 0 if early_lick[ti] == 'no early' else 1
 ...
 full_output[2, :] = out_dict['early_lick']
 ```
 
-iii. The notes justify this as a direct implementation of the decoder spec's binary early-lick label.
+iii. The notes explicitly planned this binary mapping from the trial field into the decoder output.
 
 ## 8-a. What variables in the raw data is `output` *Tongue y-position* derived from?
 
-i. Tongue y-position is derived from the side-camera tongue tracking time series: `Camera0_side_TongueTracking.data[:, 1]` for y, `[:, 2]` for likelihood, plus the corresponding timestamps.
+i. Tongue y-position is derived from `Camera0_side_TongueTracking`: column 1 of the `data` matrix for y-position, column 2 for tracking likelihood, and the matching `timestamps`.
 
-ii. ```python
+ii.
+```python
 tongue_ts = nwb.acquisition['BehavioralTimeSeries'].time_series['Camera0_side_TongueTracking']
-tongue_data_all = tongue_ts.data[:]  # (n_frames, 3): x, y, likelihood
+tongue_data_all = tongue_ts.data[:]
 tongue_timestamps = tongue_ts.timestamps[:]
 tongue_y_all = tongue_data_all[:, 1].astype(np.float32)
 tongue_likelihood = tongue_data_all[:, 2].astype(np.float32)
 ```
 
-iii. The notes say the agent identified the side-camera tongue tracking array as `(x, y, likelihood)` and selected column 1 as the requested y-position signal.
+iii. The notes and trajectory both describe the tongue tracking stream as `(x, y, likelihood)` at roughly video frame rate and explicitly identify column 1 as y-position.
 
 ## 8-b. What processing is involved in computing `output` *Tongue y-position*?
 
-i. For each trial, the script extracts tongue samples inside the go-cue-aligned window, discards samples with likelihood `< 0.9`, bins the remaining y-values into the 50 ms neural bins by average value, and leaves empty bins as `NaN`.
+i. For each trial, the code selects tongue frames in the go-cue-aligned window, sets y-values with likelihood `< 0.9` to NaN, bins remaining y-values by averaging within each 50 ms bin, and later computes session percentiles from all non-NaN trial-bin values concatenated across trials. Unlike the reference, missing bins are not given a separate class; they stay at 0 because the discretized array is initialized to zeros.
 
-ii. ```python
-mask = (tongue_timestamps >= abs_start) & (tongue_timestamps < abs_end)
-...
+ii.
+```python
+y_in_window = y_in_window.copy()
 y_in_window[like_in_window < 0.9] = np.nan
 ...
 sums = np.bincount(valid_bins, weights=valid_vals, minlength=n_bins)
@@ -361,17 +423,29 @@ counts = np.bincount(valid_bins, minlength=n_bins)
 tongue_y_binned[has_data] = (sums[has_data] / counts[has_data]).astype(np.float32)
 ```
 
-iii. The notes justify this as using the raw DLC tongue trace with a likelihood filter. The trajectory shows the agent recognized the 300 Hz tongue data and chose simple bin averaging rather than reusing the reference video-processing pipeline.
+```python
+valid_y = tongue_y_trial[~np.isnan(tongue_y_trial)]
+if len(valid_y) > 0:
+    tongue_y_session.extend(valid_y.tolist())
+...
+tongue_y_arr = np.array(tongue_y_session)
+p40 = np.percentile(tongue_y_arr, 40)
+p60 = np.percentile(tongue_y_arr, 60)
+```
+
+iii. The notes justify per-session percentile discretization and using the y channel of tongue tracking. The trajectory also notes that likelihood is the DLC confidence. The final code's `0.9` threshold and handling of missing bins are not justified in the notes; the notes had instead planned percentiles over valid values and did not mention collapsing missing bins into class 0.
 
 ## 8-c. How is `output` *Tongue y-position* thresholded into categories?
 
-i. After collecting all valid tongue y values from the session, the script computes the session's 40th and 60th percentiles and assigns each binned value to class 0, 1, or 2. Bins left as `NaN` are not specially represented; because the discretized array is initialized to zeros, missing bins effectively become class 0.
+i. The final code computes the 40th and 60th percentiles from concatenated valid trial-bin y-values within a session, then applies three visible classes: `< p40 -> 0`, `p40..p60 -> 1`, `> p60 -> 2`. Bins with no valid tongue data remain 0 because the discretized output vector starts at zeros and only valid positions are overwritten.
 
-ii. ```python
-if len(tongue_y_session) > 0:
-    p40 = np.percentile(tongue_y_arr, 40)
-    p60 = np.percentile(tongue_y_arr, 60)
-...
+ii.
+```python
+p40 = np.percentile(tongue_y_arr, 40)
+p60 = np.percentile(tongue_y_arr, 60)
+```
+
+```python
 tongue_y_disc = np.zeros(N_TIMEBINS, dtype=np.float32)
 valid = ~np.isnan(tongue_y_raw)
 tongue_y_disc[valid & (tongue_y_raw < p40)] = 0
@@ -379,13 +453,14 @@ tongue_y_disc[valid & (tongue_y_raw >= p40) & (tongue_y_raw <= p60)] = 1
 tongue_y_disc[valid & (tongue_y_raw > p60)] = 2
 ```
 
-iii. The notes explicitly say the discretization uses per-session 40th and 60th percentiles over all valid time points, matching the task instructions. They do not discuss the consequence that missing bins collapse to class 0.
+iii. The notes justify the `40/60` per-session cut points from the task spec, but the code does not preserve a separate missing / not-visible category despite many bins lacking valid tongue data.
 
 ## 8-d. How is `output` *Tongue y-position* aligned with the neural data?
 
-i. Tongue timestamps are cut to the same `[-2.5, +1.5)` window around the per-trial go cue and then averaged within the same 50 ms bins used for neural firing rates.
+i. Tongue tracking is aligned by selecting frames between `go + T_START` and `go + T_END` and binning them with the same 50 ms edges used for the go-cue-centered trial window.
 
-ii. ```python
+ii.
+```python
 bin_edges = np.arange(n_bins + 1) * bin_size + t_start + go_cue_time
 abs_start = go_cue_time + t_start
 abs_end = go_cue_time + t_end
@@ -393,98 +468,131 @@ mask = (tongue_timestamps >= abs_start) & (tongue_timestamps < abs_end)
 bin_indices = np.digitize(t_in_window, bin_edges) - 1
 ```
 
-iii. The notes treat this as part of the same global go-cue alignment requirement used for all neural, input, and output streams.
+iii. The notes describe camera timestamps and neural timestamps as living on the same absolute clock, so the code aligns tongue frames by applying the same go-cue-relative window in absolute time.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Missing or problematic data are handled with ad hoc defaults: sessions with no good units or too few kept trials are skipped; neurons whose annotations do not map to a coarse region are dropped; missing sample-onset matches fall back to `go_cue - 1.85`; low-likelihood tongue samples become `NaN`; empty tongue bins stay `NaN` until discretization, where they effectively become class 0; unknown outcome strings default to class 0.
+i. The code handles several data-quality edge cases by dropping sessions with no remaining good units, dropping trials outside `obs_intervals`, dropping `auto_water` and `free_water` trials, fabricating a tone onset at `go - 1.85` when no sample onset is found, dropping units whose `anno_name` cannot be mapped to a coarse region, and converting low-likelihood tongue samples to NaN before binning. Missing tongue bins are ultimately collapsed into class 0 rather than represented explicitly.
 
-ii. ```python
+ii.
+```python
 if n_good == 0:
     io.close()
     return None
 ...
-if region is None:
-    valid_neuron_mask[i] = False
-...
-if tone_onset is None:
-    tone_onset = go_cue - 1.85
-...
-y_in_window[like_in_window < 0.9] = np.nan
-...
-outcome_val = {'ignore': 0, 'miss': 1, 'hit': 2}.get(outcome_str, 0)
+if n_neurons == 0:
+    io.close()
+    return None
 ```
 
-iii. The notes and trajectory justify these as pragmatic fixes for imperfect NWB/event alignment and missing tracking values, but they do not show a principled treatment for all missing-data cases.
+```python
+if tone_onset is None:
+    tone_onset = go_cue - 1.85
+```
+
+```python
+y_in_window[like_in_window < 0.9] = np.nan
+...
+tongue_y_disc = np.zeros(N_TIMEBINS, dtype=np.float32)
+valid = ~np.isnan(tongue_y_raw)
+```
+
+iii. The notes justify excluding trials without neural recording and excluding water-confounded trials. The trajectory justifies `obs_intervals` filtering after seeing partial-session recordings. There is no clear note-based justification for the hard-coded tone fallback or for converting missing tongue bins into the lowest visible class.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. The slowest work is per-session trial processing: repeated spike binning in `compute_firing_rates()`, trial-validity determination from `obs_intervals`, and per-trial tongue binning. Full conversion took about 2301 seconds for 173 sessions.
+i. The dominant work in the AI code is the nested per-trial neural binning loop: for every retained trial, `compute_firing_rates` loops over all surviving units, filters spikes to the trial window, and bins them. Secondary costs are per-trial tongue binning and loading full spike-time and tongue-tracking arrays for each session. The conversion log shows the full run took about 2300.8 s.
 
-ii. ```python
+ii.
+```python
 for ti in trial_indices:
+    go_cue = go_start_times[ti]
     fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
-    ...
-    tongue_y_trial = get_tongue_y_for_trial(...)
+    neural_trials.append(fr)
 ```
 
-iii. The trajectory explicitly calls out `get_valid_trial_indices()` as a bottleneck, and the notes estimate ~6.5 seconds per session before full conversion.
+```python
+for i, st in enumerate(spike_times_list):
+    mask = (st >= abs_start) & (st < abs_end)
+    spikes_in_window = st[mask]
+    ...
+    np.add.at(fr[i], bin_indices, 1.0)
+```
+
+iii. The notes themselves report a much longer runtime than the human reference and estimate about 6.5 s per session during sampling. They do not explicitly analyze the algorithmic cost, but the final code structure makes the repeated trial-by-trial firing-rate computation the clear bottleneck.
 
 ## 10-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The main remaining vectorization opportunities are the per-neuron spike loop inside `compute_firing_rates()`, the outer per-trial session loop, the annotation-to-region mapping loop, and the repeated Python-level construction of output statistics at the end of `main()`.
+i. Several loops remain unvectorized: the per-trial loop over all retained trials, the inner per-neuron loop inside `compute_firing_rates`, the `find_last_sample_before_go` scan repeated per trial, the `obs_intervals` loop over interval sets, and the annotation-to-region mapping loop over units. The tongue binning within `get_tongue_y_for_trial` is partly vectorized once trial frames are selected.
 
-ii. ```python
-for i, st in enumerate(spike_times_list):
-    ...
+ii.
+```python
 for ti in trial_indices:
     ...
-for i, anno in enumerate(anno_names):
-    ...
-for session_outputs in data['output']:
-    for trial_out in session_outputs:
-        ...
+    fr = compute_firing_rates(spike_times_per_unit, go_cue, T_START, T_END, BIN_SIZE_S)
 ```
 
-iii. The trajectory shows the agent thinking explicitly about vectorization and bottlenecks, but the final script remains mostly serial at the session and neuron loop levels.
+```python
+for i, st in enumerate(spike_times_list):
+    ...
+```
+
+```python
+for idx in good_unit_indices:
+    st = nwb.units['spike_times'][idx]
+    spike_times_per_unit.append(st)
+```
+
+iii. The notes do not justify keeping these loops in this form. The trajectory focuses on correctness and matching dataset counts rather than computational efficiency.
 
 ## 10-c. What processing does the code repeat multiple times?
 
-i. The script repeatedly recomputes the same bin counts / bin centers inside helper functions, rescans `sample_start_times` for every trial, builds trial-level photostim masks separately for every trial, and replicates trial-level labels across all 80 bins.
+i. The code repeats several computations per trial that could have been hoisted or shared: bin-center construction in `compute_time_from_tone` and `compute_photostim_timeseries`, scanning all sample onset times to find the last pre-go tone, and re-running the spike-window filtering/bucketization for every neuron separately on every trial. It also computes final summary counters by re-iterating over the full output after saving.
 
-ii. ```python
-n_bins = int((t_end - t_start) / bin_size)
+ii.
+```python
 bin_centers = np.arange(n_bins) * bin_size + t_start + bin_size / 2
-...
-tone_onset = find_last_sample_before_go(sample_start_times, go_cue)
-...
-stim_mask = (photostim_stop_abs > trial_abs_start) & (photostim_start_abs < trial_abs_end)
-...
-full_output[0, :] = out_dict['choice']
-full_output[1, :] = out_dict['outcome']
-full_output[2, :] = out_dict['early_lick']
 ```
 
-iii. The notes mention runtime concerns and some vectorization, but they also document the final design as repeated per-trial computations around the common go-cue-aligned bin grid.
+```python
+tone_onset = find_last_sample_before_go(sample_start_times, go_cue)
+...
+photostim_ts = compute_photostim_timeseries(go_cue, ps_starts, ps_stops,
+                                              T_START, T_END, BIN_SIZE_S)
+```
 
-## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. The script does extra work that is not needed by the saved dataset or most downstream analysis: it optionally generates processing plots, computes output / brain-region summary counters only for printing, stores trial-level categorical outputs as full 80-bin repeated arrays, and computes raw tongue traces only to discard them after percentile discretization.
-
-ii. ```python
-if args.show_processing and i < 2:
-    plot_processing(result, i, nwb_path)
-
+```python
 for session_outputs in data['output']:
     for trial_out in session_outputs:
         all_choices.append(int(trial_out[0, 0]))
-...
-output_trials_raw.append({
-    'choice': choice,
-    'outcome': outcome_val,
-    'early_lick': early_val,
-    'tongue_y_raw': tongue_y_trial
-})
 ```
 
-iii. The notes describe the plotting and summary printing as validation aids, and the time-repeated outputs were justified as a decoder-format convenience rather than as information-preserving processing.
+iii. The notes do not describe these repetitions as deliberate. They appear to be consequences of a straightforward per-trial implementation rather than an optimized design.
+
+## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+
+i. The script contains optional plotting and end-of-run reporting work that is not part of the saved decoder dataset. It also builds per-run summary counters by iterating over all outputs after the dataset has already been assembled. In addition, the `session_name` field is carried inside intermediate session dicts only for logging / plotting and is not saved into the final pickle.
+
+ii.
+```python
+if args.show_processing and i < 2:
+    plot_processing(result, i, nwb_path)
+```
+
+```python
+all_choices = []
+all_outcomes = []
+all_early = []
+for session_outputs in data['output']:
+    for trial_out in session_outputs:
+        all_choices.append(int(trial_out[0, 0]))
+```
+
+```python
+return {
+    ...
+    'session_name': os.path.basename(nwb_path),
+}
+```
+
+iii. The notes describe the plots as "processing visualization" and the counters as validation / consistency checks. They are justified for inspection, but they are not used by downstream decoder training on the saved pickle itself.

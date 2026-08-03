@@ -2,225 +2,218 @@
   "1-a": {
     "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The agent's choice to iterate over all `sub-*/*.nwb` files and read NWB groups with `h5py` is consistent with the released data layout and preserves the same task-relevant signals used by the reference analysis pipeline, adapted from `.mat` exports to NWB.",
+    "decision_correctness_justification": "Like the reference, the AI treats the dataset as one NWB file per session under `sub-*` folders and processes the whole dataset by iterating over a sorted file list. Using `h5py` instead of `pynwb` changes the reader implementation, not the loading decision.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code implements exactly that strategy through `get_session_files()` and `process_session()`."
+    "code_correctness_justification": "The code really does glob `sub-*/*.nwb`, open each file once, and read trials, units, event times, and tongue tracking from that file."
   },
   "1-b": {
     "question": "How are the data split into subjects (mice)?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Inferring mouse identity from the NWB parent folder `sub-<id>` is the natural and correct way to recover subjects from the released dataset.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference reads the subject id from `nwb.subject.subject_id`, while the AI uses the `sub-<id>` folder name. In this dataset those are effectively the same identifier, so the decision is different but equally justified.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code strips `sub-` from the parent directory and builds `subjects` and `subject_idx` from those values."
+    "code_correctness_justification": "The code extracts `subject_id` from the parent folder, builds a sorted unique subject list, and maps each session into `subject_idx`."
   },
   "1-c": {
     "question": "How are the data split into sessions?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Treating each NWB file as one session matches the raw dataset organization and the session-based structure of the target format.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference and AI both use one NWB file per session and preserve sorted file order. The AI uses the filename stem rather than `nwb.identifier` as the session id, which is a small but acceptable deviation.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Each processed file yields one `SessionResult`, and the dataset is assembled one list element per kept file/session."
+    "code_correctness_justification": "The code iterates over sorted NWB paths and assigns one `SessionResult` per file, with `session_id = file_path.stem`."
   },
   "1-d": {
     "question": "How are the data split into trials?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the NWB trial table and per-trial go times, then restricting to trials with a full supported neural window, is a defensible and reference-consistent way to define analyzable trials in the NWB release.",
+    "decision_correctness_justification": "Both solutions treat the NWB behavioral trial table as the source of trials and align it to `go_start_times`. The AI adds a later selection mask, but it still starts from one behavioral row per trial.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation subsets all trial-level arrays with `selected_trial_idx` and later removes all-zero-neural trials with `nonzero_trial_mask`."
+    "code_correctness_justification": "The code reads the full trial table, reads `go_start_times`, and slices all per-trial arrays using a shared selected-trial index array."
   },
   "1-e": {
     "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Filtering by neural support and not by the full reference `regular_trial_mask` is understandable because early lick, ignore, and photostim are required decoder targets/inputs. The concerning part is that the converter also retains auto-water/free-water style task irregularities if present, rather than explicitly addressing them.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly what the decision says: it uses `obs_intervals`/`is_good_trials` support and all-zero-neural filtering, while not applying broader behavioral trial exclusions."
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference keeps trials by exact `obs_intervals` trial matching and excludes `free_water` trials. The AI instead keeps trials whose full window lies inside a session-wide start/stop range, uses `is_good_trials` opportunistically, and only later drops all-zero neural trials. That is a materially different curation rule.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The code does not correctly implement even its own stated `obs_intervals` idea: it indexes the ragged `units/obs_intervals` dataset as if it were a simple per-unit matrix, and it never explicitly applies the reference `free_water` exclusion."
   },
   "2-a": {
     "question": "What variables in the raw data is the `neural` data derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Deriving neural activity from raw spike times of QC-passed units is consistent with the reference ephys pipeline and the paper's use of good units.",
+    "decision_correctness_justification": "Both solutions derive neural data from per-unit spike times and use go-cue times to place the bin edges. The AI's use of `spike_times_index` is just an implementation detail for the same source variable.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `units/spike_times` and restricts to `classification == good`, while also using `is_good_trials` and `obs_intervals` for validity."
+    "code_correctness_justification": "The code reads `units/spike_times`, `units/spike_times_index`, and `go_start_times`, then bins those spike times for the kept good units."
   },
   "2-b": {
     "question": "How is the `neural` data processed?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Binning spikes into firing rates over the instructed `[-2.5, 1.5] s` go-aligned window with 50 ms bins matches the task requirements and is a reasonable adaptation of the reference pipeline.",
+    "decision_correctness_justification": "Both the reference and the AI convert raw spike times into 50 ms go-aligned firing rates with no smoothing or baseline subtraction. Storing the final array as `float16` is an output-format optimization, not a different processing rule.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation converts counts to Hz with `counts / bin_width` on the required window and bin width."
+    "code_correctness_justification": "The code uses shared trial edges, `np.searchsorted`, `np.diff`, and division by bin width to produce Hz values."
   },
   "2-c": {
     "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using `classification == good`, excluding sessions with zero good units, and honoring trial-support validity fields is consistent with the QC intent of the reference materials as exposed in the NWB export.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those QC rules are implemented directly in `process_session()` and the neural-binning loop."
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The important match is that units are filtered by `classification == good`, which is consistent with the reference. The concerning part is the added per-unit trial masking and zero-filling logic, which is not how the reference handles neural QC and depends on a different interpretation of trial support.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The code's fallback observation-interval masking relies on the same incorrect ragged `obs_intervals` indexing as 1-e, so it does not faithfully implement the stated per-unit support rule."
   },
   "2-d": {
     "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Go-cue alignment is exactly what both the task instructions and the reference papers/code use.",
+    "decision_correctness_justification": "Both solutions align neural activity by centering the bin grid on each trial's go cue, using the shared NWB session clock directly.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Absolute bin edges are constructed as `go_times + relative_edges`, so neural activity is go-cue aligned."
+    "code_correctness_justification": "The code adds relative edges to each trial's `go_time` and bins spikes against those absolute edges."
   },
   "2-e": {
     "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The 50 ms non-overlapping binning is required by the task, even though it differs from some published analyses.",
+    "decision_correctness_justification": "The AI matches the reference solution's interpretation of the task instruction: 80 non-overlapping 50 ms bins spanning `[-2.5, 1.5]` s relative to go cue.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The constants and bin-edge construction implement 50 ms bins and nothing else."
+    "code_correctness_justification": "The bin constants and edge construction in the code produce exactly that 50 ms, 80-bin grid."
   },
   "3-a": {
     "question": "What variables in the raw data is `input` *Time from tone onset in seconds* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using `sample_start_times` as the proxy for tone onset is the most direct task-timing variable available in the NWB behavioral events.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference uses the last `sample_start_times` event before go cue, because early licks can replay the sample epoch. The AI instead uses the earliest sample event inside the trial window and adds a hardcoded fallback, which is a different event choice.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code slices `sample_start_times` within each trial and derives the input from that event stream."
+    "code_correctness_justification": "The code really does gather sample events per trial, take `events[0]`, and fall back to `go - 1.85 s` when none are present."
   },
   "3-b": {
     "question": "What processing is involved in computing `input` *Time from tone onset in seconds*?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Choosing the earliest sample-start event within each trial is plausible, especially for replayed early-lick trials, but the hard-coded fallback of `-1.85 s` introduces a hand-set assumption that should ideally be avoided or validated more explicitly.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The algebraic form is fine, but it is applied to the wrong tone event and supplemented with an invented default onset. That makes the overall processing rule inconsistent with the reference solution.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation matches that decision exactly, including the fallback constant."
+    "code_correctness_justification": "Given its chosen onset, the code correctly computes per-bin time-since-tone as `bin_center_rel_go - sample_onset_rel_go`."
   },
   "3-c": {
     "question": "How is the `input` *Time from tone onset in seconds* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Placing the time-from-tone value on the same go-aligned bin centers as the neural data is the expected alignment for the target format.",
+    "decision_correctness_justification": "Both solutions place this input on the same go-cue-centered time grid used for neural activity; the difference is only which tone onset is chosen.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The input vector is computed directly on `bin_centers_rel`, which are also the neural bin centers."
+    "code_correctness_justification": "The code constructs the time-from-tone vector from the same `bin_centers_rel` used to define the neural bin grid."
   },
   "4-a": {
     "question": "What variables in the raw data is `input` *Photostimulation* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Deriving photostimulation from the trial-table onset and duration fields is consistent with the NWB trial metadata and sufficient for the requested binary on/off input.",
+    "decision_correctness_justification": "Like the reference, the AI derives photostimulation from per-trial onset and duration fields in the trial table and re-expresses them relative to go cue.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `photostim_onset` and `photostim_duration` directly from the trial table."
+    "code_correctness_justification": "The code reads `photostim_onset`, `photostim_duration`, `trial_start`, and `go_times`, then computes a go-relative stimulation window."
   },
   "4-b": {
     "question": "What processing is involved in computing `input` *Photostimulation*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Converting onset and duration into a go-aligned binary time series matches the task instructions and the reference notion of stimulation timing relative to go cue.",
+    "decision_correctness_justification": "Both solutions build a binary time series that is on only when the bin center falls inside the stimulation interval.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation produces exactly that binary vector for each trial."
+    "code_correctness_justification": "The code compares every bin center against `stim_rel_on` and `stim_rel_off` and writes a `0/1` vector."
   },
   "4-c": {
     "question": "How is the `input` *Photostimulation* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "A shared go-aligned bin axis is the correct alignment strategy.",
+    "decision_correctness_justification": "Both solutions align photostimulation by converting its timing onto the same go-relative axis as the neural bins.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Photostim is computed over the same `bin_centers_rel` used by the neural data."
+    "code_correctness_justification": "The code subtracts `go_time` from the trial-relative onset and compares the resulting go-relative interval to the shared bin centers."
   },
   "5-a": {
     "question": "What variables in the raw data is `output` *Lick direction choice* derived from?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Using left/right lick event timestamps is a reasonable way to recover choice, but choice for ignore/no-lick trials is intrinsically ambiguous. Falling back to `trial_instruction` is a concerning imputation rather than a true observed choice.",
+    "decision_correctness_justification": "The reference derives choice from `trial_instruction` and `outcome`, with an explicit no-lick class for `ignore` trials. The AI instead re-infers choice from lick-event timing and imputes the instructed side on no-lick trials. The task's binary-choice wording makes this ambiguity real, but the AI's choice is still concerning because it fabricates labels for `ignore` trials and can disagree with the reference definition.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code uses lick events first and `trial_instruction` only as the final fallback, exactly as described."
+    "code_correctness_justification": "The code consistently implements the stated hierarchy: first post-go lick, else first lick anywhere in trial, else instruction fallback."
   },
   "5-b": {
     "question": "What processing is involved in computing `output` *Lick direction choice*?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The post-go lick rule is sensible, and the any-lick fallback is defensible, but the final instruction-based fallback means some `choice` labels are inferred rather than observed. That should be treated cautiously against a human reference solution.",
+    "decision_correctness_justification": "The reference repeats a 3-class trial-level choice code across bins, while the AI repeats a 2-class code and resolves no-lick trials by imputation. Because the user instruction said `left = 0, right = 1`, this is not wholly unjustified, but it is still a concerning mismatch from the reference and from the underlying behavior on ignore trials.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The helper `infer_choice_for_trial()` implements exactly that three-step hierarchy."
+    "code_correctness_justification": "The code writes only `0` and `1` choices into the output array and lists only `left` and `right` in `output_values`."
   },
   "6-a": {
     "question": "What variables in the raw data is `output` *Outcome* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the NWB trial `outcome` field is the direct and correct source.",
+    "decision_correctness_justification": "Both solutions take outcome directly from the trial-table `outcome` field.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads and subsets `trials[\"outcome\"]` directly."
+    "code_correctness_justification": "The code reads the column, lowercases it, and carries the selected trial values forward."
   },
   "6-b": {
     "question": "What processing is involved in computing `output` *Outcome*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The `ignore/miss/hit -> 0/1/2` mapping matches the decoder specification exactly.",
+    "decision_correctness_justification": "Both solutions map `ignore`, `miss`, and `hit` to `0`, `1`, and `2`, then repeat the per-trial code across bins.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The mapping dictionary and resulting `outcome_trials` implement this directly."
-  },
-  "6-c": {
-    "question": "How is `output` *Distance to reward zone* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The prompt's wording appears to be a stale template mismatch. For the actually implemented `outcome` output, repeating a per-trial label across the shared neural time bins is a valid alignment choice for this target format.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code broadcasts the per-trial outcome category across all bins in each trial."
+    "code_correctness_justification": "The code applies the expected dictionary mapping and writes the result into the output tensor."
   },
   "7-a": {
     "question": "What variables in the raw data is `output` *Early lick* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The NWB `early_lick` trial label is the direct raw source for this decoder output.",
+    "decision_correctness_justification": "Both solutions use the trial-table `early_lick` label directly.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `trials[\"early_lick\"]` directly."
+    "code_correctness_justification": "The code reads `early_lick`, lowercases it, and slices it by the selected trial indices."
   },
   "7-b": {
     "question": "What processing is involved in computing `output` *Early lick*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Mapping `no early` and `early` to binary categories is exactly what the task requires.",
+    "decision_correctness_justification": "Both solutions map `no early` and `early` to `0` and `1` and repeat the per-trial code across time bins.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The binary map is implemented directly and then broadcast per trial."
+    "code_correctness_justification": "The code applies the expected dictionary and writes the code into output row 2 for every bin."
   },
   "8-a": {
     "question": "What variables in the raw data is `output` *Tongue y-position* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using side-camera tongue-tracking `y` coordinates and their timestamps matches the available raw marker stream and the reference marker-analysis path.",
+    "decision_correctness_justification": "The AI uses the same raw source stream as the reference: `Camera0_side_TongueTracking` y-values with timestamps. It also reads likelihood, although it does not use it the same way.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code extracts column 1 of `Camera0_side_TongueTracking/data` and its timestamps."
+    "code_correctness_justification": "The code reads `data[:, 1]` as `tongue_y`, `data[:, 2]` as `tongue_likelihood`, and the corresponding `timestamps`."
   },
   "8-b": {
     "question": "What processing is involved in computing `output` *Tongue y-position*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Aligning by go cue and taking the last frame in each bin is consistent with the reference marker-alignment convention.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference drops low-likelihood frames, averages surviving values within 50 ms bins, computes the session thresholds from session-wide bin means, and uses a hidden/not-visible class. The AI instead takes the last frame in each bin, ignores likelihood in the discretization, and thresholds pooled finite aligned values directly. That is a substantial mismatch.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The `bin_tongue_y()` helper uses the last sample before the bin edge exactly as described."
+    "code_correctness_justification": "The code faithfully implements that last-frame, no-likelihood-filter, pooled-percentile rule."
   },
   "8-c": {
     "question": "How is `output` *Tongue y-position* thresholded into categories?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Per-session 40th/60th percentile thresholding is exactly what the decoder task specified.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference has four categories: below 40th, middle, above 60th, and not visible. The AI produces only three explicit categories and silently lets empty or NaN bins fall into class `0`, which changes the semantics of the lowest class.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code computes session percentiles and assigns `0/1/2` accordingly."
+    "code_correctness_justification": "The code initializes all bins to `0`, sets `1` for the middle band and `2` for values above `p60`, so missing values do indeed remain `0`."
   },
   "8-d": {
     "question": "How is `output` *Tongue y-position* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Putting tongue position on the same go-aligned 50 ms bins as neural activity is the correct shared alignment strategy.",
+    "decision_correctness_justification": "Despite the different within-bin summary rule, both solutions align tongue data to the same go-cue-relative 50 ms grid used for neural activity.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Tongue binning is driven by the same `go_times` and `bin_edges_rel` used for neural activity."
+    "code_correctness_justification": "The code computes absolute bin edges from `go_times` and uses `searchsorted` on camera timestamps to assign tongue samples to those bins."
   },
   "9": {
     "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Some edge-case handling is sensible, such as skipping empty sessions and falling back on missing sample starts. The concerning part is that missing tongue bins are silently converted into the lowest tongue category because `NaN` values survive alignment but are later encoded as zeros by default.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference handles missing or unsupported data conservatively: drop unsupported trials or sessions, and represent missing tongue visibility explicitly. The AI instead fabricates missing tone onsets with a hardcoded `-1.85 s`, zero-fills invalid unit-trials, and collapses missing tongue bins into the lowest tongue class. Those are materially different choices.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code behaves exactly this way: explicit fallbacks and skips are implemented, and `tongue_discrete` initializes missing values to zero."
+    "code_correctness_justification": "The code does exactly those things: skip some bad sessions, insert a fixed tone-onset fallback, set invalid firing rates to zero, drop all-zero neural trials, and leave missing tongue bins at class `0`."
   },
   "10-a": {
     "question": "What are the most time-consuming steps of the code?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The dominant runtime cost is clearly the neural spike binning over many units and trials, which is also what the agent optimized most heavily.",
+    "decision_correctness_justification": "The AI's performance diagnosis is consistent with the reference: loading large NWB/HDF5 arrays and running the per-unit spike-binning loop are the dominant costs.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The conversion log and code structure support that interpretation, especially the large per-unit `searchsorted` loop."
+    "code_correctness_justification": "The code structure supports that description: it bulk-loads `spike_times` and tongue arrays and then iterates over good units to run `searchsorted` and `np.diff`."
   },
   "10-b": {
     "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The remaining per-trial Python loops for sample onset, inputs, choices, and outputs are genuine vectorization opportunities.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Compared with the reference, the AI leaves more vectorizable Python loops in place: sample-onset extraction, input construction, choice inference, and output assembly all remain trial-by-trial. The reference only leaves the more structural loops that are hard to remove.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those loops are present in the script exactly as identified."
+    "code_correctness_justification": "Those loops are plainly present in the final code and could be targeted for further vectorization."
   },
   "10-c": {
     "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The script does repeatedly perform per-trial event slicing, lick searching, masking, and label broadcasting beyond the main spike-binning path.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference solution is effectively single-pass and does not recompute derived quantities. The AI code repeats some calculations, especially photostimulation timing for plotting and the build-then-filter pattern after detecting all-zero trials.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "These repeated operations are visible directly in the implementation."
+    "code_correctness_justification": "The repeated photostim computation and the later re-slicing of many arrays and lists are visible in the code."
   },
   "10-d": {
     "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The converter does compute some plot- and diagnostic-oriented quantities even when they are not required for the final pickle, and it materializes time-varying copies of per-trial categorical labels.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference solution computes only what goes into the final dataset. The AI additionally computes and carries diagnostic stats, plotting-only event slices, tongue likelihood windows, and optional plot payloads that are not required for downstream decoder use.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code loads `tongue_likelihood`, computes delay slices, and constructs repeated categorical output matrices despite those values not being intrinsically necessary for a minimal saved dataset."
+    "code_correctness_justification": "The code reads and stores those diagnostics and plotting intermediates even though they are not part of the final saved dataset."
   }
 }

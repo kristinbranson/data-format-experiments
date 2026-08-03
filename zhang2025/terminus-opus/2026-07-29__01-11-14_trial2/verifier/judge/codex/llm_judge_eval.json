@@ -1,226 +1,226 @@
 {
   "1-a": {
     "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The agent loads the released session/probe index from `bwm_release.csv`, groups probe insertions by `eid`, and then reads the underlying ONE-cache trial, spike, wheel, and motion-energy files directly from disk. That is consistent with the reference dataset organization and preserves the same raw sources even though it bypasses `ONE`/`SessionLoader`/`SpikeSortingLoader`.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The agent loaded data by parsing `bwm_release.csv` and opening cache files directly instead of using the ONE API and its session/probe loaders. This can reach similar underlying files, but it is a notable deviation from the reference loading path and created extra assumptions such as hard-coded session-number search and manual revision handling.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly that: it reads `bwm_release.csv`, groups rows by `eid`, finds cache directories with `find_session_path`, and loads parquet/NumPy files directly."
+    "code_correctness_justification": "The code consistently implements direct filesystem loading from `data/one_cache` plus `bwm_release.csv`."
   },
   "1-b": {
     "question": "How are the data split into subjects (mice)?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the release table's `subject` field to define mice is consistent with the reference dataset metadata. Building the subject list from successfully converted sessions is also appropriate for the final packaged dataset.",
+    "decision_correctness_justification": "Using the release metadata's `subject` field and then creating a sorted unique subject list with per-session indices matches the reference behavior in substance.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code stores `subject` per session, then builds `subjects` as the sorted unique surviving subject IDs and records a `subject_idx` entry for each session."
+    "code_correctness_justification": "The code groups per-session metadata by subject and constructs `subjects` and `subject_idx` accordingly."
   },
   "1-c": {
     "question": "How are the data split into sessions?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The reference release is session-indexed by `eid`, with multiple probes per session. Grouping all rows with the same `eid` into one session and then merging those probes is the correct session split.",
+    "decision_correctness_justification": "Grouping rows by `eid` is equivalent to treating each session identifier as one session, which is what the reference solution does after ONE search.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code groups `bwm_release.csv` rows by `eid`, collects all probes for that `eid`, and keeps one converted session result per grouped entry."
+    "code_correctness_justification": "The script groups probe rows by `eid` and produces one output session per grouped entry."
   },
   "1-d": {
     "question": "How are the data split into trials?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using rows of `_ibl_trials.table.pqt` as trials, then keeping only masked and behavior-valid rows, is consistent with the trial structure used by the reference pipeline.",
+    "decision_correctness_justification": "The agent uses one row per trial from the trials table, which matches the reference solution.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads the trials parquet, applies `trials_mask`, builds one stimulus-aligned interval per retained row, and removes rows failing wheel/whisker validity before packaging them as final trials."
+    "code_correctness_justification": "The code loads the parquet trials table and treats masked rows as individual trials."
   },
   "1-e": {
     "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The first-stage mask matches the reference `load_trials_and_mask` logic: RT bounds, max trial length, NaN exclusion for required fields, and no-choice exclusion. The additional requirement that wheel and whisker data cover the aligned interval is also consistent with the need to align neural and behavioral outputs trial-by-trial.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference keeps trials using reaction-time bounds, valid choice/prior values, and wheel/camera coverage. The agent added an extra `max_trial_len` filter, extra NaN exclusions, and performs trial-number computation after filtering, so its trial set is stricter and not the same as the reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code implements the RT, length, NaN, and no-choice filters in `load_trials_and_mask`, then removes trials whose wheel or whisker traces fail the interpolation coverage checks."
+    "code_correctness_justification": "The implemented mask and subsequent wheel/ME validity filtering match the agent's stated filtering rule."
   },
   "2-a": {
     "question": "What variables in the raw data is the `neural` data derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The reference neural representation is derived from spike times and cluster IDs, with channel/cluster metadata used for region labels. The agent uses the correct raw sources for those pieces.",
+    "decision_correctness_justification": "The neural arrays are still ultimately derived from spike times and cluster assignments, as in the reference. The extra channel/brain-location arrays are used for metadata rather than the neural signal itself.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "It reads `spikes.times.npy`, `spikes.clusters.npy`, `clusters.channels.npy`, and `channels.brainLocationIds_ccf_2017.npy` and derives per-cluster region IDs from them."
+    "code_correctness_justification": "The code loads `spikes.times.npy` and `spikes.clusters.npy` and uses them to build the neural tensor."
   },
   "2-b": {
     "question": "How is the `neural` data processed?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Merging probes within a session, sorting spikes by time, and binning counts into fixed time bins is the intended reference processing. Mapping regions to Beryl acronyms is also consistent with the reference utilities.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference bins spikes and divides by bin width to produce firing rates in Hz. The agent bins spikes into counts but never divides by `BINSIZE`, so the stored neural values are counts rather than rates.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation offsets cluster IDs across probes, concatenates and time-sorts spikes, bins counts into 20 ms bins per trial, and maps cluster locations through `BrainRegions(..., mapping='Beryl')`."
+    "code_correctness_justification": "The code does exactly what the agent chose: merge probes, sort by time, and store binned spike counts as float32 without rate conversion."
   },
   "2-c": {
     "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The choice to apply no neuron/unit QC matches the reference code path (`qc=None`), but it conflicts with the data paper's description of using only well-isolated neurons for the published analyses. Because the paper and code disagree here, the agent's decision should be checked by a human.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The human reference keeps only clusters with `label >= 1.0`. The agent explicitly chose not to apply QC filtering, which materially changes the neural population.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code indeed keeps all clusters present in the probe outputs and does not read or apply any QC labels or thresholds."
+    "code_correctness_justification": "The script never loads or applies cluster QC labels, so it faithfully implements the no-QC decision."
   },
   "2-d": {
     "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The task instructions explicitly say to align based on stimulus onset, and the reference `0_data_caching.py` parameter block also uses `stimOn_times` with a `(-0.5, 1.5)` window. The agent follows that choice.",
+    "decision_correctness_justification": "Using `stimOn_times` with a `(-0.5, 1.5)` second window matches the reference alignment event and window.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code sets `ALIGN_TIME = 'stimOn_times'`, `TIME_WINDOW = (-0.5, 1.5)`, and constructs trial intervals directly from those settings."
+    "code_correctness_justification": "The code computes per-trial intervals from `stimOn_times` and bins spikes inside those intervals."
   },
   "2-e": {
     "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using 20 ms bins is consistent with the reference code and the decoder task. No additional rebinning step is required once the spike counts are accumulated into those bins.",
+    "decision_correctness_justification": "The agent uses 20 ms bins and 100 bins per trial with no extra resampling of the neural data, which matches the reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code fixes `BINSIZE = 0.02`, computes `N_BINS = 100`, and bins spikes directly into those bins without a later resampling stage."
+    "code_correctness_justification": "The constants and binning logic implement a 20 ms grid over the 2 s trial window."
   },
   "3-a": {
     "question": "What variables in the raw data is `input` *Time since stimulus onset* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "This input is appropriately derived from the chosen alignment event (`stimOn_times`) together with the fixed binning/window definition rather than from a separate raw signal. That is a reasonable representation of time relative to stimulus onset.",
+    "decision_correctness_justification": "Like the reference, this input is constructed from the stimulus-aligned trial grid rather than from a separate raw array.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code uses the stimulus-onset alignment constants to synthesize one shared time vector for the trial bins."
+    "code_correctness_justification": "The code builds the time vector from the alignment constants used for the trials."
   },
   "3-b": {
     "question": "What processing is involved in computing `input` *Time since stimulus onset*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the bin centers of the aligned neural window as the time-since-stimulus input is consistent with the intended decoder representation.",
+    "decision_correctness_justification": "Constructing the 100-bin stimulus-aligned time vector is consistent with the reference intent.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation computes `np.linspace(TIME_WINDOW[0] + BINSIZE, TIME_WINDOW[1], N_BINS)` and reuses it for each trial."
+    "code_correctness_justification": "The code creates the vector directly with `np.linspace`."
   },
   "3-c": {
-    "question": "How is the `input` *Time since stimulus onset* aligned with the neural data?",
+    "question": "How is `input` *Time since stimulus onset* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The input should share the same temporal bins as the neural counts, and the agent's construction does that exactly.",
+    "decision_correctness_justification": "The agent uses the same trial grid for the time input and the binned neural/behavioral data, which is the intended alignment.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same 100-bin vector used to describe the stimulus-aligned window is paired with each `(n_neurons, 100)` neural trial."
+    "code_correctness_justification": "The time vector is inserted alongside neural-aligned trial data and uses the same `N_BINS`."
   },
   "4-a": {
     "question": "What variables in the raw data is `input` *Trial number in block* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Deriving block identity from `probabilityLeft` is the natural and dataset-consistent way to identify the biased/unbiased blocks.",
+    "decision_correctness_justification": "Deriving block position from changes in `probabilityLeft` matches the reference solution.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code calls `compute_trial_number_in_block` on the `probabilityLeft` series from the filtered trial table."
+    "code_correctness_justification": "The code computes block positions solely from `probabilityLeft`."
   },
   "4-b": {
     "question": "What processing is involved in computing `input` *Trial number in block*?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The agent counts trials within blocks only after dropping invalid trials. That changes the numbering whenever excluded trials occur inside a block, so the result is not the true trial number in the original behavioral block. This is a semantic error in the derived input.",
+    "decision_correctness_justification": "The reference computes within-block count on the full trial table before filtering and uses zero-based counts. The agent computes on already filtered trials and uses one-based counts, so dropped trials no longer advance the counter and all values shift by one.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code faithfully implements that post-filtering procedure: it scans the filtered `probabilityLeft` series, resets the count when the value changes, and broadcasts the resulting count per trial."
+    "code_correctness_justification": "The code implements exactly that filtered, one-based counting rule."
   },
   "5-a": {
     "question": "What variables in the raw data is `output` *Choice* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the trial-table `choice` column is exactly how choice is represented in the raw task data.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Although the source variable is correctly `choice`, the agent's concrete mapping is reversed relative to the reference and the task specification. In IBL, `+1` is left and `-1` is right; the agent instead uses `-1 -> 0` and `+1 -> 1` while labeling 0 as left and 1 as right.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation reads `valid_trials_final['choice']` directly."
+    "code_correctness_justification": "The code consistently applies the agent's reversed mapping."
   },
   "5-b": {
     "question": "What processing is involved in computing `output` *Choice*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Excluding no-choice trials and remapping left/right to a binary `0/1` coding is consistent with the task specification.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The only processing is recoding, but the recoding itself is wrong relative to the reference convention and requested output labels.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code filters `choice == 0` earlier, maps `-1 -> 0` and `1 -> 1`, and emits the class label across each trial's output bins."
+    "code_correctness_justification": "The implementation matches the agent's chosen recoding and broadcast."
   },
   "6-a": {
     "question": "What variables in the raw data is `output` *Prior probability of left* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The raw task variable that encodes prior block probability is `probabilityLeft`, so this source choice is correct.",
+    "decision_correctness_justification": "Using `probabilityLeft` as the source variable matches the reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation uses `valid_trials_final['probabilityLeft']` as the sole source for this output."
+    "code_correctness_justification": "The code derives prior categories directly from `probabilityLeft`."
   },
   "6-b": {
     "question": "What processing is involved in computing `output` *Prior probability of left*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Mapping the three possible block priors `0.2`, `0.5`, and `0.8` to categorical values `0`, `1`, and `2` matches the decoder task specification.",
+    "decision_correctness_justification": "The categorical mapping `0.2 -> 0`, `0.5 -> 1`, `0.8 -> 2` matches the reference solution and task instructions.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code explicitly applies those three assignments and repeats the resulting category across the trial bins."
+    "code_correctness_justification": "The mapping is implemented directly and then broadcast per time bin."
   },
-  "9-a": {
+  "7-a": {
     "question": "What variables in the raw data is `output` *Wheel speed* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Wheel speed should come from raw wheel position and timestamp streams, and the agent uses those exact files.",
+    "decision_correctness_justification": "The wheel signal is correctly derived from wheel position and timestamps, as in the reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `_ibl_wheel.position.npy` and `_ibl_wheel.timestamps.npy` and derives the output from them."
+    "code_correctness_justification": "The code loads those exact raw wheel arrays."
   },
-  "9-b": {
+  "7-b": {
     "question": "What processing is involved in computing `output` *Wheel speed*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Interpolating wheel position to 1000 Hz, filtering, differentiating, and taking absolute velocity matches the reference wheel-processing path used by `SessionLoader.load_wheel()` and `velocity_filtered`.",
+    "decision_correctness_justification": "After debugging, the agent matched the reference-style wheel processing: interpolate to uniform sampling, low-pass filter, differentiate, take absolute value, then interpolate to trial bins.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation performs uniform interpolation, Butterworth low-pass filtering, differentiation, absolute-value conversion, and then trial-wise interpolation onto the neural bins."
+    "code_correctness_justification": "The code now implements that sequence."
   },
-  "9-c": {
+  "7-c": {
     "question": "How is `output` *Wheel speed* thresholded into categories?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The task requires a 3-bin categorical output, but the reference paper/code do not specify global quantile thresholds for this reformatted dataset. Choosing pooled global tertiles is a plausible convention, but it is an agent-invented discretization rule that should be human-checked.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference discretizes each session using that session's own 33rd and 67th percentiles. The agent instead computes one global threshold over all sessions and applies it everywhere.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code computes 1/3 and 2/3 quantiles over all retained wheel-speed values and digitizes each session's binned wheel traces with those thresholds."
+    "code_correctness_justification": "The code performs a dataset-wide quantile pass and then uses those boundaries for every session."
   },
-  "9-d": {
+  "7-d": {
     "question": "How is `output` *Wheel speed* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "For this task, the decoder dataset is explicitly stimulus-onset aligned, so aligning wheel speed to the same `stimOn_times` windows and bin centers as the neural data is consistent with the instructions and the reference `0_data_caching.py` configuration, even though the methods paper describes a different alignment for some dynamic-behavior analyses.",
+    "decision_correctness_justification": "Interpolating wheel speed onto the same 100-bin stimulus-aligned grid is consistent with the reference alignment.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The wheel trace is segmented over the same `interval_starts`/`interval_ends` used for spikes and interpolated to the same 100 bin centers."
+    "code_correctness_justification": "The interpolation routine uses the same trial windows and number of bins as the neural data."
   },
-  "10-a": {
+  "8-a": {
     "question": "What variables in the raw data is `output` *Whisker motion energy* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Using the precomputed whisker motion-energy traces and their camera timestamps, with left-camera preference and right-camera fallback, matches the reference behavior-loading logic.",
+    "decision_correctness_justification": "Using left camera when available and otherwise right camera matches the reference loading logic.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code loads `leftCamera.ROIMotionEnergy.npy` with left-camera times when available and otherwise falls back to the corresponding right-camera files."
+    "code_correctness_justification": "The code attempts left-camera files first and falls back to right-camera files."
   },
-  "10-b": {
+  "8-b": {
     "question": "What processing is involved in computing `output` *Whisker motion energy*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The agent correctly treats whisker motion energy as a precomputed continuous trace, cleans minor file inconsistencies, and interpolates it to the trial bins rather than recomputing motion energy from raw video.",
+    "decision_correctness_justification": "The essential behavior matches the reference: use the released motion-energy trace and interpolate it onto the trial grid. The extra equal-length trimming and NaN removal are mild implementation details rather than a conceptual change.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation trims motion-energy and timestamp arrays to a common length, drops NaNs, and interpolates the trace within each retained trial window."
+    "code_correctness_justification": "The code loads the trace, cleans basic shape/NaN issues, and interpolates it per trial."
   },
-  "10-c": {
+  "8-c": {
     "question": "How is `output` *Whisker motion energy* thresholded into categories?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "As with wheel speed, global quantile binning is a plausible way to satisfy the task's requirement for 3 categories, but it is not specified by the reference paper/code and therefore remains an agent-added convention.",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "As with wheel speed, the reference uses per-session percentile thresholds, while the agent uses global thresholds across the full converted dataset.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code pools all retained whisker motion-energy values, computes global tertile boundaries, and digitizes each session's whisker trace with those boundaries."
+    "code_correctness_justification": "The code computes global whisker-motion quantiles and applies them session-wide."
   },
-  "10-d": {
+  "8-d": {
     "question": "How is `output` *Whisker motion energy* aligned with the neural data?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "For the requested stimulus-onset-aligned decoder dataset, aligning whisker motion energy to the same stimulus-centered bins as the neural data is consistent with the instructions and the reference code's trial-aligned configuration, despite the methods paper's separate movement-aligned analysis description.",
+    "decision_correctness_justification": "Interpolating onto the shared trial grid matches the intended alignment with the neural data.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code uses the same `interval_starts`/`interval_ends` and interpolation procedure for whisker motion energy that it uses for wheel speed, and those intervals are shared with the spike binning."
+    "code_correctness_justification": "The same interpolation logic and trial intervals are used for the whisker trace."
   },
-  "11": {
+  "9": {
     "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Version-aware file lookup, fallback camera choice, NaN trimming, and trial/session skipping for missing required modalities are pragmatic and consistent with building a decoder-ready dataset that requires all specified outputs.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The agent mostly handles missing or malformed data by dropping unusable probes, trials, and sessions, which is broadly consistent with the reference. Its exact handling differs because it performs manual file checks and extra NaN trimming, but the overall policy is reasonable.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code implements versioned-file search, optional auxiliary timing loads, right-camera fallback, length trimming and NaN filtering for whisker traces, and explicit early returns for missing trials/spikes/wheel/whisker or too-few-valid-trial sessions."
+    "code_correctness_justification": "The code consistently skips missing files/sessions and filters out invalid behavioral windows."
   },
-  "12-a": {
+  "10-a": {
     "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The agent chose a straightforward but relatively expensive implementation: per-trial spike binning, 1000 Hz wheel interpolation/filtering, and per-trial behavior interpolation dominate runtime. Those choices are not functionally wrong, but they are notably less efficient than the available reference utilities and more vectorized alternatives.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference emphasizes spike-loading I/O, while this implementation also spends substantial time in explicit per-trial spike binning and wheel interpolation. Given the agent's different code path, that characterization is reasonable even though it no longer matches the reference implementation's profile exactly.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code structure makes those hotspots real: the main work is in `bin_spikes_fast`, `compute_wheel_speed`, and repeated `interpolate_behavior` calls."
+    "code_correctness_justification": "The structure of the code supports that assessment: large spike arrays are loaded and then processed inside per-trial loops."
   },
-  "12-b": {
+  "10-b": {
     "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Several core loops are obvious vectorization candidates, especially the trial loops in spike binning, behavior interpolation, and final dataset assembly. Leaving them scalar is a questionable efficiency choice, even though it does not change semantics.",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The same broad answer as the reference applies: the per-trial spike and behavior loops are the main vectorization opportunities. The agent code also adds a few more obvious Python loops, but the core point matches.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The implementation really does iterate trial-by-trial in those locations rather than using vectorized or parallelized operations."
+    "code_correctness_justification": "Those loops are present exactly as described."
   },
-  "12-c": {
+  "10-c": {
     "question": "What processing does the code repeat multiple times?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The code repeats interval searches, repeated constant-vector expansion for static labels, and two-pass behavior discretization. These repetitions are not semantically incorrect but indicate avoidable overhead.",
+    "decision_correctness_justification": "The human reference does not need repeated extra passes here, but the agent code does repeat work such as directory scanning and an extra global quantile pass. These are not functional errors, but they are avoidable inefficiencies introduced by the agent's design.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those repeated operations are directly visible in the implementation: repeated `searchsorted`, repeated `np.full` per trial, and one pass to pool values plus another to digitize them."
+    "code_correctness_justification": "The code does perform the repeated scans and separate discretization prepass."
   },
-  "12-d": {
+  "10-d": {
     "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Optional plotting, temporary `show_processing` fields, and continuous wheel/whisker arrays that are later collapsed to categories all add work that the final decoder dataset does not need. This is not wrong, but it is extra processing beyond the final artifact.",
+    "decision_correctness_justification": "The reference solution has no comparable extra downstream-discarded work. The agent added optional plotting and other ancillary work that is not needed for the final decoder dataset, which is a mild but real inefficiency.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code really does build optional plotting products, attach extra fields when `show_processing` is enabled, and compute continuous behavior arrays before discarding them after digitization."
+    "code_correctness_justification": "The plotting and extra metadata/utility paths exist and are separate from the core saved dataset."
   }
 }

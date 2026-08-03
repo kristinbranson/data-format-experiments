@@ -2,55 +2,45 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads data from three directories: `data/spk/` (neural spike data as `*_neural_data.npy`), `data/beh/` (behavior data as `Beh_*.npy`), and `data/retinotopy/` (area labels as `*_trans.npz`). It enumerates all 89 spike files to define sessions, then loads all behavior files and merges behavior views that correspond to the same physical session (stripping `_swap1`/`_swap2` suffixes). Each session is processed sequentially, loading its spike, behavior, and retinotopy data on demand.
+i. The AI discovers sessions by scanning the `spk/` directory for `*_neural_data.npy` files, rather than reading the master index `Imaging_Exp_info.npy`. It loads all `Beh_*.npy` files from `beh/`, merges behavior views for each session (handling swap suffixes), and loads retinotopy files from `retinotopy/`. Spike files and retinotopy are loaded per session.
 
 ii.
 ```python
-def convert_dataset(max_neurons_per_session):
-    spk_session_keys = sorted(
-        [path.name.replace("_neural_data.npy", "") for path in SPK_ROOT.glob("*_neural_data.npy")],
-        key=natural_key,
-    )
-    behavior_views = load_behavior_views()
-    ...
-    behavior_by_session = {
-        key: merge_behavior_views(key, behavior_views[key]) for key in spk_session_keys
-    }
+spk_session_keys = sorted(
+    [path.name.replace("_neural_data.npy", "") for path in SPK_ROOT.glob("*_neural_data.npy")],
+    key=natural_key,
+)
+behavior_views = load_behavior_views()
+# In load_behavior_views:
+for beh_path in sorted(BEH_ROOT.glob("Beh_*.npy")):
+    beh_dict = np.load(beh_path, allow_pickle=True).item()
+# Per session:
+spk_planes = np.load(spk_path, allow_pickle=True).item()["spks"]
+ret = np.load(ret_path, allow_pickle=True)
+area_codes = ret["iarea"]
 ```
 
-```python
-def load_behavior_views():
-    views = defaultdict(list)
-    for beh_path in sorted(BEH_ROOT.glob("Beh_*.npy")):
-        beh_dict = np.load(beh_path, allow_pickle=True).item()
-        for view_key, view in beh_dict.items():
-            base_key = strip_swap_suffix(view_key)
-            views[base_key].append(...)
-    return views
-```
+iii. The AI chose to discover sessions from spike file names rather than the index file. It also implemented an elaborate behavior view merging system to handle sessions that appear in multiple behavior files, including swap sessions. The CONVERSION_NOTES.md states: "The converter rebuilds sessions at the 89-recording level by stripping `_swap1` and `_swap2` suffixes, merging all behavior views that point to the same physical recording."
 
-iii. The AI documented in CONVERSION_NOTES.md that the 99 behavior keys map to 89 physical recordings due to swap1/swap2 views and repeated entries across analysis files. The merge step verifies consistency of timing and trial annotations across views. This approach is consistent with how the reference code accesses data through `exp_info` and `Beh` dictionaries keyed by session identifiers.
+## 1-b. How are the data split into subjects?
 
-## 1-b. How are the data split into subjects (mice)?
-
-i. Subjects are extracted from session keys by parsing the first component (e.g., `DR10` from `DR10_2022_07_12_1`). All unique subjects are sorted alphabetically and assigned integer indices.
+i. The subject is extracted from the session key by splitting on underscores. Subjects are the sorted unique subject names across all sessions.
 
 ii.
 ```python
 def parse_session_key(session_key: str):
     subject, year, month, day, block = session_key.split("_")
-    ...
     return {"subject": subject, ...}
 
 subjects = sorted({info["subject"] for info in parsed.values()})
 subject_to_id = {subject: idx for idx, subject in enumerate(subjects)}
 ```
 
-iii. The AI's CONVERSION_NOTES.md states 19 subjects were found, matching the paper's Methods ("89 recordings in 19 mice"). The subject splitting is derived from the session key naming convention which encodes mouse name, date, and block.
+iii. The session key encodes the mouse name as the first field, so parsing it gives the subject directly.
 
 ## 1-c. How are the data split into sessions?
 
-i. Sessions correspond 1:1 with spike data files in `data/spk/`. Each `*_neural_data.npy` file defines one session. The AI found 89 sessions total.
+i. A session is identified by the spike file name, which encodes mouse, date, and block. The AI discovers all 89 sessions from the `spk/` directory. Behavior is merged from multiple `Beh_*.npy` files per session.
 
 ii.
 ```python
@@ -60,66 +50,71 @@ spk_session_keys = sorted(
 )
 ```
 
-iii. The CONVERSION_NOTES.md confirms 89 sessions matching the paper's 89 recordings. The session definition is straightforward: one neural data file = one session.
+iii. Using spike file names guarantees one entry per physical recording. The behavior merging handles duplicate appearances across experiment types.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are defined by the behavior data field `ntrials`. For each session, the code iterates over trial indices from 0 to `ntrials-1`. For each trial, it finds frames belonging to that trial using `ft_trInd`, filtered by running (`ft_move > 0`) and corridor (`ft_CorrSpc`) masks.
+i. Trials are iterated from 0 to `ntrials`. For each trial, frames are selected where `ft_trInd == trial_idx` AND `ft_move > 0` AND `ft_CorrSpc == True`. Trials with no qualifying frames or whose maximum position does not reach 35 dm are dropped. The remaining frames are then interpolated onto 4 spatial position bins (at 5, 15, 25, 35 dm).
 
 ii.
 ```python
-for trial_idx in range(int(beh["ntrials"])):
-    frame_idx = trial_frame_indices(beh, n_frames, trial_idx)
-    ...
-
 def trial_frame_indices(beh, n_frames, trial_idx):
-    ft_trial_idx_raw = np.asarray(beh["ft_trInd"][:n_frames], dtype=np.float64)
-    ...
-    ft_trial_idx = np.full(n_frames, -1, dtype=np.int64)
-    ft_trial_idx[valid] = np.rint(ft_trial_idx_raw[valid]).astype(np.int64)
+    ft_trial_idx = ...
     move = np.asarray(beh["ft_move"][:n_frames]) > 0
     in_corridor = np.asarray(beh["ft_CorrSpc"][:n_frames]).astype(bool)
     return np.where((ft_trial_idx == trial_idx) & move & in_corridor)[0]
+
+# Additional filtering:
+if np.nanmax(trial_positions) < POSITION_BIN_CENTERS[-1]:
+    continue
 ```
 
-iii. This is consistent with the reference code's trial indexing via `ft_trInd` and the paper's statement that "We only considered timepoints during running for analysis."
+iii. The CONVERSION_NOTES.md states: "Only frames satisfying `ft_move > 0` and `ft_CorrSpc == True` are used. This follows the paper's statement that analyses only considered timepoints during running."
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are dropped if (a) no running-in-corridor frames exist for that trial, or (b) the maximum position reached in the trial is less than the last bin center (35 decimeters = 3.5 m). Sessions with fewer than 2 usable trials raise an error.
+i. Trials are dropped if (1) they have no frames after the movement and corridor-space filter, or (2) the maximum position of qualifying frames does not reach 35 dm (the center of the last spatial bin). Sessions with fewer than 2 usable trials raise an error.
 
 ii.
 ```python
 if len(frame_idx) == 0:
     trial_stats["empty_running_trials"] += 1
     continue
-
-trial_positions = ft_pos[frame_idx]
 if np.nanmax(trial_positions) < POSITION_BIN_CENTERS[-1]:
     trial_stats["empty_running_trials"] += 1
     continue
+if len(session_neural) < 2:
+    raise ValueError(...)
 ```
 
-iii. The CONVERSION_NOTES.md reports 0 empty running trials were dropped across all sessions. The filtering ensures interpolation to the 4 spatial bin centers is valid (needs data up to at least 35 dm). There is no explicit trial count filtering from the reference code applied (e.g., the reference `lick_response` function's 200-trial cap is not applied here, which is appropriate since that was for behavioral analysis figures, not for the neural decoder).
+iii. The AI's CONVERSION_NOTES.md states: "Trials without usable running corridor frames are dropped."
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data comes from deconvolved spike traces stored in `*_neural_data.npy` files under the `spks` key, which contains per-plane arrays that are concatenated across imaging planes.
+i. From `spks` in `spk/<session_key>_neural_data.npy` (deconvolved calcium traces, one array per imaging plane) and `iarea` in `retinotopy/<mouse>_<date>_trans.npz` for brain region assignment.
 
 ii.
 ```python
 spk_planes = np.load(spk_path, allow_pickle=True).item()["spks"]
 spk = np.concatenate([plane.astype(np.float32, copy=False) for plane in spk_planes], axis=0)
+area_codes = ret["iarea"]
 ```
 
-iii. This matches the reference code's `load_spk` function: `spk = np.concatenate([nspk for nspk in np.load(spk_path, allow_pickle=True).item()['spks']], 0)` and the paper's statement that "All our analyses were based on deconvolved fluorescence traces."
+iii. Same source variables as the reference.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI spatially interpolates neural activity. For each trial, it takes only running-in-corridor frames, gets their positions (`ft_Pos`), and interpolates the spike data onto 4 spatial bin centers at positions [5, 15, 25, 35] decimeters. It uses a custom `interpolate_features` function that averages duplicate positions, then uses `np.interp` for linear interpolation. The result is stored as float16.
+i. The AI applies two major processing steps not in the reference: (1) Neurons are capped at 512 per session using variance-based ranking with per-region balancing. (2) Neural activity is spatially interpolated onto 4 position bin centers (5, 15, 25, 35 dm) rather than kept at the native temporal resolution. The result is stored as float16.
 
 ii.
 ```python
+# Neuron capping:
+selected_neurons, region_idx = pick_neurons_by_variance(
+    spk=spk, area_codes=area_codes,
+    running_corridor_mask=running_corridor_mask,
+    max_neurons=max_neurons,
+)
+# Spatial interpolation:
 neural_interp = interpolate_features(
     positions=trial_positions,
     values=spk_selected[:, frame_idx],
@@ -127,80 +122,61 @@ neural_interp = interpolate_features(
 ).astype(np.float16)
 ```
 
-```python
-POSITION_BIN_CENTERS = np.array([5.0, 15.0, 25.0, 35.0], dtype=np.float32)
-
-def interpolate_features(positions, values, target_positions):
-    ...
-    interp[row] = np.interp(target_positions, unique_pos, collapsed[row])
-    return interp
-```
-
-iii. The reference code uses `spk_pos_interp` which interpolates using `scipy.interpolate.interp1d` with `fill_value='extrapolate'` onto cumulative position (60 bins per corridor including grey space). The AI's approach differs in: (1) using `np.interp` instead of `scipy.interpolate.interp1d`, (2) interpolating onto 4 bins instead of 60, (3) using within-corridor position instead of cumulative position, (4) operating trial-by-trial with a running+corridor mask instead of on all moving frames concatenated. These differences reflect the decoder task's 4-bin requirement. The AI's approach also applies float16 compression.
+iii. The CONVERSION_NOTES.md states: "A deterministic neuron cap is applied per session after visual-cortex filtering so the expanded trial structure remains trainable with the provided decoder harness."
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Neurons are filtered in two stages: (1) only neurons with valid visual cortex area codes are kept (V1, mHV, lHV, aHV), and (2) if more than 512 neurons pass, a variance-based selection with per-region balancing is applied to cap at 512 neurons per session.
+i. Neurons are first filtered to keep only those in visual cortex regions (V1, mHV, lHV, aHV) using the same area codes as the reference. Then, a second filter caps neurons at 512 per session by selecting the highest-variance neurons during running corridor frames, with per-region quota balancing.
 
 ii.
 ```python
-VISUAL_AREA_CODES = {
-    "mHV": {0, 1, 2, 9},
-    "aHV": {3, 4},
-    "lHV": {5, 6},
-    "V1": {8},
-}
-
 def pick_neurons_by_variance(spk, area_codes, running_corridor_mask, max_neurons):
-    ...
+    # First: keep only visual cortex
+    for neuron_idx, area_code in enumerate(area_codes):
+        region_name = area_code_to_region_name(area_code)
+        if region_name is not None:
+            region_to_indices[region_name].append(neuron_idx)
+    # Then: cap by variance
     if len(valid_indices) <= max_neurons:
-        ...
         return valid_indices, region_idx
-    ...
+    spk_valid = spk[valid_indices][:, running_corridor_mask]
+    variances = np.var(spk_valid, axis=1)
     per_region_quota = max_neurons // len(BRAIN_REGIONS)
     ...
 ```
 
-iii. The visual cortex area code mapping matches the reference code's `neu_area_ID` function exactly. The 512-neuron cap is documented in CONVERSION_NOTES.md as an intentional format-driven deviation for decoder trainability. The reference code does not apply a neuron cap; it uses all visual cortex neurons.
+iii. The AI justified the neuron cap as needed for the decoder harness to be trainable. The reference keeps all visual cortex neurons (up to ~89,577 per session).
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. The instructions specify "Temporally aligned based on trial start (corridor entry)." The AI aligns by corridor position rather than time: each trial's data represents activity at 4 spatial positions within the corridor, starting from corridor entry (position 0) to end (position 40 dm). Since the VR speed is fixed at 60 cm/s when running, spatial position is approximately proportional to time since corridor entry.
+i. The alignment event is corridor entry. However, instead of aligning temporally from corridor entry, the AI aligns spatially by interpolating neural activity onto 4 spatial position bins (0-1m, 1-2m, 2-3m, 3-4m). This produces trials with exactly 4 "time points" that correspond to spatial positions rather than temporal frames.
 
 ii.
 ```python
-POSITION_BIN_CENTERS = np.array([5.0, 15.0, 25.0, 35.0], dtype=np.float32)
-
 neural_interp = interpolate_features(
     positions=trial_positions,
     values=spk_selected[:, frame_idx],
-    target_positions=POSITION_BIN_CENTERS,
-)
+    target_positions=POSITION_BIN_CENTERS,  # [5, 15, 25, 35] dm
+).astype(np.float16)
 ```
 
-iii. The CONVERSION_NOTES.md states the alignment event is "corridor entry (trial start)." The spatial binning approach is consistent with the reference code's position-interpolated representation (`spk_pos_interp`), which also uses spatial position rather than time. The constant VR speed (60 cm/s) ensures spatial bins map to approximately equal time bins.
+iii. The CONVERSION_NOTES.md states: "The decoder task explicitly requires 4 equal 1 m position bins, so each trial is represented by 4 ordered samples corresponding to corridor positions 0-1 m, 1-2 m, 2-3 m, and 3-4 m."
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The data is not organized in temporal bins but in spatial bins. Each trial has 4 "time points" corresponding to 4 spatial bins of 1 meter each. The AI sets `time_bin_size` to `(1.0 / 0.60) * 1000.0` milliseconds (approximately 1666.67 ms), interpreting this as the time to traverse 1 meter at the constant VR speed of 60 cm/s. No temporal rebinning is applied; instead, spatial interpolation replaces temporal binning.
+i. The AI does not use temporal bins at all. Instead, it uses 4 spatial bins. The `time_bin_size` in metadata is set to `(1.0 / 0.60) * 1000.0 = 1666.67 ms`, derived from the nominal VR running speed of 60 cm/s over 1 m bins. No temporal rebinning is applied because the data is resampled spatially rather than temporally.
 
 ii.
 ```python
-metadata = {
-    ...
-    "time_bin_size": float((1.0 / 0.60) * 1000.0),
-    ...
-    "off_end": float(4.0 / 0.60),
-    "binning_scheme": "4 spatial bins of 1 m each inside the 4 m corridor; moving frames only",
-    ...
-}
+"time_bin_size": float((1.0 / 0.60) * 1000.0),  # ~1666.67 ms
+POSITION_BIN_CENTERS = np.array([5.0, 15.0, 25.0, 35.0], dtype=np.float32)
 ```
 
-iii. The original calcium imaging frame rate is ~3.17 Hz (frame period ~0.315 s). The reference code interpolates into 60 positional bins per 6-meter corridor, giving ~10 cm per bin. The AI's 4 spatial bins of 1 m each is a much coarser resolution, as required by the decoder task instructions. The `time_bin_size` metadata value is a derived approximation based on constant VR speed rather than the actual imaging frame period.
+iii. The AI chose to interpret the "4 equal-length, 1-m-long spatial bins" instruction as defining the temporal axis, converting each spatial bin into a time duration based on nominal running speed.
 
 ## 3-a. What variables in the raw data is `input` *Time to sound cue* derived from?
 
-i. Derived from `beh["SoundTime"]` (time of sound cue delivery) and `beh["ft"]` (timestamps for each neural frame).
+i. From `SoundTime` (the MATLAB datenum of the sound cue) and `ft` (the frame timestamps), both in MATLAB datenum format.
 
 ii.
 ```python
@@ -208,46 +184,44 @@ sound_time = float(np.asarray(beh["SoundTime"])[trial_idx])
 time_to_sound = ((sound_time - ft[frame_idx]) * SECONDS_PER_DAY).astype(np.float32)
 ```
 
-iii. `SoundTime` is described in the data dictionary as "time of sound cue" and `ft` as "time stamp for each neural frame." The difference gives the time remaining until the sound cue, converted from MATLAB datenum (days) to seconds by multiplying by 86400.
+iii. The AI uses `SoundTime` directly rather than `SoundFr` (frame number) which the reference uses.
 
 ## 3-b. What processing is involved in computing `input` *Time to sound cue*?
 
-i. For each trial, the time to sound cue is computed as `(SoundTime - ft) * 86400` for each frame, giving seconds until the sound cue (positive before, negative after). This is then spatially interpolated onto the 4 bin centers.
+i. The time to sound cue is computed as `(SoundTime - ft[frame_idx]) * SECONDS_PER_DAY`, giving positive values before the cue and negative after. It is then spatially interpolated onto the 4 position bin centers.
 
 ii.
 ```python
 time_to_sound = ((sound_time - ft[frame_idx]) * SECONDS_PER_DAY).astype(np.float32)
-...
 input_trial = np.vstack([
     interpolate_features(trial_positions, time_to_sound, POSITION_BIN_CENTERS)[0],
     ...
 ])
 ```
 
-iii. The computation is straightforward: time difference converted to seconds, then interpolated to spatial bins. The sign convention means positive values indicate the cue hasn't happened yet, negative values mean it has passed.
+iii. The sign convention (positive before cue) matches the reference's `cue[trial] - time`.
 
 ## 3-c. How is the `input` *Time to sound cue* aligned with the neural data?
 
-i. The time to sound cue is interpolated onto the same 4 spatial bin centers as the neural data, using the same trial frame positions. This ensures exact alignment with the neural data.
+i. It is interpolated onto the same 4 spatial position bins as the neural data, using the `interpolate_features` function.
 
 ii.
 ```python
 interpolate_features(trial_positions, time_to_sound, POSITION_BIN_CENTERS)[0]
 ```
 
-iii. Same spatial interpolation method as neural data ensures alignment.
+iii. All variables share the same spatial interpolation scheme.
 
 ## 4-a. What variables in the raw data is `input` *Day of training* derived from?
 
-i. Derived from the session key, which encodes the date (e.g., `DR10_2022_07_12_1`). The AI computes the number of days since the subject's first recording date.
+i. From the date encoded in the session key, parsed into a `datetime.date` object.
 
 ii.
 ```python
-def compute_subject_day_index(session_keys: list[str]):
+def compute_subject_day_index(session_keys):
     parsed = {key: parse_session_key(key) for key in session_keys}
     first_day = {}
     for key, info in parsed.items():
-        subj = info["subject"]
         if subj not in first_day or info["date"] < first_day[subj]:
             first_day[subj] = info["date"]
     day_index = {}
@@ -256,46 +230,24 @@ def compute_subject_day_index(session_keys: list[str]):
     return day_index, parsed
 ```
 
-iii. The day of training is computed as the integer number of days since the subject's first session in the dataset. This value is constant per session (all trials in a session get the same value).
+iii. The AI uses actual calendar day differences from the first recording date for each subject.
 
 ## 4-b. What processing is involved in computing `input` *Day of training*?
 
-i. For each session, the day index is computed as `(session_date - first_date_for_subject).days`. This is broadcast as a constant across all 4 spatial bins in a trial.
+i. For each subject, the earliest recording date is found. The day of training for each session is the number of calendar days between that session's date and the subject's first date. This is broadcast across all 4 spatial bins.
 
 ii.
 ```python
+day_index[key] = float((info["date"] - first_day[info["subject"]]).days)
+# Per trial:
 np.full(4, subject_day_value, dtype=np.float32)
 ```
 
-iii. The value is a simple integer (number of days), constant per session, replicated across spatial bins. No normalization or scaling is applied.
-
-## 4-a. What variables in the raw data is `input` *Environment type* derived from?
-
-i. The AI does NOT include "Environment type" as a decoder input. The instructions list only 4 decoder inputs: Time to sound cue, Day of training, Time since trial start, and Reward availability. Environment type is not among them.
-
-ii.
-```python
-"input_names": [
-    "time_to_sound_cue_s",
-    "day_of_training",
-    "time_since_trial_start_s",
-    "reward_availability",
-],
-```
-
-iii. The AI followed the instruction specification exactly, which does not include Environment type as a decoder input.
-
-## 4-b. What processing is involved in computing `input` *Environment type*?
-
-i. Not applicable - Environment type is not included as a decoder input in the AI's conversion.
-
-ii. N/A
-
-iii. N/A
+iii. This differs from the reference, which counts session index (0, 1, 2, ...) regardless of gaps between recording dates. If a mouse was recorded on day 1, day 5, and day 10, the AI would give values 0, 4, 9 while the reference gives 0, 1, 2.
 
 ## 5-a. What variables in the raw data is `input` *Time since trial start* derived from?
 
-i. Derived from `beh["ft"]` (frame timestamps) and `beh["Trial_start_time"]` (time when the animal enters each corridor).
+i. From `Trial_start_time` (MATLAB datenum of trial start) and `ft` (frame timestamps), both in MATLAB datenum format.
 
 ii.
 ```python
@@ -303,57 +255,56 @@ trial_start_time = float(np.asarray(beh["Trial_start_time"])[trial_idx])
 time_since_start = ((ft[frame_idx] - trial_start_time) * SECONDS_PER_DAY).astype(np.float32)
 ```
 
-iii. `Trial_start_time` is described in the data dictionary as "time when animal enters each corridor" and `ft` as "time stamp for each neural frame."
+iii. The AI uses `Trial_start_time` directly rather than `StartFr` (frame number) which the reference uses.
 
 ## 5-b. What processing is involved in computing `input` *Time since trial start*?
 
-i. For each trial, computed as `(ft - Trial_start_time) * 86400` giving seconds since corridor entry. Then spatially interpolated onto the 4 bin centers.
+i. The time since trial start is computed as `(ft[frame_idx] - Trial_start_time) * SECONDS_PER_DAY`, giving seconds since trial start. It is then spatially interpolated onto the 4 position bin centers.
 
 ii.
 ```python
 time_since_start = ((ft[frame_idx] - trial_start_time) * SECONDS_PER_DAY).astype(np.float32)
-...
 interpolate_features(trial_positions, time_since_start, POSITION_BIN_CENTERS)[0]
 ```
 
-iii. Straightforward time difference in seconds from trial start, interpolated to match spatial binning.
+iii. The sign convention (positive after start) matches the reference's `time - start[trial]`.
 
 ## 5-c. How is the `input` *Time since trial start* aligned with the neural data?
 
-i. Same spatial interpolation onto 4 bin centers as the neural data.
+i. It is interpolated onto the same 4 spatial position bins as the neural data.
 
 ii.
 ```python
 interpolate_features(trial_positions, time_since_start, POSITION_BIN_CENTERS)[0]
 ```
 
-iii. Aligned through shared spatial interpolation targets.
+iii. Same spatial interpolation as all other variables.
 
 ## 6-a. What variables in the raw data is `input` *Reward availability* derived from?
 
-i. Derived from `beh["isRew"]`, a boolean array indicating whether each trial is a rewarded trial.
+i. From `isRew`, which marks rewarded corridor trials.
 
 ii.
 ```python
 np.full(4, float(np.asarray(beh["isRew"])[trial_idx]), dtype=np.float32)
 ```
 
-iii. `isRew` is described in the data dictionary as "boolean value indicating if the trial is a reward trial." The value is 1.0 for rewarded trials and 0.0 for unrewarded trials.
+iii. Same source as the reference.
 
 ## 6-b. What processing is involved in computing `input` *Reward availability*?
 
-i. The boolean `isRew` value for the trial is converted to float (0.0 or 1.0) and broadcast as a constant across all 4 spatial bins.
+i. The value is converted to float and broadcast across all 4 spatial bins. No additional processing.
 
 ii.
 ```python
 np.full(4, float(np.asarray(beh["isRew"])[trial_idx]), dtype=np.float32)
 ```
 
-iii. No additional processing beyond type conversion. The instructions specify "1 if in rewarded corridor, 0 if not, discrete, per-trial," which is exactly what `isRew` provides.
+iii. Straightforward conversion, same as reference.
 
 ## 7-a. What variables in the raw data is `output` *Visual stimulus category* derived from?
 
-i. Derived from `beh["WallName"]`, which gives the stimulus name for each trial (e.g., "leaf1", "circle1").
+i. From `WallName`, which names the wall texture of each trial's corridor.
 
 ii.
 ```python
@@ -364,11 +315,11 @@ output_trial_partial = {
 }
 ```
 
-iii. `WallName` is described in the data dictionary as "name of stimuli in each corridor."
+iii. Same source variable as the reference.
 
 ## 7-b. What processing is involved in computing `output` *Visual stimulus category*?
 
-i. A global catalog of all unique stimulus names is built across all sessions, sorted naturally. Each name is mapped to an integer ID. The stimulus ID is constant across all 4 spatial bins within a trial.
+i. The AI uses each individual `WallName` (e.g., circle1, circle2, leaf1, leaf2, etc.) as a separate category, resulting in 15 distinct categories. The reference groups them into 4 broad texture types (circle, leaf, rock, wood). The category index is broadcast across all 4 spatial bins.
 
 ii.
 ```python
@@ -379,114 +330,110 @@ def stimulus_catalog(behavior_by_session):
     return sorted(names, key=natural_key)
 
 stimulus_to_id = {name: idx for idx, name in enumerate(stimulus_values)}
+# output_values:
+"output_values": [stimulus_values, ...]  # 15 individual names
 ```
 
-iii. The output_values for this variable lists all unique stimulus names found. The instructions say "e.g. circle1, leaf2, etc., per-trial" - the AI correctly treats it as a per-trial categorical value replicated across spatial bins.
+iii. The instruction says "Visual stimulus category. e.g. circle1, leaf2, etc." which the AI interpreted as each individual texture being its own category. The reference groups them into 4 broad categories following the paper's analysis.
 
 ## 8-a. What variables in the raw data is `output` *Licking* derived from?
 
-i. Derived from `beh["LickTrind"]` (trial index of each lick) and `beh["LickPos"]` (position of each lick within the corridor).
+i. From `LickTrind` (trial index of each lick) and `LickPos` (position in corridor where each lick occurred).
 
 ii.
 ```python
 lick_trials = np.rint(np.asarray(beh["LickTrind"])).astype(np.int64)
 lick_positions = np.asarray(beh["LickPos"], dtype=np.float32)
-...
 lick_pos_trial = lick_positions[lick_trials == trial_idx]
 ```
 
-iii. `LickTrind` is "trial stamp of each lick" and `LickPos` is "positional stamp of each lick" per the data dictionary.
+iii. The AI uses position-based lick data to match its spatial binning scheme, whereas the reference uses `LickFr` (frame-based).
 
 ## 8-b. What processing is involved in computing `output` *Licking*?
 
-i. For each trial, lick positions are extracted. For each of the 4 spatial bins (defined by edges [0, 10, 20, 30, 40]), a binary value is set to 1 if any lick falls within that bin, 0 otherwise. Licks at position >= 40 are assigned to the last bin.
+i. For each trial, lick positions are filtered by trial index. For each of the 4 spatial bins, licking is 1 if any lick position falls within that bin's edges, 0 otherwise. Licks at or beyond the last bin edge (40 dm) are assigned to the last bin.
 
 ii.
 ```python
 lick_trial = np.array(
-    [
-        int(np.any((lick_pos_trial >= POSITION_BIN_EDGES[bin_idx]) & (lick_pos_trial < POSITION_BIN_EDGES[bin_idx + 1])))
-        for bin_idx in range(4)
-    ],
+    [int(np.any((lick_pos_trial >= POSITION_BIN_EDGES[bin_idx]) &
+                (lick_pos_trial < POSITION_BIN_EDGES[bin_idx + 1])))
+     for bin_idx in range(4)],
     dtype=np.int16,
 )
 if len(lick_pos_trial) and np.any(lick_pos_trial >= POSITION_BIN_EDGES[-1]):
     lick_trial[-1] = 1
 ```
 
-iii. The instructions specify "Licking, binary, time-varying. 0 = not licking, 1 = licking." The AI converts this to a binary per-spatial-bin representation.
+iii. This is a spatial binning of licking, different from the reference's temporal per-frame binary flag.
 
 ## 8-c. How is `output` *Licking* aligned with the neural data?
 
-i. Licking is aligned spatially: lick positions are binned into the same 4 spatial bins as the neural data (0-10, 10-20, 20-30, 30-40 decimeters).
+i. Licking is binned into the same 4 spatial bins as the neural data, using lick position rather than lick frame.
 
 ii.
 ```python
-POSITION_BIN_EDGES = np.array([0.0, 10.0, 20.0, 30.0, 40.0], dtype=np.float32)
-lick_trial = np.array([
-    int(np.any((lick_pos_trial >= POSITION_BIN_EDGES[bin_idx]) & (lick_pos_trial < POSITION_BIN_EDGES[bin_idx + 1])))
-    for bin_idx in range(4)
-])
+lick_trial = np.array(
+    [int(np.any((lick_pos_trial >= POSITION_BIN_EDGES[bin_idx]) &
+                (lick_pos_trial < POSITION_BIN_EDGES[bin_idx + 1])))
+     for bin_idx in range(4)],
+)
 ```
 
-iii. Alignment is by spatial position rather than time, matching the neural data's spatial binning.
+iii. All variables share the spatial binning alignment.
 
 ## 9-a. What variables in the raw data is `output` *Position in corridor* derived from?
 
-i. Position in corridor is not derived from raw data variables per se - it is the spatial bin index itself (0, 1, 2, 3), since the data is organized by spatial position.
+i. Position is not derived from raw data in the traditional sense. Since the AI uses 4 spatial position bins as the data's axis, the position output is trivially the bin index (0, 1, 2, 3).
 
 ii.
 ```python
 "position_bin": np.arange(4, dtype=np.int16),
 ```
 
-iii. Since the data is binned spatially, the position output is simply the bin index [0, 1, 2, 3] for each trial.
+iii. In the AI's spatial binning scheme, position is the axis itself, not a derived variable.
 
 ## 9-b. What processing is involved in computing `output` *Position in corridor*?
 
-i. No processing is needed - the bin index is simply `np.arange(4)`. Since data is organized by spatial bins, position is trivially known.
+i. No processing is needed. The position output is simply `np.arange(4)` for every trial, since each "time point" corresponds to a spatial bin.
 
 ii.
 ```python
 "position_bin": np.arange(4, dtype=np.int16),
 ```
 
-iii. The instructions say "Position in corridor discretized into 4 equal-length, 1-m-long spatial bins, time varying." The AI's approach makes this trivial since the data is already spatially binned.
+iii. This makes position a trivially decodable variable (always [0, 1, 2, 3]) with no variance across trials.
 
 ## 9-c. How is `output` *Position in corridor* thresholded into categories?
 
-i. Position is discretized into 4 categories: bin 0 (0-1m), bin 1 (1-2m), bin 2 (2-3m), bin 3 (3-4m). No thresholding is needed since this is the inherent structure of the spatial binning.
+i. No thresholding is applied. The spatial bins (0-1m, 1-2m, 2-3m, 3-4m) are inherently the position categories, represented as indices 0-3.
 
 ii.
 ```python
-"output_values": [
-    ...
-    ["0_to_1m", "1_to_2m", "2_to_3m", "3_to_4m"],
-    ...
-]
+"position_bin": np.arange(4, dtype=np.int16),
+"output_values": [..., ["0_to_1m", "1_to_2m", "2_to_3m", "3_to_4m"], ...]
 ```
 
-iii. The 4 equal 1-meter bins match the instruction requirement exactly.
+iii. The reference discretizes `ft_Pos // 10` and clips to [0, 3], producing time-varying position within each temporal frame.
 
 ## 9-d. How is `output` *Position in corridor* aligned with the neural data?
 
-i. Position is inherently aligned because both neural data and position share the same 4-bin spatial structure. The position output at bin i simply indicates the spatial location of the corresponding neural data at bin i.
+i. Position is inherently aligned since the spatial bins define the axis of all data streams.
 
 ii.
 ```python
 "position_bin": np.arange(4, dtype=np.int16),
 ```
 
-iii. Alignment is trivial under the spatial binning approach.
+iii. No alignment step is needed in the spatial binning scheme.
 
 ## 10-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. Derived from `beh["ft_RunSpeed"]`, the running speed for each neural frame.
+i. From `ft_RunSpeed`, the running speed at each imaging frame.
 
 ii.
 ```python
 ft_speed = np.asarray(beh["ft_RunSpeed"][:n_frames], dtype=np.float32)
-...
 speed_interp = interpolate_features(
     positions=trial_positions,
     values=ft_speed[frame_idx],
@@ -494,39 +441,39 @@ speed_interp = interpolate_features(
 )[0].astype(np.float32)
 ```
 
-iii. `ft_RunSpeed` is described in the data dictionary as "running speed for each neural frame."
+iii. Same source variable as the reference.
 
 ## 10-b. What processing is involved in computing `output` *Running speed*?
 
-i. Running speed at each frame is spatially interpolated onto the 4 bin centers. The continuous speed values from all sessions are pooled to compute global quartile edges (25th, 50th, 75th percentiles). Speed is then discretized into 4 bins using these edges.
+i. Running speed is first spatially interpolated onto the 4 position bin centers per trial. Then, continuous speed values from all sessions are collected and global quantiles (25th, 50th, 75th percentiles) are computed. These quantiles define bin edges for discretization using `np.digitize`.
 
 ii.
 ```python
+# Global quantile computation:
 speed_values = np.concatenate(all_speed_values).astype(np.float32)
-q25, q50, q75 = np.quantile(speed_values, [0.25, 0.50, 0.75]).astype(np.float32)
-speed_edges = np.array([-np.inf, q25, q50, q75, np.inf], dtype=np.float32)
+q25, q50, q75 = np.quantile(speed_values, [0.25, 0.50, 0.75])
+speed_edges = np.array([-np.inf, q25, q50, q75, np.inf])
 
-def finalize_outputs(session_output_partial, speed_edges):
-    ...
-    speed_bins = np.digitize(trial["running_speed_continuous"], speed_edges[1:-1], right=False).astype(np.int16)
+# Per-trial discretization:
+speed_bins = np.digitize(trial["running_speed_continuous"], speed_edges[1:-1], right=False)
 ```
 
-iii. The instructions specify "Running speed discretized into 4 bins, each corresponding to 25% of the data." The AI correctly uses quartiles of the pooled speed distribution to define bin edges.
+iii. The reference uses per-session rank-based quartiles, which guarantee exactly 25% of frames in each bin per session. The AI uses global quantile edges, which don't guarantee equal bin counts per session.
 
 ## 10-c. How is `output` *Running speed* thresholded into categories?
 
-i. Speed is thresholded using global quartile edges (q25=16.592, q50=28.701, q75=43.168 cm/s). `np.digitize` assigns each speed value to one of 4 bins: [0] below q25, [1] q25-q50, [2] q50-q75, [3] above q75.
+i. Continuous speed values are discretized using `np.digitize` with global quantile edges (q25, q50, q75). This produces 4 bins (0-3).
 
 ii.
 ```python
 speed_bins = np.digitize(trial["running_speed_continuous"], speed_edges[1:-1], right=False).astype(np.int16)
 ```
 
-iii. The output values are labeled `["speed_q1", "speed_q2", "speed_q3", "speed_q4"]`. The quartile-based binning ensures approximately 25% of data per bin as specified.
+iii. The reference uses per-session rank-based quartiles ensuring exact 25% splits per session.
 
 ## 10-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is interpolated onto the same 4 spatial bin centers as the neural data, ensuring exact alignment.
+i. Running speed is spatially interpolated onto the same 4 position bin centers as the neural data.
 
 ii.
 ```python
@@ -537,93 +484,83 @@ speed_interp = interpolate_features(
 )[0]
 ```
 
-iii. Same spatial interpolation approach as neural data ensures alignment.
+iii. Same spatial interpolation as all other variables.
 
 ## 11. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI handles several edge cases: (1) NaN values in `ft_trInd` are detected and those frames are excluded. (2) Trials with no running-in-corridor frames are skipped. (3) Trials that don't reach position 35 dm are skipped. (4) Duplicate behavior views are merged after consistency checking. (5) `ft_trInd` values are rounded to integers via `np.rint()` to handle floating point issues. (6) Lick positions at the corridor boundary (>=40) are assigned to the last bin.
+i. The AI cuts behavior streams to the number of imaged frames (`n_frames = spk.shape[1]`). Trials with no running corridor frames are dropped. Trials that don't reach the last spatial bin center (35 dm) are dropped. Sessions with fewer than 2 usable trials raise an error. The AI also validates that behavior views agree across files and merges them.
 
 ii.
 ```python
-ft_trial_idx_raw = np.asarray(beh["ft_trInd"][:n_frames], dtype=np.float64)
-valid = ~np.isnan(ft_trial_idx_raw)
-ft_trial_idx = np.full(n_frames, -1, dtype=np.int64)
-ft_trial_idx[valid] = np.rint(ft_trial_idx_raw[valid]).astype(np.int64)
+n_frames = spk.shape[1]
+ft = np.asarray(beh["ft"][:n_frames], dtype=np.float64)
+ft_pos = np.asarray(beh["ft_Pos"][:n_frames], dtype=np.float32)
+# Trial filtering:
+if len(frame_idx) == 0: continue
+if np.nanmax(trial_positions) < POSITION_BIN_CENTERS[-1]: continue
 ```
 
-```python
-if len(lick_pos_trial) and np.any(lick_pos_trial >= POSITION_BIN_EDGES[-1]):
-    lick_trial[-1] = 1
-```
-
-iii. The CONVERSION_NOTES.md reports 0 empty running trials dropped, suggesting data quality was high. The NaN handling in `ft_trInd` is prudent since the data dictionary notes NaN means "outside the behavior recorded."
+iii. The behavior view merging and validation is more elaborate than the reference, which simply uses the first occurrence of each session.
 
 ## 12-a. What are the most time-consuming steps of the code?
 
-i. The most time-consuming steps are: (1) Loading each session's large spike data file (`*_neural_data.npy`, up to ~4.3 GB), (2) The neuron variance ranking step which requires computing variance across all running corridor frames for all valid neurons, (3) The per-trial spatial interpolation loop over all trials and neurons.
+i. Reading the spike files from disk (89 files totaling hundreds of GB) and the spatial interpolation/variance computation for neuron selection.
 
 ii.
 ```python
 spk_planes = np.load(spk_path, allow_pickle=True).item()["spks"]
 spk = np.concatenate([plane.astype(np.float32, copy=False) for plane in spk_planes], axis=0)
-...
+# Variance computation:
 spk_valid = spk[valid_indices][:, running_corridor_mask]
 variances = np.var(spk_valid, axis=1)
 ```
 
-iii. The trajectory shows the full conversion took several minutes for 89 sessions. The AI processes sessions sequentially with explicit `gc.collect()` calls to manage memory.
+iii. The I/O cost dominates, same as the reference. The variance computation is additional overhead not present in the reference.
 
 ## 12-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. Several loops could be vectorized: (1) The `interpolate_features` function loops over rows (neurons) for both collapsing duplicates and interpolation. (2) The lick binning uses a Python list comprehension with explicit per-bin checks. (3) The trial loop in `build_single_session` processes one trial at a time, but the interpolation could potentially be batched.
+i. The `interpolate_features` function loops over rows for bincount and interp operations. The `pick_neurons_by_variance` function loops over neurons for area code checking. The `trial_frame_indices` function scans the full frame index per trial.
 
 ii.
 ```python
-# Row-by-row interpolation loop
+# Row-by-row interpolation:
 for row in range(collapsed.shape[0]):
-    collapsed[row] = np.bincount(inverse, weights=values[row], minlength=len(unique_pos)) / counts
+    collapsed[row] = np.bincount(inverse, weights=values[row], ...) / counts
 for row in range(collapsed.shape[0]):
     interp[row] = np.interp(target_positions, unique_pos, collapsed[row])
+# Per-neuron area check:
+for neuron_idx, area_code in enumerate(area_codes):
+    region_name = area_code_to_region_name(area_code)
 ```
 
-```python
-# Per-bin lick check
-lick_trial = np.array([
-    int(np.any((lick_pos_trial >= POSITION_BIN_EDGES[bin_idx]) & (lick_pos_trial < POSITION_BIN_EDGES[bin_idx + 1])))
-    for bin_idx in range(4)
-])
-```
-
-iii. The row-by-row loops in `interpolate_features` over neurons (up to 512) could potentially be vectorized using 2D interpolation or batch operations, though `np.interp` only supports 1D inputs.
+iii. The row-by-row interpolation in `interpolate_features` is called for every trial of every session (neural, speed, time_to_sound, time_since_start), making it a significant candidate for vectorization.
 
 ## 12-c. What processing does the code repeat multiple times?
 
-i. (1) The `area_code_to_region_name` function is called multiple times for the same neuron during variance ranking and region index construction. (2) `interpolate_features` is called separately for neural data, time_to_sound, time_since_start, and speed - each call recomputes position sorting and unique positions from the same trial positions. (3) The behavior views are loaded and merged upfront for all sessions, even though sessions are processed one at a time.
+i. The `interpolate_features` function is called multiple times per trial with the same position data but different values (neural, time_to_sound, time_since_start, speed). The position sorting and unique computation is repeated each time. Also, `area_code_to_region_name` is called per-neuron multiple times during selection.
 
 ii.
 ```python
-# Called once during pick_neurons_by_variance and again for region_idx
-region_name = area_code_to_region_name(area_codes[i])
-...
-region_idx = np.array(
-    [BRAIN_REGIONS.index(area_code_to_region_name(area_codes[i])) for i in selected],
-)
+# Called 4 times per trial with same positions:
+neural_interp = interpolate_features(positions=trial_positions, values=spk_selected[:, frame_idx], ...)
+interpolate_features(trial_positions, time_to_sound, POSITION_BIN_CENTERS)
+interpolate_features(trial_positions, time_since_start, POSITION_BIN_CENTERS)
+speed_interp = interpolate_features(positions=trial_positions, values=ft_speed[frame_idx], ...)
 ```
 
-iii. The repeated position sorting in `interpolate_features` is a minor inefficiency since it processes the same trial positions for different value arrays.
+iii. The position-related computations (argsort, unique, inverse) within `interpolate_features` are redundant across calls for the same trial.
 
 ## 12-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. (1) The `frame_periods` computation (median frame period across all sessions) is computed upfront but only used in metadata - it requires loading `ft` arrays for all sessions. (2) The behavior merge process loads and verifies many fields (like `ft_RunCum`, `ft_PosCum` etc.) that are never used in the conversion. (3) The `running_corridor_mask` is computed twice - once for the variance ranking and implicitly again inside `trial_frame_indices` for each trial. (4) The `interpolate_features` function computes full interpolation for the position output, but position bins are trivially `np.arange(4)` and don't need interpolation.
+i. The variance-based neuron selection computes variances for all visual cortex neurons across running corridor frames, but this information is not stored in the output. The behavior view merging and validation (checking field agreement across views) is elaborate but the merged result is equivalent to just picking one view. The `source_behavior_views` metadata is stored but unlikely to be used downstream.
 
 ii.
 ```python
-# Frame periods computed upfront but only used for metadata
-frame_periods = []
-for key in spk_session_keys:
-    ft = np.asarray(behavior_by_session[key]["ft"], dtype=np.float64)
-    if len(ft) > 1:
-        frame_periods.append(float(np.median(np.diff(ft) * SECONDS_PER_DAY)))
+# Variance computation for neuron selection:
+spk_valid = spk[valid_indices][:, running_corridor_mask]
+variances = np.var(spk_valid, axis=1)
+# Elaborate view merging:
+merged["source_behavior_views"] = [...]
 ```
 
-iii. The position bin output is trivially `[0,1,2,3]` for every trial since data is spatially binned - no computation is needed. This is the most clearly "unnecessary" processing, as the decoder will always see position as perfectly predictable from the bin index.
+iii. The neuron selection itself is unnecessary processing since the reference keeps all visual cortex neurons.

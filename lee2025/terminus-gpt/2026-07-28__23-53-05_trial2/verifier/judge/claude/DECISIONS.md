@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads data from per-animal joblib files in the `data/` directory. It uses a hardcoded list of 7 animal IDs (`ANIMALS`). For each animal, it loads the joblib file, accesses the nested dictionary keyed by animal ID, and extracts `trace`, `position`, and `envs` arrays.
+i. The AI loads data from extensionless joblib files in the `data/` directory (one per animal). Each file is loaded with `joblib.load()`, which returns a dictionary keyed by animal ID containing arrays for `trace`, `position`, `envs`, etc. The list of animals is hardcoded as `ANIMALS`.
 
 ii.
 ```python
@@ -15,24 +15,25 @@ for animal in animals:
     positions = rec['position']
 ```
 
-iii. The AI chose to use the pre-converted joblib files rather than raw `.mat` files, matching the reference code's `load_dat` function which also loads from joblib format.
+iii. The AI identified that the data directory contains both `.mat` files and extensionless joblib-converted files. Since the reference code uses `joblib.load()` (via `load_dat` and `mat2joblib` utilities), the AI chose to use the joblib format for consistency with the reference code.
 
 ## 1-b. How are the data split into subjects?
 
-i. Each entry in the hardcoded `ANIMALS` list corresponds to one subject. The subject name is the animal ID string.
+i. Each joblib file corresponds to one subject (mouse). The subject name is the animal ID from the hardcoded `ANIMALS` list, matching the filename.
 
 ii.
 ```python
 ANIMALS = ['QLAK-CA1-08','QLAK-CA1-30','QLAK-CA1-50','QLAK-CA1-51','QLAK-CA1-56','QLAK-CA1-74','QLAK-CA1-75']
+...
 subjects = animals.copy()
 subject_to_idx = {a: i for i, a in enumerate(subjects)}
 ```
 
-iii. Each joblib file contains all recording sessions for one animal. The 7 animals correspond to the 7 subjects in the dataset.
+iii. Each joblib file contains all recording sessions for one animal. The filename/animal ID serves as the subject identifier.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each animal's data contains multiple recording sessions indexed along the first dimension of the `trace`, `position`, and `envs` arrays. Each recording session becomes a separate session in the output.
+i. Each subject's data contains multiple recording sessions, indexed by iterating over the `envs` array. Each session has corresponding entries in `trace` and `position`.
 
 ii.
 ```python
@@ -43,11 +44,11 @@ for s, env_name in enumerate(envs):
     nt, it, ot = session_to_trials(traces[s], positions[s], env_name)
 ```
 
-iii. The data structure has sessions as the first dimension of the arrays. The AI iterates over each session index.
+iii. The `envs` array has one entry per session, providing both the session count and the environment geometry name for each session.
 
 ## 1-d. How are the data split into trials?
 
-i. Each 40-minute session is split into consecutive 1-minute (1800-frame) non-overlapping trials. A valid-frame detection step (`infer_valid_frames`) first determines how many frames contain valid (finite) data, then only complete 1-minute chunks within that range are kept.
+i. Each session is split into non-overlapping 60-second trials (1800 frames at 30 Hz). Only the valid portion of the recording is used (determined by `infer_valid_frames`). Remainder frames that don't fill a complete trial are discarded.
 
 ii.
 ```python
@@ -62,11 +63,11 @@ def session_to_trials(trace_sxn, pos_sxn, env_name, min_trials=2):
         neural_trials.append(trace_sxn[:, sl])
 ```
 
-iii. The instruction specifies 1-minute trials. The valid-frame detection ensures trailing invalid frames are excluded before trial splitting.
+iii. Per instruction, sessions are split into 1-minute trials. The `infer_valid_frames` function determines the last frame with valid data before splitting.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Sessions with fewer than 2 valid trials are entirely excluded. The valid-frame inference discards trailing frames where position or neural data are non-finite. No per-trial quality filtering is applied beyond this.
+i. Sessions with fewer than 2 valid trials are excluded entirely. Additionally, sessions where all neurons have non-finite values after filtering are excluded.
 
 ii.
 ```python
@@ -75,26 +76,32 @@ def session_to_trials(trace_sxn, pos_sxn, env_name, min_trials=2):
     n_trials = valid_frames // FRAMES_PER_TRIAL
     if n_trials < min_trials:
         return [], [], []
+    ...
+    if trace_sxn.shape[0] == 0:
+        return [], [], []
+...
+if len(nt) < 2:
+    continue
 ```
 
-iii. The minimum trial check ensures every session has enough data for train/test split in the decoder.
+iii. The instructions require at least two trials per session for decoder evaluation. The `min_trials=2` filter enforces this.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data is derived from the `trace` variable, which contains calcium imaging traces (binary rising-phase vectors) with shape `(n_neurons, n_frames_max)` per session.
+i. Neural data is derived from the `trace` variable in the joblib-loaded data, which contains calcium imaging traces (binarized rising-phase vectors) with shape `(n_neurons, n_timepoints)` per session.
 
 ii.
 ```python
 traces = rec['trace']
 ...
-trace_sxn = traces[s]  # shape: (n_neurons, n_frames)
+trace_sxn = traces[s]  # shape: (n_neurons, n_timepoints)
 ```
 
-iii. The `trace` arrays are already preprocessed rising-phase binary vectors, as confirmed by the paper's methods.
+iii. The `trace` variable contains pre-processed binary rising-phase vectors, as confirmed by the paper's methods (z-scored derivative thresholded at 2.5) and the data inspection showing binary {0, 1} values with ~1.5% ones.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The trace data is cast to float32, truncated to valid frames, and filtered to remove neurons with any non-finite values. No additional processing (e.g., smoothing, rebinning) is applied.
+i. The only processing is: (1) truncate to valid frames, (2) cast to float32, and (3) filter out neurons with non-finite values. No additional preprocessing (dF/F, rebinning, smoothing) is applied because the traces are already processed.
 
 ii.
 ```python
@@ -103,33 +110,36 @@ finite_neurons = np.all(np.isfinite(trace_sxn), axis=1)
 trace_sxn = trace_sxn[finite_neurons]
 ```
 
-iii. The stored traces are already binarized rising-phase vectors. The AI uses them directly, which matches the reference code approach.
+iii. The stored traces are already binarized rising-phase vectors (confirmed by data inspection and paper methods), so no further preprocessing is needed beyond filtering and type conversion.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Neurons that have any non-finite (NaN/Inf) values across the valid time range are removed on a per-session basis. This filters out neurons not actually recorded in that session.
+i. Neurons are filtered by requiring all values within the valid frame range to be finite. Any neuron with any NaN or Inf value (within the valid range) is excluded.
 
 ii.
 ```python
 finite_neurons = np.all(np.isfinite(trace_sxn), axis=1)
 trace_sxn = trace_sxn[finite_neurons]
-if trace_sxn.shape[0] == 0:
-    return [], [], []
 ```
 
-iii. This ensures only neurons with complete data for the session are included. Sessions with zero valid neurons are skipped.
+iii. This strict filtering ensures only neurons with complete, valid data within the analyzed time range are included. Neurons not recorded in a given session (all-NaN) are naturally excluded, as well as neurons with partial data gaps.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. No event-based alignment is applied. The recording is continuous, and trials are consecutive 1-minute segments starting from the beginning of the session.
+i. No event-based alignment is applied. The recording is continuous, and trials are consecutive 1-minute segments starting from the session beginning. The alignment event is session start time.
 
-ii. N/A - no alignment code.
+ii.
+```python
+'temporal_alignment_event': 'session time; sessions split into consecutive 1-minute chunks',
+'off_start': 0.0,
+'off_end': float(TRIAL_SECONDS),
+```
 
-iii. There is no stimulus onset or behavioral event to align to. Trials are arbitrary temporal segments of a continuous recording.
+iii. There is no stimulus onset or specific event to align to; trials are artificial temporal segments of the continuous session.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The data is kept at the native 30 Hz frame rate (~33.33 ms per bin). No temporal rebinning is applied.
+i. Data is kept at the native 30 Hz frame rate (~33.33 ms per bin). No temporal rebinning is applied.
 
 ii.
 ```python
@@ -138,11 +148,11 @@ FPS = 30
 'time_bin_size': 1000.0 / FPS,  # ~33.33 ms
 ```
 
-iii. The acquisition rate is 30 Hz for both neural and behavioral streams, so no rebinning is needed.
+iii. Both neural and behavioral data are acquired at 30 Hz, so the native resolution is preserved.
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. The input is derived from the `envs` variable, which contains environment name strings (e.g., 'square', 'o', 't', 'u') for each session. These are converted to geometry matrices using `get_env_mat()`.
+i. The input is derived from the `envs` variable in the data, which contains the environment name (e.g., 'square', 'o', 't', 'u', etc.) for each session.
 
 ii.
 ```python
@@ -151,11 +161,11 @@ envs = rec['envs'].ravel().tolist()
 env_vec = get_env_mat(env_name).reshape(-1).astype(np.float32)
 ```
 
-iii. The reference code contains a `get_env_mat` function that maps environment names to 3x3 binary matrices indicating open/blocked positions.
+iii. The `envs` variable identifies which of the 10 environment geometries was used in each session. The `get_env_mat` function from the reference code maps each name to a 3x3 binary matrix representing which spatial bins are accessible.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The environment name string is mapped to a 3x3 binary matrix via `get_env_mat()`, then flattened to a 9-element vector. A value of 1 means the grid cell is accessible; 0 means blocked.
+i. The environment name is mapped to a 3x3 binary matrix via `get_env_mat()`, where 1 indicates an accessible spatial bin and 0 indicates a blocked bin. The matrix is flattened to a 9-dimensional vector. This is static per trial.
 
 ii.
 ```python
@@ -165,36 +175,27 @@ def get_env_mat(env):
     elif env == 'o':
         return np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.float32)
     ...
-```
-
-iii. This mapping is taken directly from the reference code, ensuring consistency with the original analysis.
-
-## 3-c. How is the `input` *Environment geometry* aligned with the neural data?
-
-i. The input is static per session (same geometry for all trials within a session), so no temporal alignment is needed. The same 9-element vector is replicated for every trial.
-
-ii.
-```python
+env_vec = get_env_mat(env_name).reshape(-1).astype(np.float32)
 input_trials.append(env_vec.copy())
 ```
 
-iii. Environment geometry doesn't change within a session.
+iii. This approach directly follows the reference code's `get_env_mat` function, which encodes the environment geometry as a binary accessibility matrix over the conceptual 3x3 grid.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. Output is derived from the `position` variable, which contains 2D (x, y) coordinates of the mouse in the arena over time.
+i. Output is derived from the `position` variable in the data, which contains 2D (x, y) coordinates of the mouse in the arena at each timepoint.
 
 ii.
 ```python
 positions = rec['position']
-pos_sxn = positions[s]  # shape: (2, n_frames)
+pos_sxn = positions[s]  # shape: (2, n_timepoints)
 ```
 
-iii. Position was tracked with DeepLabCut at 30 Hz.
+iii. The `position` variable records the animal's tracked location in the 75x75 cm arena at 30 Hz.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The 2D position is discretized into a 3x3 grid (9 classes) by dividing each axis into 3 equal bins over the 75 cm arena. The grid label is `y_bin * 3 + x_bin`.
+i. The 2D position is discretized into a 3x3 grid (9 classes) using `np.floor((coord / arena_size) * 3)`. Each axis is divided into 3 equal bins. The grid label is computed as `y_bin * 3 + x_bin`.
 
 ii.
 ```python
@@ -208,54 +209,42 @@ def discretize_position_3x3(position_xy, arena_size=75.0):
     return (yb * 3 + xb).astype(np.int64)
 ```
 
-iii. The 3x3 discretization matches the task instructions requiring position discretized into 3x3=9 spatial bins.
+iii. The 3x3 discretization matches the decoder task specification and the paper's conceptual partition of the arena.
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. Position is divided into 9 categories using equal-width bins. Each 25 cm segment of the 75 cm arena defines one bin edge. Values at/beyond the boundary are clipped to the nearest valid bin.
+i. Position coordinates are clipped to [0, arena_size - 1e-6], then divided into 3 equal bins per axis using floor division. The resulting 2D bin indices are combined into a single label 0-8 via `y_bin * 3 + x_bin`.
 
-ii. See 4-b code snippet above. `np.floor((x / arena_size) * 3)` creates bins [0, 25), [25, 50), [50, 75).
+ii.
+```python
+x = np.clip(position_xy[0], 0, arena_size - 1e-6)
+y = np.clip(position_xy[1], 0, arena_size - 1e-6)
+xb = np.floor((x / arena_size) * 3).astype(int)
+yb = np.floor((y / arena_size) * 3).astype(int)
+```
 
-iii. Equal-width binning across the arena is the natural choice matching the paper's 3x3 grid partition.
+iii. Clipping ensures positions at the boundaries are assigned to valid bins. The floor-based binning creates equal-width bins of 25 cm each.
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. Position and neural data are sampled at the same 30 Hz rate and share the same frame indices. Both are split into trials using the same slice indices, ensuring frame-for-frame alignment.
+i. Position and neural data are stored at the same 30 Hz frame rate in the data files, so they are aligned frame-for-frame. Both are truncated to the same valid frames and split using the same trial slicing.
 
 ii.
 ```python
+trace_sxn = trace_sxn[:, :n_keep]
+pos_sxn = pos_sxn[:, :n_keep]
+...
 for t in range(n_trials):
     sl = slice(t * FRAMES_PER_TRIAL, (t + 1) * FRAMES_PER_TRIAL)
     neural_trials.append(trace_sxn[:, sl])
-    ...
     output_trials.append(pos_bins[sl][None, :])
 ```
 
-iii. The DAQ acquired behavioral and neural streams simultaneously at 30 Hz, so no interpolation or resampling is needed.
+iii. Both arrays have the same number of timepoints and are sliced identically, ensuring temporal alignment. The `infer_valid_frames` function ensures only the jointly valid portion is used.
 
-## 5-a. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Same as 2-e: 30 Hz native (~33.33 ms bins), no rebinning.
-
-ii.
-```python
-FPS = 30
-'time_bin_size': 1000.0 / FPS,
-```
-
-iii. Both streams are already at the same temporal resolution.
-
-## 5-b. How are the neural, input, and output data temporally aligned?
-
-i. Neural and position data are frame-aligned from the source (same 30 Hz acquisition). Input (geometry) is static per trial. Both neural and output are sliced using identical frame indices within each trial.
-
-ii. See trial splitting code in 1-d and 4-d.
-
-iii. Simultaneous acquisition ensures inherent alignment.
-
-## 6. How are minor issues in the data (e.g., missing data, malformed entries) handled?
-
-i. The AI handles: (1) trailing invalid frames via `infer_valid_frames`, which finds the last frame where both position and neural data are finite; (2) non-finite neurons are removed per-session; (3) sessions with <2 valid trials or zero valid neurons are skipped entirely; (4) remainder frames that don't fill a complete trial are discarded.
+i. The `infer_valid_frames` function detects the last frame where both position and neural data are finite, truncating the session to this range. Neurons with any non-finite values within the valid range are removed. Sessions with fewer than 2 valid trials are excluded.
 
 ii.
 ```python
@@ -269,40 +258,45 @@ def infer_valid_frames(position, trace):
     return int(idx[-1] + 1)
 ```
 
-iii. This approach handles sessions that may have been terminated early or have trailing NaN data.
+iii. This approach robustly handles data quality issues: trailing invalid data (e.g., from session ending) is excluded, neurons with incomplete recordings are filtered, and sessions too short for meaningful analysis are dropped.
 
-## 7-a. What are the most time-consuming steps of the code?
+## 6-a. What are the most time-consuming steps of the code?
 
-i. Loading the joblib files containing large trace arrays is the most time-consuming step (I/O bound). The full conversion took ~291 seconds.
+i. The most time-consuming step is loading the joblib files via `joblib.load()`, which involves deserializing large numpy arrays. Processing (filtering, discretization, trial splitting) is fast by comparison. The full conversion runs in ~291 seconds.
 
 ii. N/A
 
-iii. The trace arrays are large (hundreds of neurons x ~72000 frames per session) and there are 207 sessions across 7 animals.
+iii. The joblib files contain large trace arrays (up to ~950 neurons x ~72000 timepoints per animal). I/O and deserialization dominate the runtime.
 
-## 7-b. What loops in the code could have been vectorized to improve efficiency?
+## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The trial-splitting loop iterates over trials to create slices, but this is already lightweight. The main per-session loop is inherently sequential due to I/O.
+i. The trial slicing loop within `session_to_trials` creates trial slices in a Python loop. This could potentially be vectorized using `np.split` or array reshaping, though the loop is not a significant bottleneck.
 
 ii.
 ```python
 for t in range(n_trials):
     sl = slice(t * FRAMES_PER_TRIAL, (t + 1) * FRAMES_PER_TRIAL)
     neural_trials.append(trace_sxn[:, sl])
+    input_trials.append(env_vec.copy())
+    output_trials.append(pos_bins[sl][None, :])
 ```
 
-iii. The trial splitting could theoretically be done with `np.split` or reshaping, but the performance impact is minimal.
+iii. Since the number of trials per session is small (~39-40), this loop is not a performance bottleneck.
 
-## 7-c. What processing does the code repeat multiple times?
+## 6-c. What processing does the code repeat multiple times?
 
-i. No significant repeated processing is evident. Each session is processed once.
+i. The `env_vec.copy()` call repeats the same geometry vector for each trial within a session, creating redundant copies. The `infer_valid_frames` function is called once per session, which is appropriate.
 
-ii. N/A
+ii.
+```python
+input_trials.append(env_vec.copy())  # repeated for each trial
+```
 
-iii. The code processes each session independently in a single pass.
+iii. Since the environment geometry is static per session, a single computation followed by copies is the expected approach.
 
-## 7-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. No obviously unnecessary processing. The code is fairly streamlined. The `--show-processing` flag is accepted but not implemented ("plotting not yet implemented").
+i. No significant unnecessary processing is identified. The code is lean and focused on the conversion task. The `--show-processing` flag is accepted but not implemented (prints a message instead of generating plots).
 
 ii.
 ```python
@@ -310,44 +304,4 @@ if args.show_processing:
     print('show-processing requested; plotting not yet implemented')
 ```
 
-iii. The code does the minimum required processing.
-
-## 8. How are minor mistakes in the data, e.g. missing data, handled?
-
-i. Same as question 6: trailing invalid frames detected and excluded, non-finite neurons removed, sessions with insufficient data skipped.
-
-ii. See code in question 6.
-
-iii. The approach is conservative, preferring to exclude suspect data rather than impute.
-
-## 9-a. What are the most time-consuming steps of the code?
-
-i. Same as 7-a: loading joblib files is the bottleneck.
-
-ii. N/A
-
-iii. N/A
-
-## 9-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. Same as 7-b.
-
-ii. N/A
-
-iii. N/A
-
-## 9-c. What processing does the code repeat multiple times?
-
-i. Same as 7-c: no significant repeated processing.
-
-ii. N/A
-
-iii. N/A
-
-## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. Same as 7-d: no obviously unnecessary processing.
-
-ii. N/A
-
-iii. N/A
+iii. The lack of processing plot implementation is a minor gap but does not affect the data conversion quality.

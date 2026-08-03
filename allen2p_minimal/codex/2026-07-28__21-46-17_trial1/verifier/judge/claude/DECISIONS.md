@@ -28,11 +28,11 @@ def select_experiments(exp_table, available_ids, max_sessions=None):
 dataset = BehaviorOphysExperiment.from_nwb_path(str(nwb_path), exclude_invalid_rois=True)
 ```
 
-iii. The AI loads NWB files directly rather than using the `VisualBehaviorOphysProjectCache`. It filters to `active_behavior` to select the relevant behavioral sessions. The `exclude_invalid_rois=True` flag pre-filters low-quality ROIs at load time.
+iii. The AI loads data directly from local NWB files rather than using the SDK's S3 cache. It filters to `active_behavior` experiments to focus on sessions where the mouse was actively performing the task, as described in the whitepaper.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are identified by unique `mouse_id` values from the experiment table. They are sorted alphabetically.
+i. Subjects are identified by unique `mouse_id` values from the experiment metadata table. Each experiment's `mouse_id` is tracked and collected into a sorted unique list.
 
 ii.
 ```python
@@ -40,28 +40,27 @@ subjects = sorted({session["mouse_id"] for session in sessions})
 subject_to_idx = {name: idx for idx, name in enumerate(subjects)}
 ```
 
-iii. The `mouse_id` field from the experiment metadata uniquely identifies each animal.
+iii. The `mouse_id` field from the Allen SDK metadata table uniquely identifies each animal.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each `ophys_experiment_id` (a single imaging plane) is treated as a separate decoder session. Multiple planes from the same `ophys_session_id` are NOT merged — they become separate sessions.
+i. Each `ophys_experiment_id` is treated as a separate session. This means each imaging plane is its own session, rather than grouping multiple planes from the same `ophys_session_id` together.
 
 ii.
 ```python
-session = {
-    "experiment_id": int(experiment_id),
+for idx, (_, meta_row) in enumerate(selected_df.iterrows(), start=1):
+    experiment_id = int(meta_row["ophys_experiment_id"])
     ...
-    "ophys_session_id": int(meta_row["ophys_session_id"]),
-    "n_neurons": int(events_matrix.shape[0]),
+    session, stats = load_session(experiment_id=experiment_id, nwb_path=nwb_path, meta_row=meta_row)
     ...
-}
+    sessions.append(session)
 ```
 
 iii. From CONVERSION_NOTES.md: "One decoder session is one `ophys_experiment_id`. An `ophys_experiment_id` is one imaging plane with one ophys timestamp stream. This keeps neural timestamps native and avoids merging planes with different neuron sets."
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are defined using the built-in `dataset.trials` table. Each trial corresponds to one stimulus change event (go or catch). Within each trial, the AI uses the `stimulus_presentations` table to identify the image-presentation intervals, and bins data into those 750ms intervals. The trial spans from `start_time` to `stop_time`.
+i. Trials are defined using the SDK's built-in `trials` table. For each trial, the AI extracts stimulus presentation intervals from the `stimulus_presentations` table that fall within the trial's `start_time` to `stop_time`. Each trial becomes a variable-length sequence of 750ms image-presentation intervals, not individual ophys frames.
 
 ii.
 ```python
@@ -81,17 +80,15 @@ for trial_id, row in valid_trials.iterrows():
     ].copy()
     ...
     stim_start_times = trial_stim["start_time"].to_numpy(dtype=np.float64)
-    bin_edges = np.concatenate(
-        [stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]]
-    )
+    bin_edges = np.concatenate([stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]])
     neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
 ```
 
-iii. The AI uses the stimulus_presentations table to define the temporal bins within each trial, matching the paper's description of 750ms image-presentation intervals. This results in variable-length trials (10-17 intervals per trial).
+iii. From CONVERSION_NOTES.md: The paper's behavioral processing explicitly assigns events to each 750ms image-presentation interval, so the AI chose interval-based binning as the closest match to the references.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials must be `go` or `catch`, not `aborted`, not `auto_rewarded`, and have a finite `change_time`. Additional filters: trials with no stimulus presentations are skipped; trials with non-finite binned neural/running/pupil values are skipped; trials with all-zero neural activity are skipped; go trials must have exactly 1 change flag, catch trials must have 0 change flags. Sessions with fewer than 2 valid trials or missing eye tracking or no valid ROIs are excluded entirely.
+i. Trials are filtered to include only `go` or `catch` trials that are not `aborted`, not `auto_rewarded`, and have a finite `change_time`. Additional filtering: trials with no stimulus presentations are skipped; trials with non-finite binned neural/running/pupil values are skipped; trials with all-zero neural activity are skipped; go trials must have exactly 1 change flag and catch trials must have 0. Sessions with fewer than 2 valid trials are excluded. Sessions missing eye tracking data or with no valid ROIs are also excluded.
 
 ii.
 ```python
@@ -101,25 +98,25 @@ valid_trials = trials[
     & (~trials["auto_rewarded"])
     & np.isfinite(trials["change_time"])
 ].copy()
-
-if len(valid_trials) < 2:
-    return None, {...}
-
-# Per-trial filters:
+...
 if np.any(~np.isfinite(neural_trial)) or np.any(~np.isfinite(running_trial)) or np.any(~np.isfinite(pupil_trial)):
     continue
 if np.all(neural_trial == 0):
     continue
+...
 if bool(row["go"]) and int(change_flags.sum()) != 1:
-    ...
+    session["sanity_change_flag_mismatch_count"] += 1
     continue
+...
+if len(session["neural_trials"]) < 2:
+    return None, {"skip_reason": "too_few_binned_trials", ...}
 ```
 
-iii. The AI applies more aggressive filtering than the reference, including checking for non-finite values and all-zero neural trials. Sessions missing eye tracking data are skipped entirely. The `exclude_invalid_rois=True` flag at load time also pre-filters bad ROIs.
+iii. The AI applies extensive quality controls including sanity checks on change flag consistency. Sessions without eye tracking are skipped entirely rather than handling missing data gracefully.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data is derived from `dataset.events["events"]` — the Allen SDK's inferred calcium events (deconvolved spike-like events), NOT the raw dF/F fluorescence traces.
+i. Neural data is derived from `dataset.events["events"]` — the AllenSDK's inferred calcium events (deconvolved spike-like events), not `dff_traces` (dF/F fluorescence traces).
 
 ii.
 ```python
@@ -130,120 +127,101 @@ iii. From CONVERSION_NOTES.md: "This follows the paper's use of inferred/discret
 
 ## 2-b. How is the `neural` data processed?
 
-i. The events matrix is loaded for a single imaging plane and then temporally binned into 750ms image-presentation intervals using `reduce_to_bins`, which computes the mean of all ophys samples within each interval.
-
-ii.
-```python
-events_matrix = np.vstack(dataset.events["events"].to_numpy()).astype(np.float32)
-...
-neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
-
-def reduce_to_bins(values, timestamps, bin_edges):
-    ...
-    for i in range(n_bins):
-        lo = start_idx[i]
-        hi = end_idx[i]
-        if hi > lo:
-            reduced[:, i] = np.nanmean(values[:, lo:hi], axis=1, dtype=np.float64)
-        else:
-            nearest = np.searchsorted(timestamps, centers[i], side="left")
-            ...
-            reduced[:, i] = values[:, nearest]
-    return reduced
-```
-
-iii. The temporal rebinning averages the neural events within each 750ms stimulus interval, reducing the data from ~11Hz to ~1.33Hz (one value per image flash).
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. Invalid ROIs are excluded at load time via `exclude_invalid_rois=True`. Sessions with no valid ROIs (empty events) are skipped. Trials with non-finite binned neural values or all-zero neural activity are dropped.
+i. The events matrix is extracted per experiment (single imaging plane). Neural data is then temporally rebinned into 750ms image-presentation intervals by averaging (`nanmean`) all ophys frames within each bin. Invalid ROIs are excluded at load time via `exclude_invalid_rois=True`.
 
 ii.
 ```python
 dataset = BehaviorOphysExperiment.from_nwb_path(str(nwb_path), exclude_invalid_rois=True)
-
-if len(dataset.events) == 0:
-    return None, {"skip_reason": "no_valid_rois"}
-
-if np.any(~np.isfinite(neural_trial)):
-    continue
-if np.all(neural_trial == 0):
-    continue
-```
-
-iii. The `exclude_invalid_rois=True` parameter leverages the Allen SDK's built-in quality control. Additional per-trial checks ensure no degenerate data enters the dataset.
-
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
-
-i. Neural data is aligned to the stimulus presentation intervals within each trial. The bin edges are defined by the `start_time` of each stimulus presentation in the change-detection block, plus a final edge at the last start + 750ms. The neural data (ophys events) is averaged within each interval.
-
-ii.
-```python
-trial_stim = stimulus_presentations[
-    (stimulus_presentations["start_time"] >= trial_start - 1e-6)
-    & (stimulus_presentations["start_time"] < trial_stop + 1e-6)
-].copy()
-stim_start_times = trial_stim["start_time"].to_numpy(dtype=np.float64)
-bin_edges = np.concatenate(
-    [stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]]
-)
+events_matrix = np.vstack(dataset.events["events"].to_numpy()).astype(np.float32)
+...
 neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
 ```
 
-iii. From CONVERSION_NOTES.md: "For each kept trial, stimulus intervals were taken from `stimulus_presentations` rows in the change-detection block whose `start_time` falls within the AllenSDK trial `start_time` to `stop_time`."
+Where `reduce_to_bins` averages values within each bin:
+```python
+def reduce_to_bins(values, timestamps, bin_edges):
+    ...
+    reduced[:, i] = np.nanmean(values[:, lo:hi], axis=1, dtype=np.float64)
+    ...
+```
+
+iii. The AI chose to use events (deconvolved signals) following the paper's methodology, and rebins to 750ms intervals to match the image presentation schedule described in the paper.
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. Invalid ROIs are excluded at load time via `exclude_invalid_rois=True`. Sessions with no valid ROIs (`len(dataset.events) == 0`) are skipped entirely. Trials where all neural bins are zero are dropped. Trials with non-finite neural values are dropped.
+
+ii.
+```python
+dataset = BehaviorOphysExperiment.from_nwb_path(str(nwb_path), exclude_invalid_rois=True)
+if len(dataset.events) == 0:
+    return None, {"skip_reason": "no_valid_rois"}
+...
+if np.all(neural_trial == 0):
+    continue
+if np.any(~np.isfinite(neural_trial)):
+    continue
+```
+
+iii. The `exclude_invalid_rois=True` flag leverages the Allen SDK's built-in quality control. Additional checks prevent degenerate trials from entering the dataset.
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Neural data is aligned to stimulus presentation intervals, not to ophys timestamps directly. For each trial, stimulus onset times from `stimulus_presentations` define bin edges, and ophys frames are averaged within each 750ms bin using `reduce_to_bins`.
+
+ii.
+```python
+stim_start_times = trial_stim["start_time"].to_numpy(dtype=np.float64)
+bin_edges = np.concatenate([stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]])
+neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
+```
+
+iii. The AI's temporal alignment is based on stimulus presentation onsets rather than the ophys timestamp stream. This was motivated by the paper's description of 750ms image-presentation intervals. The instructions say "temporally align based on ophys timestamp."
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The temporal resolution is 750ms — the native image-presentation interval. The AI explicitly rebins the data from the native ophys frame rate (~11Hz, ~90ms) to this 750ms interval by averaging within each stimulus presentation window.
+i. The AI rebins data from the native ophys frame rate (~11 Hz, ~93ms) to 750ms image-presentation intervals. The time bin size is hardcoded as 750ms.
 
 ii.
 ```python
 TIME_BIN_MS_DEFAULT = 750.0
 IMAGE_INTERVAL_S = 0.75
 ...
-bin_edges = np.concatenate(
-    [stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]]
-)
+bin_edges = np.concatenate([stim_start_times, [stim_start_times[-1] + IMAGE_INTERVAL_S]])
 ```
 
-iii. From CONVERSION_NOTES.md: "The whitepaper and paper describe the task as 250 ms flashed images plus 500 ms gray. The paper's behavioral processing explicitly assigns events to each 750 ms image-presentation interval."
+iii. From CONVERSION_NOTES.md: "The whitepaper and paper describe the task as 250ms flashed images plus 500ms gray. The paper's behavioral processing explicitly assigns events to each 750ms image-presentation interval."
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. Image identity is derived from the `stimulus_presentations` table, specifically the `image_name` column and `omitted` flag. For omitted intervals, the label is "gray".
+i. Image identity is derived from the `stimulus_presentations` table, specifically the `image_name` column and the `omitted` flag. For omitted intervals, the label is "gray".
 
 ii.
 ```python
 stimulus_presentations = dataset.stimulus_presentations.copy()
 stimulus_presentations = stimulus_presentations[
-    stimulus_presentations["stimulus_block_name"]
-    .fillna("")
-    .str.contains("change_detection")
+    stimulus_presentations["stimulus_block_name"].fillna("").str.contains("change_detection")
 ].copy()
 ...
-session["interval_image_names"].append(
-    [
-        NO_IMAGE_LABEL if omitted else str(image_name)
-        for image_name, omitted in zip(
-            trial_stim["image_name"].tolist(),
-            omitted_flags.tolist(),
-        )
-    ]
-)
+session["interval_image_names"].append([
+    NO_IMAGE_LABEL if omitted else str(image_name)
+    for image_name, omitted in zip(
+        trial_stim["image_name"].tolist(), omitted_flags.tolist()
+    )
+])
 ```
 
-iii. The AI uses the stimulus_presentations table which provides the actual image shown at each interval, including handling omitted flashes (labeled as "gray"). This gives one image label per 750ms interval.
+iii. The AI uses the stimulus_presentations table for per-interval image names, which provides the actual presented image at each 750ms interval. Omitted intervals (where no image was shown) are labeled "gray".
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. Image names are mapped to integer codes via a global sorted mapping built from all unique image names (including "gray") across all sessions.
+i. Image names are mapped to integer codes via a global sorted mapping built from all unique image names across all sessions (including "gray" for omitted intervals). The mapping is applied per interval.
 
 ii.
 ```python
 image_names = {NO_IMAGE_LABEL}  # starts with "gray"
 ...
-for trial_image_names in session["interval_image_names"]:
-    image_names.update(trial_image_names)
+image_names.update(trial_image_names)
 ...
 image_name_to_idx = {name: idx for idx, name in enumerate(sorted(image_names))}
 ...
@@ -253,24 +231,22 @@ image_identity = np.asarray(
 )
 ```
 
-iii. A global mapping ensures consistent integer codes across sessions. The "gray" label for omitted intervals is included as a separate category.
+iii. A global sorted mapping ensures consistent integer codes. The inclusion of "gray" as an image category accounts for omitted stimulus intervals.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Image identity is inherently aligned because it is computed per stimulus-presentation interval — the same intervals used as the time bins for the neural data.
+i. Image identity is inherently aligned because each time bin corresponds to one stimulus presentation interval. The same bin edges used for neural data define the image identity labels.
 
 ii.
 ```python
-# Both use the same bin_edges from stimulus_presentations
-neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
-...
-session["interval_image_names"].append(
-    [NO_IMAGE_LABEL if omitted else str(image_name)
-     for image_name, omitted in zip(trial_stim["image_name"].tolist(), omitted_flags.tolist())]
-)
+# Each interval in trial_stim corresponds to one time bin
+session["interval_image_names"].append([
+    NO_IMAGE_LABEL if omitted else str(image_name)
+    for image_name, omitted in zip(trial_stim["image_name"].tolist(), omitted_flags.tolist())
+])
 ```
 
-iii. Since each time bin corresponds to one stimulus presentation interval, the image name directly maps to each bin.
+iii. Since time bins are defined by stimulus presentation onsets, each bin naturally has one image label.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
@@ -280,14 +256,14 @@ ii.
 ```python
 change_flags = trial_stim["is_change"].fillna(False).to_numpy(dtype=bool)
 ...
-session["interval_change_flags"].append(change_flags.astype(bool).tolist())
+image_change = np.asarray(session["interval_change_flags"][trial_idx], dtype=np.int64)
 ```
 
-iii. The `is_change` flag from the stimulus table directly indicates which interval had the image change.
+iii. The AI uses the SDK's pre-computed `is_change` flag from the stimulus presentations table rather than computing it from `change_time` and the `go` column.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. The `is_change` boolean is converted directly to a binary integer (0 or 1). Go trials have exactly one change interval (verified by sanity check); catch trials have zero change intervals.
+i. The `is_change` boolean from stimulus_presentations is directly converted to 0/1 integer values. For go trials, exactly one interval should have `is_change=True`; for catch trials, zero intervals should. Trials that violate this are excluded.
 
 ii.
 ```python
@@ -299,28 +275,29 @@ if bool(row["catch"]) and int(change_flags.sum()) != 0:
     session["sanity_change_flag_mismatch_count"] += 1
     continue
 ...
-image_change = np.asarray(
-    session["interval_change_flags"][trial_idx], dtype=np.int64
-)
+session["interval_change_flags"].append(change_flags.astype(bool).tolist())
 ```
 
-iii. The AI validates the change flag consistency as a sanity check. Trials with unexpected change flag counts are discarded.
+iii. The AI validates that change flags are consistent with trial type, which serves as a data integrity check.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. Image change is already binary — no thresholding is needed. The value is 1 only on the single change interval (for go trials), 0 everywhere else.
+i. Image change is inherently binary (0 or 1) from the `is_change` flag. No thresholding is needed.
 
-ii. See 4-b above.
+ii.
+```python
+image_change = np.asarray(session["interval_change_flags"][trial_idx], dtype=np.int64)
+```
 
-iii. N/A — it is inherently binary from the `is_change` flag.
+iii. The binary nature of `is_change` directly produces the two categories: `no_change` (0) and `change` (1).
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. Same as image identity — one value per stimulus-presentation interval, inherently aligned with the neural bins.
+i. Same as image identity — each stimulus presentation interval corresponds to one time bin, and the change flag is a per-interval value.
 
-ii. See 3-c.
+ii. See 4-a.
 
-iii. Both neural and change flag data share the same interval-based time bins.
+iii. Alignment is inherent in the interval-based binning approach.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
@@ -330,32 +307,31 @@ ii.
 ```python
 running_speed = dataset.running_speed["speed"].to_numpy(dtype=np.float32)
 running_timestamps = dataset.running_speed["timestamps"].to_numpy(dtype=np.float64)
-running_valid = np.isfinite(running_speed) & np.isfinite(running_timestamps)
-...
-running_speed = running_speed[running_valid]
-running_timestamps = running_timestamps[running_valid]
 ```
 
-iii. Non-finite values in speed and timestamps are filtered out before use.
+iii. The AllenSDK's `running_speed` attribute provides locomotion data from the running wheel encoder.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Running speed is temporally binned into 750ms intervals using `reduce_to_bins` (mean within each interval), then discretized into 5 global quantile bins computed across all sessions.
+i. Running speed values are filtered to remove non-finite entries, then binned into 750ms stimulus intervals by averaging (`nanmean`) all samples within each bin via `reduce_to_bins`. The resulting values are then discretized into 5 equal-percentile bins computed globally across all sessions.
 
 ii.
 ```python
+running_valid = np.isfinite(running_speed) & np.isfinite(running_timestamps)
+running_speed = running_speed[running_valid]
+running_timestamps = running_timestamps[running_valid]
+...
 running_trial = reduce_to_bins(running_speed, running_timestamps, bin_edges)
 ...
 running_edges = compute_quantile_edges(all_running_values, nbins=5)
-...
 running_bins = digitize_with_edges(session["running_cont"][trial_idx], running_edges)
 ```
 
-iii. The interval mean preserves the average behavior within each stimulus presentation window. Global quantile binning ensures balanced bin counts.
+iii. The AI bins running speed by averaging within each 750ms interval before discretization. Quantile-based binning ensures roughly equal class counts across bins.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Running speed is discretized into 5 bins using global quantile edges. The `compute_quantile_edges` function computes 4 internal quantile boundaries (at 20th, 40th, 60th, 80th percentiles), then `digitize_with_edges` uses `np.searchsorted` to assign values to bins 0-4.
+i. Running speed is discretized using global quantile edges computed via `compute_quantile_edges` which finds the 20th, 40th, 60th, and 80th percentiles. Values are then assigned to bins 0-4 using `searchsorted`.
 
 ii.
 ```python
@@ -369,19 +345,18 @@ def digitize_with_edges(values, edges):
     return np.searchsorted(edges, values, side="right").astype(np.int64)
 ```
 
-iii. Quantile-based binning ensures roughly equal counts per bin. Tie-breaking with `np.nextafter` prevents collapsed bins.
+iii. Quantile edges ensure roughly equal bin occupancy across the full dataset.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is binned into the same 750ms stimulus-presentation intervals as the neural data using `reduce_to_bins`, so alignment is inherent.
+i. Running speed is binned into the same 750ms stimulus intervals as the neural data using `reduce_to_bins` with the same bin edges.
 
 ii.
 ```python
 running_trial = reduce_to_bins(running_speed, running_timestamps, bin_edges)
-neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
 ```
 
-iii. Both streams use the same bin edges derived from stimulus presentation times.
+iii. By using the same bin edges for both neural and running data, temporal alignment is guaranteed.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
@@ -391,56 +366,51 @@ ii.
 ```python
 eye_timestamps = dataset.eye_tracking["timestamps"].to_numpy(dtype=np.float64)
 pupil_width = fill_nan_by_time(
-    dataset.eye_tracking["pupil_width"].to_numpy(),
-    eye_timestamps,
+    dataset.eye_tracking["pupil_width"].to_numpy(), eye_timestamps
 )
 ```
 
-iii. `pupil_width` is used as the pupil diameter measure.
+iii. `pupil_width` from the Allen SDK eye tracking module is used as the measure of pupil size.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. NaN values in pupil_width are linearly interpolated in timestamp space using `fill_nan_by_time` (which uses `np.interp`). Then the interpolated signal is temporally binned into 750ms intervals via `reduce_to_bins` (mean). Finally, discretized into 5 global quantile bins.
+i. Pupil width NaN values are filled by linear interpolation in timestamp space (via `fill_nan_by_time`), then binned into 750ms stimulus intervals by averaging within each bin. Finally, values are discretized into 5 global quantile bins.
 
 ii.
 ```python
 def fill_nan_by_time(values, timestamps):
-    values = np.asarray(values, dtype=np.float32)
-    timestamps = np.asarray(timestamps, dtype=np.float64)
     valid = np.isfinite(values) & np.isfinite(timestamps)
     ...
     return np.interp(timestamps, timestamps[valid], values[valid]).astype(np.float32)
 
-pupil_width = fill_nan_by_time(
-    dataset.eye_tracking["pupil_width"].to_numpy(),
-    eye_timestamps,
-)
+pupil_width = fill_nan_by_time(dataset.eye_tracking["pupil_width"].to_numpy(), eye_timestamps)
+...
 pupil_trial = reduce_to_bins(pupil_width, eye_timestamps, bin_edges)
 ...
 pupil_edges = compute_quantile_edges(all_pupil_values, nbins=5)
 pupil_bins = digitize_with_edges(session["pupil_cont"][trial_idx], pupil_edges)
 ```
 
-iii. NaN interpolation fills missing values. Blink frames are NOT explicitly filtered using the `likely_blink` flag — the AI relies on NaN values being present during blinks, which may not always be the case.
+iii. NaN filling by interpolation handles missing pupil data (e.g., blinks) before binning. Note: unlike the reference, the AI does not explicitly filter out blink frames using the `likely_blink` flag before interpolation — it relies on NaN values to implicitly handle blinks.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Same approach as running speed — 5 global quantile bins using `compute_quantile_edges` and `digitize_with_edges`.
+i. Same approach as running speed — global quantile edges with `searchsorted`.
 
-ii. See 5-c for the quantile edge computation. Applied identically to pupil values.
+ii. See 5-c (same `compute_quantile_edges` and `digitize_with_edges` functions).
 
-iii. Same rationale as running speed discretization.
+iii. Same rationale as running speed.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Same as running speed — pupil is binned into the same 750ms stimulus-presentation intervals.
+i. Same as running speed — binned into the same 750ms stimulus intervals using `reduce_to_bins` with the same bin edges.
 
 ii.
 ```python
 pupil_trial = reduce_to_bins(pupil_width, eye_timestamps, bin_edges)
 ```
 
-iii. Same bin edges as neural and running data ensure alignment.
+iii. By using the same bin edges, alignment is guaranteed.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
@@ -448,9 +418,6 @@ i. Trial outcome is derived from the boolean columns `hit`, `miss`, `false_alarm
 
 ii.
 ```python
-TRIAL_OUTCOME_VALUES = ["hit", "miss", "false_alarm", "correct_reject"]
-TRIAL_OUTCOME_TO_INT = {name: idx for idx, name in enumerate(TRIAL_OUTCOME_VALUES)}
-
 def get_trial_outcome(row):
     if bool(row["hit"]):
         return TRIAL_OUTCOME_TO_INT["hit"]
@@ -463,79 +430,86 @@ def get_trial_outcome(row):
     raise ValueError("Trial does not have a valid decoder outcome.")
 ```
 
-iii. These four columns are mutually exclusive for valid (non-aborted, non-auto-rewarded) trials.
+iii. These four boolean columns are the SDK's canonical trial outcomes for the change detection task.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. Trial outcomes are mapped to integer codes (0-3) via a fixed mapping. The integer code is replicated across all time bins (intervals) within the trial.
+i. Trial outcomes are mapped to integer codes (0-3) via a fixed mapping and repeated across all time bins within a trial.
 
 ii.
 ```python
-trial_outcome = np.full(
-    T, session["trial_outcomes"][trial_idx], dtype=np.int64
-)
+TRIAL_OUTCOME_VALUES = ["hit", "miss", "false_alarm", "correct_reject"]
+TRIAL_OUTCOME_TO_INT = {name: idx for idx, name in enumerate(TRIAL_OUTCOME_VALUES)}
+...
+trial_outcome = np.full(T, session["trial_outcomes"][trial_idx], dtype=np.int64)
 ```
 
-iii. The mapping order is `['hit', 'miss', 'false_alarm', 'correct_reject']`, matching the reference.
+iii. The mapping order matches `TRIAL_OUTCOME_VALUES`. The outcome is static per trial but repeated across time bins.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
 i. Several cases are handled:
-- **Missing eye tracking**: Sessions with no eye tracking data are skipped entirely.
-- **No valid ROIs**: Sessions with empty events are skipped.
-- **All-NaN pupil**: Sessions where all pupil values are NaN are skipped.
-- **Missing running speed**: Sessions with no valid running speed data are skipped.
-- **Non-finite binned values**: Trials where any binned neural, running, or pupil value is non-finite are dropped.
-- **All-zero neural**: Trials where all neural values are zero are dropped.
-- **Change flag mismatches**: Go trials without exactly 1 change flag or catch trials with any change flags are dropped.
-- **Too few trials**: Sessions with fewer than 2 valid trials are excluded.
-- **NaN pupil interpolation**: NaN values in pupil_width are interpolated.
+- **Missing eye tracking**: Sessions with empty eye tracking data are skipped entirely.
+- **Missing running data**: Sessions where all running values are non-finite are skipped.
+- **Missing pupil data**: NaN values are linearly interpolated via `fill_nan_by_time`.
+- **All-zero neural**: Trials with all-zero neural activity after binning are dropped.
+- **Non-finite values**: Trials with non-finite neural/running/pupil bins are dropped.
+- **Change flag mismatches**: Trials where go/catch type doesn't match expected change flag count are dropped.
+- **Few trials**: Sessions with fewer than 2 valid trials after all filtering are excluded.
+- **Omitted stimuli**: Labeled as "gray" rather than excluded.
 
 ii.
 ```python
 if len(dataset.eye_tracking) == 0:
     return None, {"skip_reason": "missing_eye_tracking"}
-if len(dataset.events) == 0:
-    return None, {"skip_reason": "no_valid_rois"}
+...
+pupil_width = fill_nan_by_time(dataset.eye_tracking["pupil_width"].to_numpy(), eye_timestamps)
 if pupil_width is None:
     return None, {"skip_reason": "all_pupil_nan"}
 ...
-if np.any(~np.isfinite(neural_trial)) or np.any(~np.isfinite(running_trial)) or np.any(~np.isfinite(pupil_trial)):
+if np.any(~np.isfinite(neural_trial)) or ...:
     continue
 if np.all(neural_trial == 0):
     continue
 ```
 
-iii. The AI applies more aggressive quality filtering than the reference, which may discard additional trials/sessions but ensures cleaner data.
+iii. The AI takes a more aggressive filtering approach than the reference — skipping entire sessions for missing eye tracking rather than handling it gracefully, and dropping individual trials with any non-finite values.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. Loading each NWB experiment file via `BehaviorOphysExperiment.from_nwb_path()` is the most time-consuming step, as it reads large neural, behavioral, and stimulus data from disk.
+i. The most time-consuming step is loading each experiment via `BehaviorOphysExperiment.from_nwb_path()`, which reads large NWB files containing neural, behavioral, and stimulus data.
 
 ii. N/A
 
-iii. Each NWB file contains full-session neural events, running speed, eye tracking, trials, and stimulus presentations.
+iii. Each NWB file contains full-session data arrays. The AI processes experiments sequentially.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The `reduce_to_bins` function iterates over bins in a Python for-loop to compute per-bin means. This could be vectorized. The per-trial loop in `load_session` also iterates sequentially over trials.
+i. The per-trial loop that calls `reduce_to_bins` for neural, running, and pupil data separately for each trial could potentially be vectorized. The `reduce_to_bins` function itself contains a per-bin loop.
 
 ii.
 ```python
-def reduce_to_bins(values, timestamps, bin_edges):
+for trial_id, row in valid_trials.iterrows():
     ...
-    for i in range(n_bins):
-        lo = start_idx[i]
-        hi = end_idx[i]
-        if hi > lo:
-            reduced[:, i] = np.nanmean(values[:, lo:hi], axis=1, dtype=np.float64)
+    neural_trial = reduce_to_bins(events_matrix, ophys_timestamps, bin_edges)
+    running_trial = reduce_to_bins(running_speed, running_timestamps, bin_edges)
+    pupil_trial = reduce_to_bins(pupil_width, eye_timestamps, bin_edges)
 ```
 
-iii. The loop over bins is relatively small (10-17 bins per trial), so the overhead is modest compared to I/O.
+And within `reduce_to_bins`:
+```python
+for i in range(n_bins):
+    lo = start_idx[i]
+    hi = end_idx[i]
+    if hi > lo:
+        reduced[:, i] = np.nanmean(values[:, lo:hi], axis=1, dtype=np.float64)
+```
+
+iii. The inner loop in `reduce_to_bins` iterates over each bin and computes nanmean, which could be vectorized.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. The `reduce_to_bins` function is called separately for neural, running, and pupil data with the same bin edges for each trial. The bin edge computation (searchsorted) is duplicated across these calls. Additionally, `convert_sessions_to_dataset` is called twice — once for the full dataset and once for the sample dataset.
+i. The `reduce_to_bins` function is called three times per trial (neural, running, pupil) with the same bin edges but different data streams. The searchsorted within each call recomputes the same temporal indices. Additionally, `convert_sessions_to_dataset` is called twice — once for the full dataset and once for the sample dataset, reprocessing shared sessions.
 
 ii.
 ```python
@@ -548,20 +522,21 @@ full_data = convert_sessions_to_dataset(sessions=sessions, ...)
 sample_data = convert_sessions_to_dataset(sessions=sample_sessions, ...)
 ```
 
-iii. The repeated `searchsorted` calls in `reduce_to_bins` could be precomputed once and shared.
+iii. The repeated `searchsorted` calls within `reduce_to_bins` compute overlapping index lookups.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The AI computes detailed sanity check statistics (omitted interval counts, change flag mismatch counts, pre-change omission counts) that are stored in session metadata but are not used in decoder training. It also collects extensive per-session statistics and session summary DataFrames.
+i. The AI collects extensive sanity check statistics (omission counts, change flag mismatch counts) per session that are stored in session metadata but not used by the decoder. The `summarize_sessions` function builds a full DataFrame of per-session statistics. The sample dataset is a redundant subset of the full dataset.
 
 ii.
 ```python
 session["sanity_total_omitted_intervals"] += int(omitted_flags.sum())
-session["sanity_change_interval_omission_count"] += int(omitted_flags[change_idx].sum())
-session["sanity_pre_change_omission_count"] += int(omitted_flags[change_idx[0] - 1])
+session["sanity_change_interval_omission_count"] += ...
+session["sanity_pre_change_omission_count"] += ...
+session["sanity_change_flag_mismatch_count"] += ...
 ...
 session_summary = summarize_sessions(session_stats, sessions)
 full_data["metadata"]["session_summary"] = session_summary.to_dict(orient="records")
 ```
 
-iii. These statistics are useful for validation but don't affect downstream decoder training.
+iii. While useful for validation, these statistics are not used by the downstream decoder. The sample dataset conversion is extra processing.

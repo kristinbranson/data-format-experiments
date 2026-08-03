@@ -2,10 +2,15 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads every NWB file matching `sub-*/sub-*_behavior+ophys.nwb` under the data directory, sorts them by parsed subject/session, and converts each file with `build_session()`. It reads the NWB files directly with `h5py` rather than `pynwb`.
+i. The AI loads all session files by globbing every `sub-*/sub-*_behavior+ophys.nwb` file under `/app/data`, sorting them by subject/session parsed from the pathname, and then opening each NWB file directly with `h5py`. Trial data are produced inside `build_session()` after the file is opened.
 
 ii.
 ```python
+def subject_session_key(path: Path):
+    subject = int(path.parent.name.split("-m")[-1])
+    session = int(path.stem.split("_ses-")[-1].split("_")[0])
+    return subject, session
+
 def build_full_dataset(data_dir: Path):
     session_records = []
     for path in sorted(data_dir.glob("sub-*/sub-*_behavior+ophys.nwb"), key=subject_session_key):
@@ -16,18 +21,21 @@ def build_full_dataset(data_dir: Path):
 ```python
 def build_session(path: Path):
     with h5py.File(path, "r") as f:
+        ...
 ```
 
-iii. The trajectory shows the agent inspected the NWB layout directly and then chose `h5py` after confirming it was available. `CONVERSION_NOTES.md` says the conversion uses the public NWB export as the source data.
+iii. `CONVERSION_NOTES.md` says the conversion follows the public NWB export while mirroring the paper/code logic. The notes also justify this as complete coverage by reporting `11` converted mice and `152` converted sessions.
 
-## 1-b. How are the data split into subjects (mice)?
+## 1-b. How are the data split into subjects?
 
-i. Sessions are grouped by the subject ID stored in each NWB file. The subject list is built from the converted session records, and `subject_idx` maps each session back to that subject.
+i. Subjects are identified per file from the NWB metadata field `general/subject/subject_id`, then deduplicated in file order to build `subjects` and `subject_idx`.
 
 ii.
 ```python
-subject = decode_scalar(f["general/subject/subject_id"][()])
-...
+with h5py.File(path, "r") as f:
+    subject = decode_scalar(f["general/subject/subject_id"][()])
+```
+```python
 subjects = []
 subject_to_idx = {}
 for record in session_records:
@@ -37,11 +45,11 @@ for record in session_records:
         subjects.append(subject)
 ```
 
-iii. The notes treat mice as the manuscript cohort and report manuscript-level checks by subject count, indicating the AI relied on NWB subject metadata rather than only directory names.
+iii. The notes justify the subject split with manuscript-level sanity checks: `11` converted mice, matching the switch-task cohort.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each NWB file is treated as one session. Session order is determined by parsing the subject and session number from the file path.
+i. Each NWB file is treated as one session. Session ordering comes from sorting file paths by parsed subject ID and session number.
 
 ii.
 ```python
@@ -55,11 +63,11 @@ for path in sorted(data_dir.glob("sub-*/sub-*_behavior+ophys.nwb"), key=subject_
     record = build_session(path)
 ```
 
-iii. The trajectory repeatedly refers to “every NWB session” and the final dataset summary counts 152 sessions, so the AI explicitly treated one file as one session.
+iii. The justification is implicit in the code structure and in the notes’ per-session reporting. The notes treat each converted NWB file as one imaging session and report per-session sanity statistics.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials start where `trial_start > 0`. Instead of using `teleport` to end trials, the AI takes frames until the last frame before leaving the 0 to 450 cm corridor, using `position` within the interval up to the next trial start.
+i. Trials are segmented from frames where `trial_start > 0`. For each start, the AI ends the trial at the last frame before the next start whose position remains on the 0 to 450 cm corridor. It does not use the `teleport` variable directly.
 
 ii.
 ```python
@@ -71,110 +79,124 @@ def find_trial_segments(position: np.ndarray, trial_start: np.ndarray):
     for start, next_start in zip(starts, next_starts):
         trial_pos = position[start:next_start]
         valid = np.flatnonzero((trial_pos >= 0.0) & (trial_pos <= 450.5))
-        ...
+        if len(valid) == 0:
+            continue
         end = start + valid[-1] + 1
+        ...
+        ends.append(end)
 ```
 ```python
 starts, ends = find_trial_segments(position, trial_start)
 ```
 
-iii. `CONVERSION_NOTES.md` justifies this as matching the paper’s 450 cm track, explicitly stating that frames are kept from `trial_start` until the last frame still on the corridor and that teleport-zone frames are excluded.
+iii. `CONVERSION_NOTES.md` explicitly justifies this choice: trials are aligned to `trial_start`, and only corridor frames in `[0, 450]` cm are kept because the AI considered that to better match the reference focus on the 450 cm track rather than the teleport period.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI does not apply the reference solution’s explicit minimum-length trial filter. It only drops degenerate trial segments implicitly when no valid corridor frames are found, and raises an error if a session ends up with fewer than two trials.
+i. The AI does not apply the reference solution’s explicit minimum-length trial filter. Instead, it drops candidate trial segments with no valid corridor frames, ignores zero-length segments, and raises an error if a session ends up with fewer than two trials.
 
 ii.
 ```python
-for start, next_start in zip(starts, next_starts):
-    trial_pos = position[start:next_start]
-    valid = np.flatnonzero((trial_pos >= 0.0) & (trial_pos <= 450.5))
-    if len(valid) == 0:
-        continue
+valid = np.flatnonzero((trial_pos >= 0.0) & (trial_pos <= 450.5))
+if len(valid) == 0:
+    continue
+end = start + valid[-1] + 1
+if end <= start:
+    continue
 ```
 ```python
+starts, ends = find_trial_segments(position, trial_start)
 ntrials = len(starts)
 if ntrials < 2:
     raise ValueError(f"{path.name}: expected at least 2 trials, found {ntrials}")
 ```
 
-iii. No explicit short-trial justification appears in the notes or trajectory. The notes frame the main trial-quality choice as excluding teleport-zone frames rather than dropping short trials.
+iii. The notes frame this as part of the trial-window definition: only corridor frames are retained and teleport-zone frames are excluded. No explicit justification for omitting a short-trial filter was recorded.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The final neural matrices come from NWB `processing/ophys/Deconvolved` event traces after cell filtering. The filtering step also consults `Fluorescence` and `Neuropil` to compute the interneuron mask.
-
-ii.
-```python
-events = f["processing/ophys/Deconvolved"]
-...
-plane_data = np.asarray(events[plane_name]["data"][:common_length, curated_mask], dtype=np.float32)
-```
-```python
-fluorescence = f["processing/ophys/Fluorescence"]
-neuropil = f["processing/ophys/Neuropil"]
-```
-
-iii. `CONVERSION_NOTES.md` says the decoder neural input uses NWB deconvolved traces, while fluorescence and neuropil are only reconstructed “for the putative-interneuron screen.”
-
-## 2-b. How is the `neural` data processed?
-
-i. The AI keeps curated ROIs, reconstructs per-trial dF/F only to identify putative interneurons, excludes those interneurons, then uses the remaining deconvolved event traces as the neural signal. It concatenates curated cells across planes.
+i. The final decoder neural signal is taken from `processing/ophys/Deconvolved`. Additional raw variables from `Fluorescence`, `Neuropil`, and `ImageSegmentation/PlaneSegmentation/iscell` are used only for cell filtering.
 
 ii.
 ```python
 plane_masks = get_curated_plane_masks(f)
-is_int = compute_interneuron_mask(f, plane_masks, starts, ends, speed, common_length)
-keep_mask = ~is_int
+...
 events = load_curated_events(f, plane_masks, keep_mask, common_length)
 ```
 ```python
+def load_curated_events(...):
+    events = f["processing/ophys/Deconvolved"]
+    ...
+    plane_data = np.asarray(events[plane_name]["data"][:common_length, curated_mask], dtype=np.float32)
+```
+
+iii. `CONVERSION_NOTES.md` states that the decoder neural input uses the NWB `processing/ophys/Deconvolved` traces, and that fluorescence and neuropil are reconstructed only for the interneuron screen.
+
+## 2-b. How is the `neural` data processed?
+
+i. The AI concatenates curated cells across planes, crops all streams to a shared `common_length`, excludes putative interneurons, and then slices the deconvolved events into per-trial `(neurons, time)` matrices. It does not further smooth or bin the final neural signal.
+
+ii.
+```python
+dense_lengths = [...]
+for grp_name in ("Deconvolved", "Fluorescence", "Neuropil"):
+    grp = f[f"processing/ophys/{grp_name}"]
+    for plane_name in get_plane_names(grp):
+        dense_lengths.append(grp[plane_name]["data"].shape[0])
+common_length = min(dense_lengths)
+```
+```python
+events = load_curated_events(f, plane_masks, keep_mask, common_length)
+...
 neural = events[start:end].T.astype(np.float32)
 neural_trials.append(neural)
 ```
 
-iii. The notes say this mirrors manuscript/code logic: use exported deconvolved events for decoding, but reconstruct dF/F with neuropil subtraction, maximin baseline, and smoothing for the interneuron screen.
+iii. The notes justify this as using the NWB deconvolved traces directly while matching the paper/code logic for curated-cell selection and extra interneuron exclusion.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. First the AI keeps only manually curated ROIs where `iscell[:, 0] == 1`. It then removes putative interneurons defined by correlation between reconstructed dF/F and speed greater than `0.5`.
+i. The AI keeps only manually curated ROIs (`iscell[:, 0] == 1`) and then applies an extra interneuron exclusion step: it reconstructs per-trial dF/F from fluorescence and neuropil and removes cells with `corr(dff, speed) > 0.5`.
 
 ii.
 ```python
+seg = f["processing/ophys/ImageSegmentation/PlaneSegmentation"]
 iscell = np.asarray(seg["iscell"])[:, 0].astype(bool)
 ...
 masks[plane_name] = mask
 ```
 ```python
-corr = np.divide(
-    numerator,
-    denom,
-    out=np.zeros_like(numerator, dtype=np.float32),
-    where=denom > 0,
-)
+trial_roi = f_roi[:, start:end] - 0.7 * f_neu[:, start:end]
+trial_roi = trial_roi + 0.7 * np.mean(f_neu[:, start:end], axis=1, keepdims=True)
+baseline = gaussian_filter1d(trial_roi, sigma=15, axis=1, mode="nearest")
+baseline = minimum_filter1d(baseline, size=300, axis=1, mode="nearest")
+baseline = maximum_filter1d(baseline, size=300, axis=1, mode="nearest")
+trial_dff = (trial_roi - baseline) / np.abs(baseline)
+trial_dff = gaussian_filter1d(trial_dff, sigma=2, axis=1, mode="nearest")
+...
 all_is_int.append(corr > 0.5)
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly justifies both filters, and trajectory step 42 states the plan to use `iscell[:,0] == 1` plus the paper/code interneuron rule `corr(dff, speed) > 0.5`.
+iii. `CONVERSION_NOTES.md` explicitly justifies this as matching the manuscript criterion and `dayData.py`, and reports that the removal fraction was small, consistent with the paper.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural trials are aligned to trial start. For each trial, the AI slices the event matrix from the `trial_start` frame to the trial end chosen by `find_trial_segments()`.
+i. The neural data are aligned to trial start by segmenting each trial from `trial_start`, then taking the deconvolved event rows between each trial’s `start:end` indices.
 
 ii.
 ```python
 starts, ends = find_trial_segments(position, trial_start)
 ...
 for trial_idx, (start, end) in enumerate(zip(starts, ends)):
-    ...
     neural = events[start:end].T.astype(np.float32)
+    neural_trials.append(neural)
 ```
 
-iii. The notes explicitly say “Trials are aligned to `trial_start`,” and the metadata names the alignment event as “trial start / entry onto the 0 cm corridor position.”
+iii. The notes explicitly say trials are aligned to `trial_start`.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The AI keeps the native frame resolution and does not rebin. It records the bin size as the median frame interval from `position/timestamps`, about 64.5 ms.
+i. The converted data stay at the native frame resolution. The AI estimates the bin size from the median difference of the behavioral timestamps and stores it as milliseconds. No temporal rebinning is applied.
 
 ii.
 ```python
@@ -183,11 +205,11 @@ dt_seconds = float(np.median(np.diff(position_ts)))
 "time_bin_size_ms": float(np.median(dt_all) * 1000.0),
 ```
 
-iii. `CONVERSION_NOTES.md` says the median frame interval is `0.0644836 s` (`64.4836 ms`) and that this matches the approximately `15.5 Hz` per-plane sampling in the paper.
+iii. The notes justify this with a timing sanity check: the median frame interval was `0.0644836` s (`64.4836` ms), matching the approximately `15.5 Hz` per-plane sampling described in the paper.
 
 ## 3-a. What variables in the raw data is `input` *Time from start of trial in seconds* derived from?
 
-i. The AI derives this input from `processing/behavior/BehavioralTimeSeries/position/timestamps`, not from `trial number` timestamps.
+i. The AI derives this input from the `position/timestamps` behavioral timestamp stream.
 
 ii.
 ```python
@@ -196,42 +218,37 @@ position_ts = np.asarray(beh["position/timestamps"], dtype=np.float64)
 time_trial = (position_ts[start:end] - position_ts[start]).astype(np.float32)
 ```
 
-iii. No separate justification is given in the notes beyond treating the behavior streams as frame-aligned and using trial-relative timestamps after clipping all streams to a common length.
+iii. No separate explicit justification was recorded beyond the general alignment logic. The code uses `position_ts` because all per-frame signals were handled on that shared timestamp grid after cropping.
 
 ## 3-b. What processing is involved in computing `input` *Time from start of trial in seconds*?
 
-i. For each trial, the AI subtracts the first timestamp in that trial from every timestamp in the same slice.
+i. For each trial, it subtracts the first timestamp in the trial from every timestamp in that trial.
 
 ii.
 ```python
 time_trial = (position_ts[start:end] - position_ts[start]).astype(np.float32)
-...
-inputs = np.vstack([
-    time_trial,
 ```
 
-iii. This is implicit in the code and consistent with the notes’ description of `time_from_trial_start_s`. No extra justification beyond trial-start alignment is given.
+iii. The justification is implicit in the alignment requirement and the notes’ statement that trials are aligned to `trial_start`.
 
 ## 3-c. How is the `input` *Time from start of trial in seconds* aligned with the neural data?
 
-i. The time vector uses the exact same `start:end` frame indices as the neural slice. All streams are truncated to the common minimum length before trial extraction.
+i. The same `start:end` indices are used for timestamps and deconvolved events after all streams are cropped to a shared `common_length`.
 
 ii.
 ```python
 common_length = min(dense_lengths)
-...
 position_ts = position_ts[:common_length]
 ...
-for trial_idx, (start, end) in enumerate(zip(starts, ends)):
-    time_trial = (position_ts[start:end] - position_ts[start]).astype(np.float32)
-    neural = events[start:end].T.astype(np.float32)
+neural = events[start:end].T.astype(np.float32)
+time_trial = (position_ts[start:end] - position_ts[start]).astype(np.float32)
 ```
 
-iii. The notes describe the aligned behavior timestamps as matching the imaging frame rate. The agent’s process justification is therefore that simple shared frame indexing is sufficient after clipping streams to the same length.
+iii. The notes justify this with timing checks and with the explicit choice to align all trial streams to `trial_start`.
 
 ## 4-a. What variables in the raw data is `input` *Environment type* derived from?
 
-i. The final environment input is derived from the session `identifier` string, specifically the parsed `scene` name, not directly from the framewise `environment` behavior series. The behavior `environment` series is used only as a sanity check.
+i. The stored decoder input is derived from the session `identifier` string, specifically its scene name, not from the raw `environment` time series. The raw `environment` stream is only used as a validation check.
 
 ii.
 ```python
@@ -241,58 +258,67 @@ scene = identifier.split("/")[-1]
 env_by_trial, zone_labels, zone_idx, zone_bounds = scene_schedule(scene, ntrials)
 ```
 ```python
-inputs = np.vstack([
-    time_trial,
-    np.full(time_trial.shape[0], env_by_trial[trial_idx], dtype=np.float32),
+env_vals = environment[start:end]
+env_vals = env_vals[env_vals >= 0]
+behavior_env_by_trial.append(int(round(float(np.median(env_vals)))))
+...
+env_mismatch = int(np.sum(env_by_trial != np.asarray(behavior_env_by_trial, dtype=np.int64)))
 ```
 
-iii. `CONVERSION_NOTES.md` says the AI “reproduced the same schedule logic as `reward_relative.behavior.get_reward_zones`” and uses `Env1 -> 0`, `Env2 -> 1`, while also reporting a sanity check that parsed schedule and behavior stream matched on every trial.
+iii. `CONVERSION_NOTES.md` justifies this by saying it reproduced the paper/code reward-zone schedule from scene names and verified that the parsed environment schedule matched the behavior stream on every trial.
 
 ## 4-b. What processing is involved in computing `input` *Environment type*?
 
-i. The AI regex-parses the scene name, assigns a fixed environment for constant sessions, and for switch sessions splits trials at trial 30. It then broadcasts the per-trial environment label across all frames in the trial.
+i. The AI parses the scene name with regexes, maps `Env1 -> 0` and `Env2 -> 1`, applies a hard-coded switch split at trial `30` for switch sessions, and then fills a constant value across each trial’s timepoints.
 
 ii.
 ```python
+ENV_TO_IDX = {"Env1": 0, "Env2": 1}
+CHANGE_TRIAL = 30
+...
 fixed_match = re.fullmatch(r"(Env[12])_Location([ABC])", scene)
 same_env_switch_match = re.fullmatch(r"(Env[12])_Location([ABC])_to_([ABC])", scene)
 env_switch_match = re.fullmatch(r"(Env[12])_([ABC])_to_(Env[12])_([ABC])", scene)
-...
-split = min(change_trial, ntrials)
 ```
 ```python
-np.full(time_trial.shape[0], env_by_trial[trial_idx], dtype=np.float32),
+inputs = np.vstack([
+    time_trial,
+    np.full(time_trial.shape[0], env_by_trial[trial_idx], dtype=np.float32),
+    ...
+])
 ```
 
-iii. The notes justify this by saying it mirrors the manuscript/code reward-zone schedule logic and explicitly handles day-8 environment-switch sessions.
+iii. The notes explicitly justify the `30`-trial split and special handling of day-8 environment-switch sessions as matching the manuscript/code conventions.
 
 ## 5-a. What variables in the raw data is `input` *Trial number* derived from?
 
-i. Trial number is derived from the order of the extracted trial loop, i.e. the within-session trial index after segmentation.
+i. Trial number is derived from the segmented-trial loop index, which itself comes from the `trial_start`-based trial segmentation.
 
 ii.
 ```python
+starts, ends = find_trial_segments(position, trial_start)
+...
 for trial_idx, (start, end) in enumerate(zip(starts, ends)):
     ...
     np.full(time_trial.shape[0], trial_idx, dtype=np.float32),
 ```
 
-iii. `CONVERSION_NOTES.md` states that `trial_number` is `0`-indexed within session.
+iii. The notes explicitly say `trial_number` is `0`-indexed within session.
 
 ## 5-b. What processing is involved in computing `input` *Trial number*?
 
-i. There is no processing beyond taking the loop index and repeating it across all timepoints in the trial.
+i. No additional processing is applied beyond filling the per-trial loop index across all timepoints of that trial.
 
 ii.
 ```python
 np.full(time_trial.shape[0], trial_idx, dtype=np.float32),
 ```
 
-iii. The notes explicitly say the variable is `0`-indexed within session; no further transformation is described.
+iii. `CONVERSION_NOTES.md` justifies this as matching the aligned behavior stream and being `0`-indexed within session.
 
 ## 6-a. What variables in the raw data is `input` *Previous trial outcome* derived from?
 
-i. Previous trial outcome is derived from NWB `Reward/timestamps`, combined with per-trial start and end timestamps from `position/timestamps`.
+i. It is derived from the reward-event timestamp stream `processing/behavior/BehavioralTimeSeries/Reward/timestamps`, together with the per-trial time boundaries taken from `position_ts[start:end]`.
 
 ii.
 ```python
@@ -303,47 +329,57 @@ reward_outcome.append(
 )
 ```
 
-iii. The notes say “previous_trial_outcome uses the previous imaged trial in the same session,” and reward outcome is derived from sparse reward timestamps within each trial.
+iii. The notes justify reward outcome as derived from the sparse NWB reward timestamps within each trial.
 
 ## 6-b. What processing is involved in computing `input` *Previous trial outcome*?
 
-i. The AI first computes a binary `reward_outcome` for every trial by checking whether any reward timestamp falls inside the trial window. It then assigns each trial the previous trial’s outcome, with the first trial hard-coded to `0`.
+i. First, the AI computes a binary `reward_outcome` per trial by checking whether any reward timestamp falls inside the current trial. Then it assigns `previous_trial_outcome` from the previous imaged trial’s reward outcome, with the first trial set to `0`.
 
 ii.
 ```python
-reward_trial = reward_outcome[trial_idx]
-prev_reward = reward_outcome[trial_idx - 1] if trial_idx > 0 else 0
+reward_outcome.append(
+    int(np.any((reward_ts >= position_ts[start]) & (reward_ts <= position_ts[end - 1] + 1e-9)))
+)
 ...
+prev_reward = reward_outcome[trial_idx - 1] if trial_idx > 0 else 0
+```
+```python
 np.full(time_trial.shape[0], prev_reward, dtype=np.float32),
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly says the first trial is set to `0` and that previous-trial outcome is defined from the previous imaged trial.
+iii. `CONVERSION_NOTES.md` explicitly says the first trial is set to `0` and that the previous-trial label uses the previous imaged trial in the same session.
 
 ## 7-a. What variables in the raw data is `output` *Distance to reward zone* derived from?
 
-i. The distance output is derived from trial position plus reward-zone bounds inferred from the parsed `scene` schedule. The framewise `reward_zone` behavior stream is only used for a sanity check, not for the actual decoder target.
+i. The stored output is derived from the clipped per-trial position trace plus reward-zone bounds inferred from the scene name and session schedule. The raw `reward_zone` time series is used only to validate the inferred schedule, not to generate the label.
 
 ii.
 ```python
 env_by_trial, zone_labels, zone_idx, zone_bounds = scene_schedule(scene, ntrials)
 ...
+pos_trial = np.clip(position[start:end], 0.0, 450.0)
 zone_start, zone_end = zone_bounds[trial_idx]
-...
-discretize_distance_to_zone(pos_trial, zone_start, zone_end),
+outputs = np.vstack([
+    discretize_distance_to_zone(pos_trial, zone_start, zone_end),
+    ...
+])
 ```
 ```python
 zone_vals = reward_zone[start:end] > 0
 if np.any(zone_vals):
     zone_pos = np.clip(position[start:end][zone_vals], 0.0, 450.0)
-    ...
-    parsed_zone_matches += int(inferred == zone_labels[trial_idx])
+    center = float(np.mean(zone_pos))
+    inferred = min(
+        ZONE_BOUNDS_CM,
+        key=lambda label: abs(center - np.mean(ZONE_BOUNDS_CM[label])),
+    )
 ```
 
-iii. The notes justify this by saying the conversion follows paper/code reward-zone schedules from scene names and then checks that those parsed schedules match observed reward-zone occupancy.
+iii. The notes justify this by saying the AI reproduced the same reward-zone schedules from scene names as the manuscript/code and verified perfect agreement with observed reward-zone occupancy when it was present.
 
 ## 7-b. What processing is involved in computing `output` *Distance to reward zone*?
 
-i. The AI computes signed distance to the active reward zone: negative before the zone, zero inside it, positive after it.
+i. For each timepoint, the AI computes signed distance to the active 50 cm reward zone: negative before the zone, `0` inside the zone, positive after the zone. It then discretizes that continuous distance.
 
 ii.
 ```python
@@ -355,11 +391,11 @@ def discretize_distance_to_zone(position_cm: np.ndarray, zone_start: float, zone
     dist[after] = position_cm[after] - zone_end
 ```
 
-iii. `CONVERSION_NOTES.md` gives exactly this interpretation and says it is distance to the nearest point in the active 50 cm reward zone.
+iii. `CONVERSION_NOTES.md` states this rule explicitly and says it matches the signed distance to the nearest point in the active reward zone.
 
 ## 7-c. How is `output` *Distance to reward zone* thresholded into categories?
 
-i. The signed distance is manually thresholded into seven categories matching the requested bins.
+i. The AI manually thresholds the signed distance into seven bins: `< -50`, `[-50, -10)`, `[-10, 0)`, `0`, `(0, 10]`, `(10, 50]`, and `> 50`.
 
 ii.
 ```python
@@ -372,27 +408,24 @@ bins[(dist > 10.0) & (dist <= 50.0)] = 5
 bins[dist > 50.0] = 6
 ```
 
-iii. The notes list the same distance interpretation and state that the decoder outputs are stored as categorical arrays.
+iii. The notes justify these bins as following the decoder task specification.
 
 ## 7-d. How is `output` *Distance to reward zone* aligned with the neural data?
 
-i. The distance categories are computed from the same `start:end` trial slices used for the neural data, so alignment is by shared frame indices.
+i. It is aligned by taking the same per-trial `start:end` slices from position as from the deconvolved event matrix.
 
 ii.
 ```python
 for trial_idx, (start, end) in enumerate(zip(starts, ends)):
     pos_trial = np.clip(position[start:end], 0.0, 450.0)
-    ...
     neural = events[start:end].T.astype(np.float32)
-    outputs = np.vstack([
-        discretize_distance_to_zone(pos_trial, zone_start, zone_end),
 ```
 
-iii. The notes describe all decoder inputs and outputs as aligned framewise to the trial-aligned imaging stream.
+iii. The notes justify this with the same trial-alignment logic used throughout the conversion.
 
 ## 8-a. What variables in the raw data is `output` *Absolute position* derived from?
 
-i. Absolute position is derived from the framewise `position` behavior series.
+i. It is derived from the raw behavioral `position` time series, clipped to the 0 to 450 cm corridor before binning.
 
 ii.
 ```python
@@ -401,28 +434,11 @@ position = np.asarray(beh["position/data"], dtype=np.float32)
 pos_trial = np.clip(position[start:end], 0.0, 450.0)
 ```
 
-iii. The notes refer to a 450 cm virtual linear track and use clipped corridor positions for trial outputs.
+iii. The notes justify this as focusing on the 450 cm track and excluding teleport frames.
 
 ## 8-b. What processing is involved in computing `output` *Absolute position*?
 
-i. The AI clips positions to the corridor range `[0, 450]` and then bins them.
-
-ii.
-```python
-pos_trial = np.clip(position[start:end], 0.0, 450.0)
-...
-discretize_position(pos_trial),
-```
-```python
-def discretize_position(position_cm: np.ndarray):
-    clipped = np.clip(position_cm, 0.0, 450.0)
-```
-
-iii. `CONVERSION_NOTES.md` justifies the corridor clipping through the trial-window decision: teleport-zone frames are excluded and the corridor is treated as 0 to 450 cm.
-
-## 8-c. How is `output` *Absolute position* thresholded into categories?
-
-i. The AI divides the 0 to 450 cm corridor into five equal 90 cm bins by computing `floor(position / 90)`, with values above 4 clipped back to 4.
+i. The AI clips position to `[0, 450]` cm and then places it into five equal 90 cm bins using `floor(position / 90)`, with values above the final bin clipped to bin `4`.
 
 ii.
 ```python
@@ -433,24 +449,36 @@ def discretize_position(position_cm: np.ndarray):
     return bins
 ```
 
-iii. The notes explicitly say “Absolute position uses five equal 90 cm corridor bins.”
+iii. `CONVERSION_NOTES.md` explicitly justifies this as “five equal 90 cm corridor bins.”
 
-## 8-d. How is `output` *Absolute position* aligned with the neural data?
+## 8-c. How is `output` *Absolute position* thresholded into categories?
 
-i. Position bins are computed from the same per-trial `start:end` frame slices used for the neural matrix.
+i. The thresholding is the same 90 cm corridor binning: `0-90`, `90-180`, `180-270`, `270-360`, and `360-450` cm, encoded as integer categories `0` through `4`.
 
 ii.
 ```python
-for trial_idx, (start, end) in enumerate(zip(starts, ends)):
-    pos_trial = np.clip(position[start:end], 0.0, 450.0)
-    neural = events[start:end].T.astype(np.float32)
+clipped = np.clip(position_cm, 0.0, 450.0)
+bins = np.floor(clipped / 90.0).astype(np.int64)
+bins[bins > 4] = 4
 ```
 
-iii. No extra alignment step is documented; the AI’s stated logic is shared frame indexing after trial alignment.
+iii. The notes justify this as matching the instruction for five equal-sized bins on the 450 cm corridor.
+
+## 8-d. How is `output` *Absolute position* aligned with the neural data?
+
+i. Position uses the same `start:end` frame indices as the neural data for each trial.
+
+ii.
+```python
+pos_trial = np.clip(position[start:end], 0.0, 450.0)
+neural = events[start:end].T.astype(np.float32)
+```
+
+iii. The justification is the same trial-start alignment described in the notes.
 
 ## 9-a. What variables in the raw data is `output` *Lick* derived from?
 
-i. Lick is derived from the framewise NWB `lick` behavior series.
+i. It is derived from the behavioral `lick` time series.
 
 ii.
 ```python
@@ -459,39 +487,34 @@ lick = np.asarray(beh["lick/data"], dtype=np.float32)
 lick_trial = (lick[start:end] > 0).astype(np.int64)
 ```
 
-iii. `CONVERSION_NOTES.md` says licks are binarized from the framewise cumulative lick counts.
+iii. `CONVERSION_NOTES.md` says licks are binarized from the framewise lick counts.
 
 ## 9-b. What processing is involved in computing `output` *Lick*?
 
-i. The AI binarizes licks with `lick > 0`.
+i. The AI thresholds the lick trace at `> 0` to produce a binary no/yes time series.
 
 ii.
 ```python
 lick_trial = (lick[start:end] > 0).astype(np.int64)
-...
-outputs = np.vstack([
-    ...
-    lick_trial,
 ```
 
-iii. The notes explicitly justify this as converting the cumulative lick count stream into a binary decoder output.
+iii. The notes explicitly justify this as binarizing licks with `lick > 0`.
 
 ## 9-c. How is `output` *Lick* aligned with the neural data?
 
-i. The lick vector is sliced with the same `start:end` trial indices as the neural data.
+i. Lick uses the same per-trial `start:end` frame indices as the neural data.
 
 ii.
 ```python
 lick_trial = (lick[start:end] > 0).astype(np.int64)
-...
 neural = events[start:end].T.astype(np.float32)
 ```
 
-iii. The AI does not describe any extra alignment step; shared frame indexing is the stated approach throughout the notes.
+iii. The justification is the same shared frame-index alignment described for the other time-varying signals.
 
 ## 10-a. What variables in the raw data is `output` *Reward zone location* derived from?
 
-i. The final reward-zone label is derived from the parsed `scene` string in the NWB `identifier`, not from the `reward_zone` behavior stream used in the human reference solution. The observed `reward_zone` occupancy is only used for agreement checks.
+i. The stored reward-zone-location output is derived from the NWB `identifier` scene string and the hard-coded schedule parser. The raw `reward_zone` time series is used only as a sanity check.
 
 ii.
 ```python
@@ -501,33 +524,35 @@ scene = identifier.split("/")[-1]
 env_by_trial, zone_labels, zone_idx, zone_bounds = scene_schedule(scene, ntrials)
 ```
 ```python
-np.full(time_trial.shape[0], zone_idx[trial_idx], dtype=np.int64),
+outputs = np.vstack([
+    ...
+    np.full(time_trial.shape[0], zone_idx[trial_idx], dtype=np.int64),
+    ...
+])
 ```
 
-iii. `CONVERSION_NOTES.md` says the conversion follows reward-zone schedules from scene names and reports perfect agreement between the parsed schedule and observed reward-zone occupancy when occupancy was present.
+iii. The notes justify this by saying the reward-zone schedules were parsed from scene names to mirror the manuscript/code conventions, and then checked against observed occupancy.
 
 ## 10-b. What processing is involved in computing `output` *Reward zone location*?
 
-i. The AI regex-parses scene names into fixed sessions, within-environment switches, and environment-switch sessions. It uses a fixed change point at trial 30 and maps labels `A/B/C` to indices `0/1/2`, then broadcasts the per-trial label across all frames.
+i. The AI parses fixed-session, same-environment switch, and environment-switch scene formats with regexes, applies a `30`-trial split when a switch occurs, maps `A/B/C` to `0/1/2`, and repeats that value across the trial.
 
 ii.
 ```python
-ZONE_TO_IDX = {"A": 0, "B": 1, "C": 2}
-CHANGE_TRIAL = 30
+fixed_match = re.fullmatch(r"(Env[12])_Location([ABC])", scene)
+same_env_switch_match = re.fullmatch(r"(Env[12])_Location([ABC])_to_([ABC])", scene)
+env_switch_match = re.fullmatch(r"(Env[12])_([ABC])_to_(Env[12])_([ABC])", scene)
 ...
 split = min(change_trial, ntrials)
 ...
 zone_idx = np.array([ZONE_TO_IDX[z] for z in zone_labels], dtype=np.int64)
 ```
-```python
-np.full(time_trial.shape[0], zone_idx[trial_idx], dtype=np.int64),
-```
 
-iii. The notes justify this as mirroring `reward_relative.behavior.get_reward_zones` and explicitly mention handling day-8 environment-switch sessions.
+iii. `CONVERSION_NOTES.md` explicitly justifies the schedule logic, including day-8 environment switches and the `30`-trial switch point.
 
 ## 11-a. What variables in the raw data is `output` *Reward outcome* derived from?
 
-i. Reward outcome is derived from NWB `Reward/timestamps` and the per-trial time bounds from `position/timestamps`.
+i. It is derived from the sparse behavioral reward-event timestamps, `Reward/timestamps`, combined with per-trial time windows.
 
 ii.
 ```python
@@ -538,11 +563,11 @@ reward_outcome.append(
 )
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly says reward outcome is derived from sparse NWB reward timestamps within each trial.
+iii. The notes explicitly say reward outcome is derived from the sparse NWB reward timestamps within each trial.
 
 ## 11-b. What processing is involved in computing `output` *Reward outcome*?
 
-i. For each trial, the AI marks reward outcome as `1` if any reward timestamp falls within that trial’s timestamp interval and `0` otherwise. It then repeats that binary label across all frames in the trial.
+i. For each trial, the AI marks the outcome as rewarded if any reward timestamp falls between the trial’s first and last retained timestamps; otherwise it marks the trial as omitted. The label is then repeated across all timepoints in that trial.
 
 ii.
 ```python
@@ -551,16 +576,16 @@ reward_trial = reward_outcome[trial_idx]
 np.full(time_trial.shape[0], reward_trial, dtype=np.int64),
 ```
 
-iii. The notes describe reward outcome as a per-trial categorical output built from sparse reward timestamps.
+iii. `CONVERSION_NOTES.md` ties this to omission/reward trial labels and reports the resulting omission fraction as a sanity check against the paper.
 
 ## 12. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI clips all dense streams to the shortest common length across behavior and ophys arrays, skips trial segments with no valid corridor samples, raises if fewer than two trials remain, and raises if no neurons survive filtering. It does not implement the reference solution’s explicit short-trial filter or reward-timestamp alignment assertion.
+i. The AI crops all dense streams to the shortest available length across behavior and ophys arrays. It skips malformed trial candidates with no retained corridor frames, errors out if fewer than two trials or zero neurons remain, and treats missing reward-zone occupancy as non-fatal because labels come from the scene schedule; in that case it simply omits the agreement check for that trial.
 
 ii.
 ```python
 common_length = min(dense_lengths)
-...
+clipped_samples = max(dense_lengths) - common_length
 position = position[:common_length]
 position_ts = position_ts[:common_length]
 speed = speed[:common_length]
@@ -580,11 +605,11 @@ if n_neurons == 0:
     raise ValueError(...)
 ```
 
-iii. The trajectory and notes emphasize defensive sanity checks and stream alignment. The AI’s documented rationale is mainly to keep frame-aligned corridor data and validate manuscript-level counts.
+iii. The notes justify the cropping as an alignment fix and describe the scene-based schedule plus occupancy agreement checks as sanity checks rather than primary label sources.
 
 ## 13-a. What are the most time-consuming steps of the code?
 
-i. The likely slowest parts are reading large NWB arrays for every session, reconstructing per-trial dF/F for every curated cell in `compute_interneuron_mask()`, building the full 9.3 GB dataset, and writing the large pickle outputs.
+i. The most expensive work is the per-session dF/F reconstruction and correlation-based interneuron screen in `compute_interneuron_mask()`, followed by loading large NWB arrays and assembling per-trial matrices across all sessions.
 
 ii.
 ```python
@@ -593,60 +618,57 @@ for plane_name in get_plane_names(fluorescence):
     for start, end in zip(starts, ends):
         trial_roi = f_roi[:, start:end] - 0.7 * f_neu[:, start:end]
         ...
+        trial_dff = gaussian_filter1d(trial_dff, sigma=2, axis=1, mode="nearest")
         dff[:, start:end] = trial_dff
 ```
 ```python
-full_data = build_full_dataset(args.data_dir)
-...
-save_pickle(args.full_output, full_data)
+for path in sorted(data_dir.glob("sub-*/sub-*_behavior+ophys.nwb"), key=subject_session_key):
+    record = build_session(path)
 ```
 
-iii. The trajectory explicitly treats the full-session scan, full conversion, and large output files as the expensive steps, and the code structure shows the interneuron screen is the heaviest per-session computation.
+iii. The trajectory explicitly says “the converter is CPU-bound” because of the “per-session dF/F reconstruction,” which is the clearest justification the AI recorded.
 
 ## 13-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The main non-vectorized loops are the per-plane and per-trial loops in `compute_interneuron_mask()`, the per-trial loop that builds `neural/input/output`, and the loop that infers reward and sanity-check statistics trial by trial.
+i. The per-trial loops inside `find_trial_segments()`, `compute_interneuron_mask()`, the session summary pass, and the final per-trial assembly pass are the main vectorization opportunities. The trial-wise dF/F reconstruction loop is especially expensive.
 
 ii.
 ```python
-for plane_name in get_plane_names(fluorescence):
-    ...
-    for start, end in zip(starts, ends):
-        ...
+for start, next_start in zip(starts, next_starts):
+    trial_pos = position[start:next_start]
+    valid = np.flatnonzero((trial_pos >= 0.0) & (trial_pos <= 450.5))
 ```
 ```python
+for start, end in zip(starts, ends):
+    trial_roi = f_roi[:, start:end] - 0.7 * f_neu[:, start:end]
+    ...
 for trial_idx, (start, end) in enumerate(zip(starts, ends)):
     ...
-    neural_trials.append(neural)
-    input_trials.append(inputs)
-    output_trials.append(outputs)
 ```
 
-iii. No explicit vectorization discussion appears in the notes. This assessment is inferred directly from the implementation.
+iii. No explicit vectorization discussion was recorded in the notes. This answer is inferred from the code structure and the trajectory’s statement that the dF/F reconstruction dominates runtime.
 
 ## 13-c. What processing does the code repeat multiple times?
 
-i. The code makes repeated passes over the same session frames: once to derive reward/environment sanity stats, once to reconstruct dF/F for interneuron detection, and again to build the final trial tensors. It also rereads all sessions during downstream verification and decoder runs.
+i. The code iterates over the same trial boundaries multiple times: once to build the valid mask for interneuron screening, once to compute per-trial summary variables such as environment and reward outcome, and once again to build the final neural/input/output trial arrays. It also repeatedly traverses plane groups for curation and event loading.
 
 ii.
 ```python
-for trial_idx, (start, end, next_start) in enumerate(zip(starts, ends, next_starts)):
-    ...
-    reward_outcome.append(...)
+for start, end in zip(starts, ends):
+    valid_mask[start:end] = True
 ```
 ```python
-is_int = compute_interneuron_mask(f, plane_masks, starts, ends, speed, common_length)
-...
+for trial_idx, (start, end, next_start) in enumerate(zip(starts, ends, next_starts)):
+    ...
 for trial_idx, (start, end) in enumerate(zip(starts, ends)):
     ...
-    neural_trials.append(neural)
 ```
 
-iii. The notes emphasize both sanity checking and manuscript-matching curation, so these repeated passes appear deliberate rather than accidental.
+iii. No separate explicit justification was recorded. This is an inference from the implementation.
 
 ## 13-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The code computes several diagnostics that are not used as decoder inputs or outputs: `behavior_env_by_trial`, `parsed_zone_matches`, `parsed_zone_checks`, `zone_counter`, `env_counter`, and the summary metadata. It also reconstructs full dF/F traces only to throw them away after producing the interneuron mask.
+i. The AI computes several sanity-check-only quantities that are not part of the saved decoder dataset: `behavior_env_by_trial`, reward-zone agreement counts, `zone_counter`, `env_counter`, and the full dF/F arrays used only to derive the boolean interneuron mask. Those intermediates are discarded after summary statistics or filtering.
 
 ii.
 ```python
@@ -665,4 +687,4 @@ all_is_int.append(corr > 0.5)
 del f_roi, f_neu, dff, dff_valid, dff_centered
 ```
 
-iii. The trajectory shows the AI prioritized self-validation against the paper, so this extra work was mainly for sanity checks and filtering rather than for the final decoder tensors.
+iii. The notes explicitly describe the environment/reward-zone checks as sanity checks, and the trajectory shows the dF/F reconstruction was done only to support the interneuron screen rather than to populate the saved neural data.

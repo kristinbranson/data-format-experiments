@@ -2,379 +2,463 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The implemented code loads all subjects by globbing `*.mat` files in `data/`, opens each file with `h5py`, and reads per-session references from `trace`, `position`, and `blocked`. Trials are not loaded directly; they are derived later by splitting each session into fixed 1-minute chunks.
+i. The AI loads per-animal joblib files from `data/`, not the `.mat` files used in the human reference. It scans `data/` for regular files that are not `.mat`, skips `behav_dict`, loads each animal with `joblib.load`, then iterates over every session in `dat["position"]`. Trials are created later by splitting each session into consecutive 60 s chunks and keeping only chunks that survive additional preprocessing.
 
-ii. ```python
-mat_files = sorted(glob.glob(f'{args.datadir}/*.mat'))
+ii.
+```python
+def get_animal_files(data_dir):
+    animals = []
+    for name in sorted(os.listdir(data_dir)):
+        path = os.path.join(data_dir, name)
+        if (
+            os.path.isfile(path)
+            and not name.endswith(".mat")
+            and name not in {"behav_dict"}
+            and not name.startswith(".")
+        ):
+            animals.append(name)
+    return animals
 ...
-f = h5py.File(filepath, 'r')
-trace_refs = f['trace']
-pos_refs = f['position']
-blk_refs = f['blocked'][:][0]
+for animal in selected_animals:
+    animal_path = os.path.join(data_dir, animal)
+    dat = joblib.load(animal_path)[animal]
 ...
-trace = f[trace_refs[i][0]][:]
-position = f[pos_refs[i][0]][:].T
-blk_indices = f[blk_refs[i]][:].flatten()
+for session_idx in range(dat["position"].shape[0]):
 ```
 
-iii. The code docstring and inline comments justify this as a direct conversion from MATLAB/HDF5 session arrays. `CONVERSION_NOTES.md` and the trajectory mostly justify a different, more elaborate joblib-based plan, not the shipped code.
+iii. In `CONVERSION_NOTES.md`, the AI says it chose the joblib files because they “match the reference code storage path” and expose “analysis-ready axis ordering,” which it viewed as safer than reading the MATLAB HDF5 layout directly.
 
 ## 1-b. How are the data split into subjects?
 
-i. Each `.mat` file is treated as one subject, and the subject name is the filename stem.
+i. Each joblib animal file is treated as one subject. Subject IDs are the filenames returned by `get_animal_files`, and each processed session gets a `subject_idx` pointing to that filename’s position in the full `animals` list.
 
-ii. ```python
-for subj_i, mat_file in enumerate(mat_files):
-    name = mat_file.split('/')[-1].replace('.mat', '')
-    subjects.append(name)
+ii.
+```python
+animals = get_animal_files(data_dir)
+...
+for animal in selected_animals:
+    animal_path = os.path.join(data_dir, animal)
+    dat = joblib.load(animal_path)[animal]
+...
+    subject_idx.append(animals.index(animal))
+...
+data = {
+    ...
+    "subjects": animals,
+    "subject_idx": np.array(subject_idx, dtype=np.int64),
 ```
 
-iii. The implemented rationale is that one file corresponds to one mouse. This matches the code comments and `reference_DECISIONS.md`; the notes file does not materially justify this specific final implementation.
+iii. The notes describe the dataset as “one dataset per animal” in both joblib and `.mat` formats, so the AI kept the file-per-animal organization as the mouse split.
 
 ## 1-c. How are the data split into sessions?
 
-i. Within each subject file, the code iterates over rows of the `trace` reference array; each row is one recording session, and corresponding `position` and `blocked` entries are pulled with the same index.
+i. Within each animal file, the AI treats the first axis of `position` and `trace` as session/day index. Every `session_idx` becomes one output session.
 
-ii. ```python
-n_recording_sessions = trace_refs.shape[0]
-
-for i in range(n_recording_sessions):
-    trace = f[trace_refs[i][0]][:]
-    position = f[pos_refs[i][0]][:].T
-    blk_indices = f[blk_refs[i]][:].flatten()
+ii.
+```python
+for session_idx in range(dat["position"].shape[0]):
+    session_id = f"{animal}_s{session_idx:02d}"
+    env_name = str(dat["envs"][session_idx, 0])
+    ...
+    session_neural, session_input, session_output, ... = preprocess_session(
+        trace_session=dat["trace"][session_idx],
+        position_session=dat["position"][session_idx],
+        blocked_entry=dat["blocked"][session_idx],
+        ...
+    )
+    all_neural.append(session_neural)
+    all_input.append(session_input)
+    all_output.append(session_output)
 ```
 
-iii. The implemented justification is that the HDF5 reference arrays are organized one entry per recording session. The notes/trajectory instead describe a joblib session-first layout, which was not used in the final code.
+iii. In the notes, the AI states that the joblib files expose shapes like `trace (n_sessions, n_cells, n_frames)` and `position (n_sessions, 2, n_frames)`, so it used the session axis directly.
 
 ## 1-d. How are the data split into trials?
 
-i. Sessions are split into non-overlapping 60 s trials at 30 Hz, so each trial is 1800 frames. Any remainder shorter than 1800 frames is dropped.
+i. The AI first computes the number of complete 60 s chunks per session using floor division by `1800` frames, then loops over those chunks. However, the exported “trials” are not the raw 1800-frame segments: within each chunk it keeps only movement-valid frames, smooths neural data, average-pools in 3-frame groups, and may drop the chunk entirely.
 
-ii. ```python
-TRIAL_DURATION_SEC = 60
-TRIAL_LENGTH = SAMPLING_RATE * TRIAL_DURATION_SEC  # 1800
-
-def split_into_trials(data, trial_length=TRIAL_LENGTH):
-    if data.ndim == 1:
-        n_trials = len(data) // trial_length
-        return [data[i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
-    else:
-        n_trials = data.shape[1] // trial_length
-        return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
+ii.
+```python
+RAW_TRIAL_FRAMES = FPS * TRIAL_SECONDS
+...
+n_full_trials = trace_session.shape[1] // RAW_TRIAL_FRAMES
+...
+for trial_idx in range(n_full_trials):
+    start = trial_idx * RAW_TRIAL_FRAMES
+    end = start + RAW_TRIAL_FRAMES
+    chunk_mask = velocity_mask[start:end]
+    ...
+    chunk_trace = trace_active[:, start:end][:, chunk_mask]
+    ...
+    pooled_trace = trial_average_pool(chunk_trace).astype(np.float32, copy=False)
+    ...
+    neural_trials.append(pooled_trace)
 ```
 
-iii. The code comments justify this directly from the task requirement that long sessions be split into 1-minute trials.
+iii. The notes say the AI intentionally “split sessions into one-minute chunks” but then “within each chunk keep only movement-valid frames and pool in groups of 3” to mimic the reference decoder rather than preserve raw continuous samples.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. They are effectively not filtered beyond dropping incomplete trailing chunks. Zero-trial sessions can remain; there is no trial-quality rejection based on behavior or signal quality.
+i. Trials are filtered aggressively. A 60 s chunk is dropped if it has fewer than 3 movement-valid frames, if the pooled neural data has fewer than 10 pooled samples, or if the pooled neural matrix is all zero. After this, the whole session is rejected if fewer than 2 valid trials remain.
 
-ii. ```python
-n_trials = data.shape[1] // trial_length
-return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
+ii.
+```python
+chunk_mask = velocity_mask[start:end]
+if int(chunk_mask.sum()) < POOL_SIZE:
+    continue
+...
+if pooled_trace.shape[1] < MIN_POOLED_SAMPLES_PER_TRIAL:
+    continue
+
+if not np.any(pooled_trace):
+    continue
+...
+if len(neural_trials) < 2:
+    raise ValueError(f"{session_id}: fewer than 2 valid trials after preprocessing")
 ```
 
-iii. No explicit justification is given in the final code beyond using full-length chunks only. The notes/trajectory discuss stricter curation, but that logic was not implemented.
+iii. The AI justified this in the notes as “trial-quality curation,” saying it removed all-zero and too-short pooled trials after seeing warnings during sample validation.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` is derived from the raw `trace` variable for each session.
+i. The neural output is derived from `dat["trace"][session_idx]` in the per-animal joblib structure.
 
-ii. ```python
-trace = f[trace_refs[i][0]][:]  # (timepoints, neurons)
+ii.
+```python
+session_neural, session_input, session_output, ... = preprocess_session(
+    trace_session=dat["trace"][session_idx],
+    position_session=dat["position"][session_idx],
+    blocked_entry=dat["blocked"][session_idx],
+    ...
+)
 ```
 
-iii. The code comments state that `trace` contains session neural activity. The notes additionally say these are already preprocessed calcium-event traces.
+iii. The notes identify `trace` as the released “rise-event calcium traces” and state that this is the neural signal used by the reference analyses.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Processing is minimal: remove all-NaN neuron columns, cast to `float32`, and transpose from `(timepoints, neurons)` to `(neurons, timepoints)`. Then split into trials.
+i. The AI applies several processing steps to the raw session trace: it removes non-finite cells, restricts to movement-valid frames, keeps only cells with more than 5 events during movement, smooths each retained cell with a Gaussian filter (`sigma=3` frames), then average-pools non-overlapping groups of 3 frames. The exported per-trial neural arrays are these pooled matrices.
 
-ii. ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
-trace = trace[:, active_mask].astype(np.float32).T
-neural_trials = split_into_trials(trace)
+ii.
+```python
+finite_cells = np.isfinite(trace_session).all(axis=1)
+trace_finite = trace_session[finite_cells].astype(np.float32, copy=False)
+...
+activity_mask = np.sum(trace_finite[:, velocity_mask], axis=1) > CELL_EVENT_THRESHOLD
+trace_active = trace_finite[activity_mask]
+...
+chunk_trace = trace_active[:, start:end][:, chunk_mask]
+chunk_trace = gaussian_filter1d(chunk_trace, sigma=TRACE_SMOOTH_SIGMA, axis=1, mode="nearest")
+pooled_trace = trial_average_pool(chunk_trace).astype(np.float32, copy=False)
 ```
 
-iii. The shipped code’s rationale is that the traces are already in a usable processed form and only need reshaping. The notes explicitly claimed a more complex smoothing/pooling pipeline, which is inconsistent with the final implementation.
+iii. The notes say this was intended to mirror `decode_position_within`, `fit_decoder`, and `test_decoder` from the reference code, which the AI interpreted as requiring movement filtering, activity filtering, Gaussian smoothing, and 3-frame pooling before export.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Only neurons that are all NaN within a session are removed. There is no activity threshold, movement filter, or place-cell filter.
+i. Neural quality control happens in two stages. First, a cell must be finite at every time point within the session (`np.isfinite(...).all(axis=1)`). Second, among those finite cells, it must have more than 5 total events during movement-valid frames. Chunks/trials with too little movement or no pooled activity are then dropped separately.
 
-ii. ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
-trace = trace[:, active_mask].astype(np.float32).T
+ii.
+```python
+finite_cells = np.isfinite(trace_session).all(axis=1)
+trace_finite = trace_session[finite_cells].astype(np.float32, copy=False)
+...
+activity_mask = np.sum(trace_finite[:, velocity_mask], axis=1) > CELL_EVENT_THRESHOLD
+trace_active = trace_finite[activity_mask]
+...
+if pooled_trace.shape[1] < MIN_POOLED_SAMPLES_PER_TRIAL:
+    continue
+if not np.any(pooled_trace):
+    continue
 ```
 
-iii. The code comment justifies this as keeping only neurons actually recorded in that session. The notes/trajectory justify additional activity filtering, but that was not implemented.
+iii. The notes explicitly justify this as matching the reference within-session decoder’s “movement / activity” filtering rather than the broader paper analyses that used all cells.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. There is no event-based alignment. Trials are artificial contiguous chunks of a continuous recording.
+i. The AI does not align to an experimental event from the paper. It defines the alignment event as the start of each artificial 60 s chunk from the continuous session. Neural data are then further aligned sample-for-sample with the movement-filtered and pooled behavioral output from the same chunk.
 
-ii. ```python
-neural_trials = split_into_trials(trace)
+ii.
+```python
+for trial_idx in range(n_full_trials):
+    start = trial_idx * RAW_TRIAL_FRAMES
+    end = start + RAW_TRIAL_FRAMES
+    chunk_mask = velocity_mask[start:end]
+    chunk_trace = trace_active[:, start:end][:, chunk_mask]
+...
+"metadata": {
+    ...
+    "temporal_alignment_event": "Start of each consecutive one-minute chunk from a continuous recording session",
+    "off_start": 0.0,
+    "off_end": 60.0,
 ```
 
-iii. The implicit justification is that the dataset contains continuous sessions rather than event-locked trials.
+iii. The notes describe the sessions as continuous recordings with no native trial events, and the AI chose chunk-start alignment to satisfy the target format while keeping neural and behavior on the same filtered time axis.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted data remain at the native 30 Hz sampling rate, so each bin is about 33.33 ms. No temporal rebinning is applied.
+i. The converted data are exported at an effective 100 ms bin size. Yes, temporal rebinning is applied: after movement filtering, the AI average-pools non-overlapping groups of 3 native 30 Hz frames.
 
-ii. ```python
-SAMPLING_RATE = 30  # Hz
-TIME_BIN_SIZE = 1000.0 / SAMPLING_RATE  # ~33.33 ms
+ii.
+```python
+FPS = 30
+POOL_SIZE = 3
+...
+def trial_average_pool(values, pool_size=POOL_SIZE):
+    n_full = values.shape[-1] // pool_size
+    ...
+    return trimmed.reshape(new_shape).mean(axis=-1)
+...
+"metadata": {
+    ...
+    "time_bin_size": 100.0,
+    ...
+    "temporal_pool_size_frames": POOL_SIZE,
 ```
 
-iii. The code constants and metadata encode the rationale: keep the original frame rate.
+iii. The notes say the AI adopted the reference decoder’s 3-frame pooling and therefore exported the pooled representation instead of native 30 Hz samples.
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. The implemented input is derived from the raw `blocked` variable, not `envs`.
+i. The input geometry is derived from the raw `blocked` field for each session, not from `envs`. The AI parses the blocked partition indices and converts them to a 9-element geometry vector.
 
-ii. ```python
-blk_refs = f['blocked'][:][0]
+ii.
+```python
+def parse_blocked_indices(blocked_entry):
+    ...
+def blocked_to_open_vector(blocked_entry):
+    blocked_idx = parse_blocked_indices(blocked_entry)
+    open_vec = np.ones(GEOMETRY_SIZE * GEOMETRY_SIZE, dtype=np.float32)
+    open_vec[blocked_idx] = 0.0
+    return open_vec, blocked_idx
 ...
-blk_indices = f[blk_refs[i]][:].flatten()
+geometry_open, blocked_idx = blocked_to_open_vector(blocked_entry)
 ```
 
-iii. The code and `reference_DECISIONS.md` justify this as directly encoding blocked positions per session. The notes also favored `blocked`, though for a different abandoned pipeline.
+iii. The notes say the AI chose `blocked` because it “directly encodes which 3x3 partitions are occluded,” whereas `envs` would require an additional mapping step.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The blocked indices are converted into a length-9 one-hot vector with `1` at blocked positions. `[-1]` means no blocked positions, producing all zeros.
+i. The AI converts each session’s blocked-bin list into a static length-9 vector in row-major 3x3 order with `1=open` and `0=blocked`. The same geometry vector is copied into every exported trial from that session.
 
-ii. ```python
-def encode_blocked(blk_indices, n_positions=N_BLOCKED_POSITIONS):
-    blocked = np.zeros(n_positions, dtype=np.float32)
-    if not (len(blk_indices) == 1 and blk_indices[0] == -1):
-        blocked[blk_indices.astype(int)] = 1
-    return blocked
-```
-
-iii. The final code treats each blocked partition as an independent binary feature. This is explicitly documented in the function docstring.
-
-## 3-c. How is the `input` *Environment geometry* aligned with the neural data?
-
-i. It is session-static. The same length-9 geometry vector is attached to every trial in the session without time variation.
-
-ii. ```python
-blocked = encode_blocked(blk_indices)
+ii.
+```python
+def blocked_to_open_vector(blocked_entry):
+    blocked_idx = parse_blocked_indices(blocked_entry)
+    open_vec = np.ones(GEOMETRY_SIZE * GEOMETRY_SIZE, dtype=np.float32)
+    open_vec[blocked_idx] = 0.0
+    return open_vec, blocked_idx
 ...
-input_trials = [blocked] * len(neural_trials)
+input_trials.append(geometry_open.copy())
+...
+"input_names": [f"partition_{idx}_open" for idx in range(GEOMETRY_SIZE * GEOMETRY_SIZE)],
 ```
 
-iii. The code assumes geometry does not change within a session, so no frame-by-frame temporal alignment is needed.
+iii. The notes justify this as a direct geometry encoding “consistent with the reference code’s `get_env_mat` convention” and as a decoder-friendly static context variable.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. The output is derived from the raw `position` variable for each session.
+i. The output position labels are derived primarily from raw `position`, but they are also conditioned by `blocked` through geometry snapping and by an inferred coordinate transform built from all sessions of the same animal.
 
-ii. ```python
-position = f[pos_refs[i][0]][:].T  # (2, n_timepoints)
+ii.
+```python
+scale_cm = float(np.nanmax(dat["position"]))
+transform_name, transform_scores = infer_transform(dat["position"], dat["blocked"], scale_cm)
+coord_map = build_coord_map(transform_name)
+...
+session_neural, session_input, session_output, ... = preprocess_session(
+    trace_session=dat["trace"][session_idx],
+    position_session=dat["position"][session_idx],
+    blocked_entry=dat["blocked"][session_idx],
+    ...
+)
 ```
 
-iii. The code comments identify this as the 2D mouse trajectory used to form the decoder output.
+iii. The notes say the AI wanted the output labels to respect the blocked geometry and therefore used `blocked` plus an inferred transform to align spatial bins with the session’s environment layout.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The 2D position is discretized into a 3x3 grid over a fixed `75 x 75` arena. The categorical label is `y_bin * 3 + x_bin`, then the 1D label stream is wrapped as shape `(1, n_timepoints)`.
+i. The AI computes a per-animal spatial scale from the maximum position value, converts x/y coordinates into 3x3 row/column bins, infers and applies a global coordinate transform per animal, snaps any blocked-bin samples to the nearest open bin, applies the same movement filter used for neural data, average-pools row/column values in groups of 3 frames, floors them back to integer bins, clips to `[0, 2]`, and finally converts row/column to a single class index.
 
-ii. ```python
-def discretize_position(position, n_grid=N_GRID, arena_size=ARENA_SIZE):
-    edges = np.linspace(0, arena_size, n_grid + 1)[1:-1]
-    x_bin = np.clip(np.digitize(position[0], edges), 0, n_grid - 1)
-    y_bin = np.clip(np.digitize(position[1], edges), 0, n_grid - 1)
-    return (y_bin * n_grid + x_bin).astype(np.int8)
+ii.
+```python
+def raw_position_to_rc(position_xy, bin_size_cm):
+    x = np.floor(position_xy[0] / bin_size_cm).astype(np.int64)
+    y = np.floor(position_xy[1] / bin_size_cm).astype(np.int64)
+    x = np.clip(x, 0, GEOMETRY_SIZE - 1)
+    y = np.clip(y, 0, GEOMETRY_SIZE - 1)
+    return y, x
 ...
-output = discretize_position(position)[np.newaxis, :]
+mapped_ids_all = coord_map[raw_ids_all]
+mapped_rows_all = mapped_ids_all // GEOMETRY_SIZE
+mapped_cols_all = mapped_ids_all % GEOMETRY_SIZE
+snapped_rows_all, snapped_cols_all = snap_to_open_bins(mapped_rows_all, mapped_cols_all, geometry_open)
+...
+pooled_rows = np.floor(trial_average_pool(chunk_rows[np.newaxis, :].astype(np.float32))[0]).astype(np.int64)
+pooled_cols = np.floor(trial_average_pool(chunk_cols[np.newaxis, :].astype(np.float32))[0]).astype(np.int64)
+...
+pooled_bins = (pooled_rows * GEOMETRY_SIZE + pooled_cols)[np.newaxis, :].astype(np.int64)
 ```
 
-iii. The function docstring and constants justify this as a simple 9-class spatial discretization consistent with the requested decoder task.
+iii. The notes justify this as adapting the reference decoder’s position preprocessing to the required 9-class output while reducing label noise from samples that fall in blocked regions.
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. Each axis is thresholded by equal-width bin edges over `[0, 75]`, creating 3 bins per axis and therefore 9 categories total. Values are clipped to valid edge bins.
+i. Position is thresholded into categories by dividing each axis into 3 equal-width bins determined by `bin_size_cm = scale_cm / 3`, where `scale_cm` is the per-animal maximum coordinate value. After pooling, rows and columns are clipped to `0, 1, 2` and combined into a row-major category `row * 3 + col`.
 
-ii. ```python
-edges = np.linspace(0, arena_size, n_grid + 1)[1:-1]
-x_bin = np.clip(np.digitize(position[0], edges), 0, n_grid - 1)
-y_bin = np.clip(np.digitize(position[1], edges), 0, n_grid - 1)
-return (y_bin * n_grid + x_bin).astype(np.int8)
+ii.
+```python
+bin_size_cm = (scale_cm + 1e-6) / GEOMETRY_SIZE
+...
+x = np.floor(position_xy[0] / bin_size_cm).astype(np.int64)
+y = np.floor(position_xy[1] / bin_size_cm).astype(np.int64)
+x = np.clip(x, 0, GEOMETRY_SIZE - 1)
+y = np.clip(y, 0, GEOMETRY_SIZE - 1)
+...
+pooled_rows = np.clip(pooled_rows, 0, GEOMETRY_SIZE - 1)
+pooled_cols = np.clip(pooled_cols, 0, GEOMETRY_SIZE - 1)
+pooled_bins = (pooled_rows * GEOMETRY_SIZE + pooled_cols)[np.newaxis, :].astype(np.int64)
 ```
 
-iii. The explicit justification is the decoder requirement for categorical outputs on a 3x3 spatial grid.
+iii. The notes say this was chosen to mirror the reference decoder’s use of a per-animal global spatial scale while adapting it to the required 3x3 coarse grid.
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. The code assumes framewise alignment because `trace` and `position` are session time series with matched sample counts. Both are split with the same trial boundaries.
+i. Neural and output data are aligned by using the same session boundaries, the same 60 s chunk boundaries, the same per-frame movement mask within each chunk, and the same non-overlapping 3-frame pooling logic. The output labels are therefore on the same filtered pooled sample axis as the neural data.
 
-ii. ```python
-neural_trials = split_into_trials(trace)
-output_trials = split_into_trials(output)
-```
-
-iii. The final code relies on identical slicing for temporal alignment. No interpolation or resampling is performed.
-
-## 5-a. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. The temporal resolution is still 30 Hz, or about 33.33 ms per sample. No rebinning or pooling is applied.
-
-ii. ```python
-SAMPLING_RATE = 30  # Hz
-TIME_BIN_SIZE = 1000.0 / SAMPLING_RATE  # ~33.33 ms
-```
-
-iii. This is the same decision reflected in metadata and in the absence of any resampling code.
-
-## 5-b. How are the neural, input, and output data temporally aligned?
-
-i. `neural` and `output` are frame-aligned by applying the same session-to-trial slicing. `input` is a static per-trial vector copied across all trials in a session.
-
-ii. ```python
-neural_trials = split_into_trials(trace)
-output_trials = split_into_trials(output)
-input_trials = [blocked] * len(neural_trials)
-```
-
-iii. The code’s alignment model is simple: one shared session clock for neural and position, with session-constant geometry.
-
-## 6. How are minor issues in the data (e.g., missing data, malformed entries) handled?
-
-i. Two minor issues are handled explicitly: all-NaN neurons are dropped, and `blocked == [-1]` is treated as no blocked positions. Incomplete trailing frames are discarded when trials are formed.
-
-ii. ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
+ii.
+```python
+chunk_mask = velocity_mask[start:end]
+chunk_trace = trace_active[:, start:end][:, chunk_mask]
+chunk_rows = snapped_rows_all[start:end][chunk_mask]
+chunk_cols = snapped_cols_all[start:end][chunk_mask]
 ...
-if not (len(blk_indices) == 1 and blk_indices[0] == -1):
-    blocked[blk_indices.astype(int)] = 1
+pooled_trace = trial_average_pool(chunk_trace).astype(np.float32, copy=False)
+pooled_rows = np.floor(trial_average_pool(chunk_rows[np.newaxis, :].astype(np.float32))[0]).astype(np.int64)
+pooled_cols = np.floor(trial_average_pool(chunk_cols[np.newaxis, :].astype(np.float32))[0]).astype(np.int64)
+```
+
+iii. The notes explicitly say the conversion “preserves the simultaneous neural/behavior streams and applies filtering on the same frame axis.”
+
+## 5. How are minor mistakes in the data, e.g. missing data, handled?
+
+i. The AI mostly handles irregularities by dropping or coercing them rather than imputing them. Empty blocked lists become empty arrays, `[-1]` means “no blocked bins,” cells with any non-finite values are removed, coordinates are clipped to the 3x3 range, samples in blocked bins are snapped to the nearest open bin, and bad chunks are discarded. Sessions with no finite cells, no active cells, or fewer than 2 valid trials trigger errors.
+
+ii.
+```python
+if isinstance(blocked_entry, list):
+    if len(blocked_entry) == 0:
+        return np.array([], dtype=np.int64)
 ...
-n_trials = data.shape[1] // trial_length
-```
-
-iii. The code’s implicit rationale is to remove clearly invalid session-specific neuron entries and normalize the special no-blocked sentinel.
-
-## 7-a. What are the most time-consuming steps of the code?
-
-i. The likely bottleneck is opening each HDF5 `.mat` file and reading the large `trace` and `position` arrays. The rest of the processing is light NumPy slicing.
-
-ii. ```python
-f = h5py.File(filepath, 'r')
+if arr.size == 1 and arr[0] < 0:
+    return np.array([], dtype=np.int64)
 ...
-trace = f[trace_refs[i][0]][:]
-position = f[pos_refs[i][0]][:].T
-```
-
-iii. There is no explicit performance discussion in the final code. The notes discuss joblib I/O as the main cost in a different pipeline; by analogy, the implemented HDF5 I/O is the dominant cost here.
-
-## 7-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. The Python list construction in `split_into_trials` could be replaced with reshaping or strided views for full-trial chunks. The subject/session loops are structurally necessary.
-
-ii. ```python
-return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
+finite_cells = np.isfinite(trace_session).all(axis=1)
 ...
-for subj_i, mat_file in enumerate(mat_files):
+x = np.clip(x, 0, GEOMETRY_SIZE - 1)
+y = np.clip(y, 0, GEOMETRY_SIZE - 1)
 ...
-    for sess_i, sess in enumerate(sessions):
-```
-
-iii. No explicit justification is given. This is an implementation-level observation from the final code.
-
-## 7-c. What processing does the code repeat multiple times?
-
-i. It repeatedly reads per-session `trace`, `position`, and `blocked` datasets and repeatedly slices arrays into trials for each session. There is no caching.
-
-ii. ```python
-for i in range(n_recording_sessions):
-    trace = f[trace_refs[i][0]][:]
-    position = f[pos_refs[i][0]][:].T
-    blk_indices = f[blk_refs[i]][:].flatten()
+if np.any(invalid):
+    pooled_rows, pooled_cols = snap_to_open_bins(pooled_rows, pooled_cols, geometry_open)
 ...
-    neural_trials = split_into_trials(trace)
-    output_trials = split_into_trials(output)
+if len(neural_trials) < 2:
+    raise ValueError(f"{session_id}: fewer than 2 valid trials after preprocessing")
 ```
 
-iii. No explicit justification is documented; this follows directly from a simple per-session conversion strategy.
+iii. The notes frame these choices as pragmatic cleanup to keep geometry-consistent labels and remove sessions/trials that caused validation warnings or had too little usable movement data.
 
-## 7-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+## 6-a. What are the most time-consuming steps of the code?
 
-i. The code computes verbose per-session summary values only for printing, such as unique output classes and blocked strings; they are not saved in the pickle.
+i. The code’s main expensive steps are loading each joblib animal file, inferring the per-animal coordinate transform by scoring multiple 3x3 transforms across all sessions, and then per-session preprocessing with movement masking, smoothing, and pooling.
 
-ii. ```python
-output_classes = np.unique(np.concatenate([t.flatten() for t in sess['output']]))
-blocked_str = sess['input'][0].astype(int) if n_trials > 0 else []
-print(f"    session {sess_i}: {n_neurons} neurons, {n_trials} trials, "
-      f"{trial_len} timepoints/trial, "
-      f"neural dtype={sess['neural'][0].dtype}, "
-      f"output classes={output_classes.astype(int)}, "
-      f"blocked={blocked_str}")
-```
-
-iii. This is not justified beyond diagnostic logging.
-
-## 8. How are minor mistakes in the data, e.g. missing data, handled?
-
-i. Same as 6: all-NaN neurons are removed, `[-1]` in `blocked` means no blocked partitions, and incomplete end-of-session fragments are dropped.
-
-ii. ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
+ii.
+```python
+dat = joblib.load(animal_path)[animal]
 ...
-if not (len(blk_indices) == 1 and blk_indices[0] == -1):
-    blocked[blk_indices.astype(int)] = 1
+transform_name, transform_scores = infer_transform(dat["position"], dat["blocked"], scale_cm)
 ...
-n_trials = data.shape[1] // trial_length
-```
-
-iii. The shipped code uses only these minimal checks; no broader malformed-data recovery is implemented.
-
-## 9-a. What are the most time-consuming steps of the code?
-
-i. Same as 7-a: HDF5 I/O for per-session neural and position arrays is likely the dominant runtime cost.
-
-ii. ```python
-f = h5py.File(filepath, 'r')
-trace = f[trace_refs[i][0]][:]
-position = f[pos_refs[i][0]][:].T
-```
-
-iii. No explicit final-code justification is given.
-
-## 9-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. Same as 7-b: the trial-splitting list comprehensions are the clearest vectorization opportunity.
-
-ii. ```python
-return [data[i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
-return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
-```
-
-iii. No explicit justification is given.
-
-## 9-c. What processing does the code repeat multiple times?
-
-i. Same as 7-c: repeated per-session dataset reads and repeated trial slicing.
-
-ii. ```python
-for i in range(n_recording_sessions):
-    trace = f[trace_refs[i][0]][:]
-    position = f[pos_refs[i][0]][:].T
+speed = gaussian_filter1d(speed, sigma=VELOCITY_SMOOTH_SIGMA, mode="nearest")
 ...
-    neural_trials = split_into_trials(trace)
-    output_trials = split_into_trials(output)
+chunk_trace = gaussian_filter1d(chunk_trace, sigma=TRACE_SMOOTH_SIGMA, axis=1, mode="nearest")
+pooled_trace = trial_average_pool(chunk_trace).astype(np.float32, copy=False)
 ```
 
-iii. No explicit justification is given.
+iii. The notes explicitly say the animal joblib loads are “relatively slow,” give a per-animal load-time estimate, and mention transform inference and preprocessing as the main deliberate speed optimizations.
 
-## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. Same as 7-d: diagnostic class summaries and blocked-vector prints are computed only for stdout.
+i. The AI leaves several Python loops that could have been vectorized: the per-sample loop in `snap_to_open_bins`, the nested transform/session loops in `infer_transform`, the per-trial loop in `preprocess_session`, and repeated list-building loops such as `build_output_values`.
 
-ii. ```python
-output_classes = np.unique(np.concatenate([t.flatten() for t in sess['output']]))
-blocked_str = sess['input'][0].astype(int) if n_trials > 0 else []
+ii.
+```python
+for i in range(row_idx.shape[0]):
+    if geometry_mat[row_idx[i], col_idx[i]] == 1:
+        continue
+    distances = np.sum((open_coords - np.array([row_idx[i], col_idx[i]])) ** 2, axis=1)
+    nearest = open_coords[np.argmin(distances)]
+    row_idx[i] = nearest[0]
+    col_idx[i] = nearest[1]
+...
+for name, transform_fn in TRANSFORMS.items():
+    ...
+    for sess, occ in enumerate(occupancies):
+        ...
+for trial_idx in range(n_full_trials):
+    ...
 ```
 
-iii. This appears to be purely for human-readable logging during conversion.
+iii. The notes acknowledge the code is only partially optimized and emphasize vectorized NumPy/Scipy where convenient, but they do not claim these loops were eliminated.
+
+## 6-c. What processing does the code repeat multiple times?
+
+i. The code repeats several operations: it copies the same static geometry vector into every trial, looks up `animals.index(animal)` inside the session loop, scores all 8 candidate coordinate transforms for every animal, snaps position bins twice (once session-wide and again after pooling if any pooled bins are blocked), and creates plot payload data for the first valid trial of every session.
+
+ii.
+```python
+for name, transform_fn in TRANSFORMS.items():
+    for sess, occ in enumerate(occupancies):
+        ...
+...
+input_trials.append(geometry_open.copy())
+...
+subject_idx.append(animals.index(animal))
+...
+snapped_rows_all, snapped_cols_all = snap_to_open_bins(mapped_rows_all, mapped_cols_all, geometry_open)
+...
+if np.any(invalid):
+    pooled_rows, pooled_cols = snap_to_open_bins(pooled_rows, pooled_cols, geometry_open)
+```
+
+iii. The notes justify some of this repetition, especially transform inference and per-trial geometry copies, as the cost of the AI’s geometry-alignment approach and of storing self-contained trial objects.
+
+## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+
+i. The code computes and stores plotting-only intermediates that are discarded unless `--show-processing` is used: occupancy summaries, raw trial copies, transform score summaries, and the `SessionPlotPayload`. It also constructs `plot_payload` during session preprocessing even when plotting is disabled, and `full_mode` is computed but never used.
+
+ii.
+```python
+full_mode = not args.sample
+...
+occupancy_raw = occupancy_matrix(position_session, bin_size_cm)
+occupancy_aligned = np.zeros_like(occupancy_raw)
+np.add.at(occupancy_aligned, (mapped_rows_all, mapped_cols_all), 1)
+occupancy_snapped = np.zeros_like(occupancy_raw)
+np.add.at(occupancy_snapped, (snapped_rows_all, snapped_cols_all), 1)
+...
+if plot_payload is None:
+    plot_payload = SessionPlotPayload(
+        ...
+        raw_trial_neural=trace_active[:, start:end].copy(),
+        raw_trial_position=position_session[:, start:end].copy(),
+        ...
+        occupancy_raw=occupancy_raw.copy(),
+        occupancy_aligned=occupancy_aligned.copy(),
+        occupancy_snapped=occupancy_snapped.copy(),
+        ...
+    )
+...
+if len(processing_payloads) < 2 and args.show_processing:
+    processing_payloads.append(plot_payload)
+```
+
+iii. The notes describe the plots as sanity checks, but these computations are not part of the exported dataset and are unnecessary for downstream decoding when plotting is off.

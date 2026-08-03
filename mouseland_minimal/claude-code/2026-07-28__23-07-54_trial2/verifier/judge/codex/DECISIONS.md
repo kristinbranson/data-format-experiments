@@ -2,200 +2,241 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads `Imaging_Exp_info.npy`, collapses it to one record per unique neural recording key `mname_datexp_blk`, then loads one behavior dictionary `Beh_{exp_type}.npy` per experiment type, one spike file per session from `data/spk`, and one retinotopy file per session from `data/retinotopy`. When multiple behavior views exist for the same neural recording, it keeps the one with the largest number of non-NaN `stim_id` entries.
+i. The AI loads `beh/Imaging_Exp_info.npy` as a master index, builds one unique session per `(mname, datexp, blk)`, caches behavior files by experiment type, then loads spikes and retinotopy per session during processing. Unlike the reference, it resolves duplicate session listings by choosing the behavior entry with the most non-`NaN` `stim_id` values.
 
-ii.
+ii. 
 ```python
 exp_info = np.load(os.path.join(DATA_ROOT, 'beh', 'Imaging_Exp_info.npy'), allow_pickle=True).item()
-
-for exp_type in exp_info:
-    for db in exp_info[exp_type]:
-        key = f'{db["mname"]}_{db["datexp"]}_{db["blk"]}'
-        stimtype = db.get('stimtype', '')
-        beh_key = key if not stimtype else f'{key}_{stimtype}'
 ```
-
 ```python
-spk_path = os.path.join(root, 'spk', fn)
-spk_data = np.load(spk_path, allow_pickle=True).item()
-spk = np.concatenate([s for s in spk_data['spks']], axis=0)
+if key not in sessions or n_stim > sessions[key]['n_stim']:
+    sessions[key] = {
+        'mname': db['mname'],
+        'datexp': db['datexp'],
+        'blk': db['blk'],
+        'exp_type': exp_type,
+        'beh_key': beh_key,
+        'n_stim': n_stim,
+```
+```python
+if exp_type not in beh_cache:
+    beh_cache[exp_type] = np.load(
+        os.path.join(DATA_ROOT, 'beh', f'Beh_{exp_type}.npy'),
+        allow_pickle=True
+    ).item()
+```
+```python
+spk = load_spk(mname, datexp, blk, DATA_ROOT)
+iarea = load_retino(mname, datexp, DATA_ROOT)
 ```
 
-iii. The justification appears in trajectory step 79: the agent decided that duplicated `Imaging_Exp_info` rows were “the same recording but with different stim_id assignments” and that it should “select the behavior dataset with the most complete stimulus information for each unique neural recording.”
+iii. There is no `CONVERSION_NOTES.md`; the rationale comes from the trajectory and README. In the trajectory, the AI explicitly says each unique neural recording should map to one decoder session and that it should pick the behavior interpretation with the “most complete stimulus coverage.”
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are split by unique mouse name `mname`. The script builds `subjects` as a sorted set of all `mname` values and maps each kept session to `subject_idx`.
+i. Subjects are split by mouse name (`mname`). The output `subjects` list is the sorted set of unique mouse names, and each session’s `subject_idx` is assigned from that list.
 
-ii.
+ii. 
 ```python
 all_subjects = sorted(set(s['mname'] for s in sessions.values()))
 subject_to_idx = {s: i for i, s in enumerate(all_subjects)}
-...
+```
+```python
 subject_idx_all.append(subject_to_idx[mname])
 ```
 
-iii. The trajectory does not show a separate long justification for this; it is an implementation choice consistent with the target schema.
+iii. The AI’s code does not justify this separately; it follows the obvious mouse identifier in the dataset and matches the README’s description of “19 mice.”
 
 ## 1-c. How are the data split into sessions?
 
-i. Sessions are split by unique `mname_datexp_blk` keys, sorted lexicographically. This collapses the 142 `Imaging_Exp_info` entries down to 89 unique neural recordings.
+i. A session is one unique `(mname, datexp, blk)` triple. If the same neural session appears multiple times across experiment types or swap variants, the AI keeps only one session record and chooses the behavior entry with the highest count of non-missing `stim_id` values.
 
-ii.
+ii. 
 ```python
 key = f'{db["mname"]}_{db["datexp"]}_{db["blk"]}'
-...
-sorted_keys = sorted(sessions.keys())
-for sess_idx, key in enumerate(sorted_keys):
-    sess_info = sessions[key]
+stimtype = db.get('stimtype', '')
+beh_key = key if not stimtype else f'{key}_{stimtype}'
+```
+```python
+if key not in sessions or n_stim > sessions[key]['n_stim']:
+    sessions[key] = {
+        ...
+        'beh_key': beh_key,
+        'n_stim': n_stim,
 ```
 
-iii. In trajectory step 33 the agent stated that “each unique (mname, datexp, blk) combination” should define a session. In step 79 it explicitly justified collapsing repeated behavior views onto one neural recording.
+iii. In the trajectory, the AI states that the same neural recording can appear in multiple behavior datasets and that it should select the one with the “most complete stimulus information” instead of taking the first occurrence.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are split by iterating `range(beh['ntrials'])` and taking a fixed 32-frame window starting at each rounded `StartFr`. The code does not use `GrayFr`, `EndFr`, `ft_trInd`, or the reference position interpolation pipeline to define trial contents.
+i. Trials are split by taking a fixed 32-frame window beginning at each trial’s `StartFr` value. The code does not use `ft_trInd` or `ft_CorrSpc` to define within-trial frames; it assumes a trial is the 32 frames immediately after rounded corridor entry.
 
-ii.
+ii. 
 ```python
+start_frs = beh['StartFr']
+...
 for trial in range(ntrials):
     start_fr = int(np.round(start_frs[trial]))
     end_fr = start_fr + n_timepoints
-    trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
+```
+```python
+trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
 ```
 
-iii. Trajectory step 33 says the agent chose “fixed-size time bins across all trials and sessions” and planned to “extract a consistent number of time bins per trial regardless of how long the mouse takes to traverse.”
+iii. The README and trajectory justify this as “32 frames from corridor entry,” with the AI reasoning that about 10 seconds at 3.17 Hz should cover most corridor traversals while giving fixed-length trial tensors.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trial filtering is minimal. A trial is dropped only if the 32-frame window would start before frame 0 or end after the recording. Afterward, the whole session is dropped if it has fewer than 10 valid trials. There is no trial-level filtering for non-running periods, gray-space periods, cue anomalies, or missing behavior variables.
+i. Trials are marked invalid only if the fixed 32-frame window would go out of bounds of the imaged frames. Sessions are also skipped if they have fewer than 10 total trials before extraction or fewer than 10 valid trials after extraction.
 
-ii.
+ii. 
+```python
+MIN_TRIALS = 10
+```
 ```python
 if start_fr < 0 or end_fr > n_frames:
     valid_mask.append(False)
+    neural_trials.append(None)
+    input_trials.append(None)
+    output_trials.append(None)
+```
+```python
+if beh['ntrials'] < MIN_TRIALS:
     ...
-    continue
-...
 if len(valid_neural) < MIN_TRIALS:
-    print(f"  Skipping: only {len(valid_neural)} valid trials after filtering")
-    continue
+    ...
 ```
 
-iii. The trajectory shows the agent noticed very long trial durations and late cue times in step 33 and step 50, but it did not add extra trial QC beyond the bounds check.
+iii. The AI does not provide a strong paper-based justification. The trajectory frames the filtering as a practical decoder requirement rather than a reference-matching curation rule.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` is derived from the Suite2p deconvolved fluorescence traces stored as `spk_data['spks']` in each `*_neural_data.npy` file.
+i. The neural data is derived from `spk_data['spks']` in each session’s spike file, concatenated across imaging planes. Brain-region assignments are derived from retinotopy `iarea`.
 
-ii.
+ii. 
 ```python
 spk_data = np.load(spk_path, allow_pickle=True).item()
 spk = np.concatenate([s for s in spk_data['spks']], axis=0)
 ```
+```python
+dtrans = np.load(ret_path, allow_pickle=True)
+return dtrans['iarea']
+```
 
-iii. The README and trajectory repeatedly describe the neural source as deconvolved calcium/Suite2p output.
+iii. The README describes the neural source as “Deconvolved calcium fluorescence traces from Suite2p” with retinotopy-based region assignment.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI concatenates planes, filters neurons to four visual cortex groups using retinotopy, and then slices raw deconvolved traces into 32-frame trial windows aligned to `StartFr`. It does not interpolate neural data to 60 position bins, restrict to running frames, or normalize the activity the way the reference analysis code often does.
+i. After concatenating imaging planes and filtering neurons by visual area, the AI slices a 32-frame window per trial starting at `StartFr` and stores it as `float32`. It does not interpolate, pad, or otherwise transform the traces.
 
-ii.
+ii. 
 ```python
-region_idx = get_brain_region_idx(iarea)
-valid_neurons = region_idx >= 0
 spk_filtered = spk[valid_neurons]
-...
+```
+```python
 trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
 ```
 
-iii. Trajectory step 33 records the key decision: the agent considered using the reference position-interpolated representation, but rejected it as too expensive and instead chose fixed raw-frame windows.
+iii. The README says the processing is “Fixed-length time windows per trial” aligned to corridor entry. The trajectory shows the AI chose this for fixed-size decoder inputs.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Neurons are filtered by retinotopy: keep only neurons mapped to `V1`, `mHV`, `lHV`, or `aHV`; exclude neurons with no mapped region. Entire sessions are skipped if fewer than 10 such neurons remain. No frame-level QC is applied to neural data after loading.
+i. Neurons are kept only if retinotopy maps them into one of four visual regions: `V1`, `mHV`, `lHV`, or `aHV`. Sessions with fewer than 10 retained neurons are skipped entirely.
 
-ii.
+ii. 
 ```python
-region_idx = get_brain_region_idx(iarea)
+region_idx = np.full(len(iarea), -1, dtype=int)
+region_idx[iarea == 8] = 0
+region_idx[(iarea == 0) | (iarea == 1) | (iarea == 2) | (iarea == 9)] = 1
+region_idx[(iarea == 5) | (iarea == 6)] = 2
+region_idx[(iarea == 3) | (iarea == 4)] = 3
+```
+```python
 valid_neurons = region_idx >= 0
-
+...
 if valid_neurons.sum() < 10:
     print(f"  Skipping: only {valid_neurons.sum()} visual cortex neurons")
     continue
 ```
 
-iii. The docstring and trajectory step 35 say the agent matched the retinotopy area mapping and exclusion of neurons outside visual cortex.
+iii. The README justifies the region filter as “All visual cortex neurons ... kept; neurons outside visual cortex excluded.” The extra minimum-neuron session filter is not separately justified.
 
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+## 2-d. How is the per-trial `neural` data aligned to the event described in the instructions?
 
-i. Per-trial neural data are aligned to trial start, operationalized as corridor entry at `StartFr`.
+i. Neural data is aligned to trial start, interpreted as corridor entry, by taking frames from `StartFr` onward. The alignment is purely frame-index based, using the rounded `StartFr` as the first bin.
 
-ii.
+ii. 
 ```python
-start_frs = beh['StartFr']
-...
 start_fr = int(np.round(start_frs[trial]))
+end_fr = start_fr + n_timepoints
 trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
 ```
 
-iii. This choice is explicit in the script docstring and in trajectory step 33, where the agent says “Align to trial start (corridor entry).”
+iii. The README explicitly states “Align to trial start (corridor entry)” and “Window: 32 frames from corridor entry.”
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The temporal resolution is one calcium imaging frame, `1000 / 3.17 = 315.46 ms`. No temporal rebinning is applied; the code uses raw frames directly and fixes the number of frames per trial at 32.
+i. The AI uses the native imaging frame rate, `FS = 3.17`, so each time bin is about 315.5 ms. No temporal rebinning is applied.
 
-ii.
+ii. 
 ```python
-FS = 3.17
-TIME_BIN_MS = 1000.0 / FS
-N_TIMEPOINTS = 32
+FS = 3.17  # Calcium imaging frame rate in Hz
+TIME_BIN_MS = 1000.0 / FS  # ~315.5 ms per frame
+```
+```python
+'time_bin_size': TIME_BIN_MS,
 ```
 
-iii. Trajectory step 33 states the agent chose to “use the calcium imaging frame rate as my time bins (~315 ms per frame).”
+iii. The README says the neural data is sampled at about 3.17 Hz and treats that as the decoder time grid.
 
 ## 3-a. What variables in the raw data is `input` *Time to sound cue* derived from?
 
-i. It is derived from `SoundFr` and `StartFr`.
+i. The AI derives `time_to_sound_cue` from `SoundFr`, `StartFr`, and the constant frame rate `FS`. It does not use the recorded frame timestamps `ft`.
 
-ii.
+ii. 
 ```python
 start_frs = beh['StartFr']
 sound_frs = beh['SoundFr']
-sound_fr_rel = sound_frs[trial] - start_frs[trial]
 ```
-
-iii. The trajectory discusses cue timing repeatedly, especially in step 50 when the agent examined extreme cue offsets.
-
-## 3-b. What processing is involved in computing `input` *Time to sound cue*?
-
-i. For each trial, the code computes frame offsets relative to the cue, then divides by `FS` to express them in seconds. The resulting vector is negative before the cue and positive after the cue.
-
-ii.
 ```python
+sound_fr_rel = sound_frs[trial] - start_frs[trial]
 time_to_cue = np.arange(n_timepoints) - sound_fr_rel
 time_to_cue_sec = time_to_cue / FS
 ```
 
-iii. Trajectory step 50 explicitly says the large negative values are “mathematically correct” because they represent frames before a late cue.
+iii. The README describes this as “Time relative to sound cue onset (seconds), negative before cue.” The trajectory shows the AI accepted large cue offsets as a consequence of delayed cues in long trials.
+
+## 3-b. What processing is involved in computing `input` *Time to sound cue*?
+
+i. For each trial, the code computes the cue’s frame offset from `StartFr`, subtracts that offset from `0..31`, and divides by `FS` to express it in seconds. The resulting sign convention is negative before the cue and positive after it.
+
+ii. 
+```python
+sound_fr_rel = sound_frs[trial] - start_frs[trial]
+time_to_cue = np.arange(n_timepoints) - sound_fr_rel
+time_to_cue_sec = time_to_cue / FS
+```
+
+iii. The trajectory explicitly discusses “negative before cue” and treats extreme negative values as mathematically correct when cues happen long after trial start.
 
 ## 3-c. How is the `input` *Time to sound cue* aligned with the neural data?
 
-i. It is aligned to the same 32-frame trial window used for neural data, with time index 0 corresponding to the first neural frame after rounded `StartFr`.
+i. It is defined on exactly the same 32 bins as the neural window, using the trial’s `StartFr` as time zero and one value per frame in the extracted neural segment.
 
-ii.
+ii. 
 ```python
 trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
-time_to_cue = np.arange(n_timepoints) - sound_fr_rel
+...
+trial_input = np.stack([time_to_cue_sec, day_of_training, time_since_start, reward_avail])
 ```
 
-iii. The alignment follows the agent’s broader step-33 decision to align every variable to corridor entry and keep fixed-length time windows.
+iii. The AI’s general justification is that all decoder variables should share the same fixed frame-aligned trial window.
 
 ## 4-a. What variables in the raw data is `input` *Day of training* derived from?
 
-i. It is derived from session dates `datexp` collected from the collapsed `sessions` dictionary, not from a dedicated per-session training-day field in the behavior metadata.
+i. `day_of_training` is derived from mouse name `mname` and session date string `datexp` across all sessions. It is not taken from a raw “day” field.
 
-ii.
+ii. 
 ```python
 for k, s in all_sessions.items():
     if s['mname'] == mname:
@@ -203,378 +244,441 @@ for k, s in all_sessions.items():
         mouse_dates.append(date)
 ```
 
-iii. The trajectory does not show a separate defense of this choice. The code stores `days`/`sess#` in the session dictionary but never uses them.
+iii. The README describes this as “Days since first recording session for this mouse.”
 
 ## 4-b. What processing is involved in computing `input` *Day of training*?
 
-i. The AI sorts recording dates for a mouse, subtracts the first date from the current session date, and uses the resulting number of calendar days. It then repeats that scalar across all time bins in every trial of the session.
+i. The AI parses each session’s calendar date, finds the first date for that mouse, computes the integer day difference to the current session, and broadcasts that constant value across all 32 bins of every trial in the session.
 
-ii.
+ii. 
 ```python
 mouse_dates.sort()
 current_date = datetime.strptime(datexp, '%Y_%m_%d')
 day_idx = (current_date - mouse_dates[0]).days
-...
-input_trials[i][1, :] = float(day)
+return day_idx
 ```
-
-iii. This is an inferred implementation decision from the code itself; there is no matching explanation in a notes file because `CONVERSION_NOTES.md` is missing.
-
-## 4-c. What variables in the raw data is `input` *Environment type* derived from?
-
-i. The AI did not create an `environment type` input at all, so it does not derive this variable from any raw field.
-
-ii.
 ```python
-input_names = ['time_to_sound_cue', 'day_of_training', 'time_since_trial_start', 'reward_availability']
+for i in range(len(input_trials)):
+    if valid_mask[i]:
+        input_trials[i][1, :] = float(day)
 ```
 
-iii. There is no trajectory evidence that the agent attempted to add this variable. It followed the decoder-input list from the user instructions instead.
-
-## 4-d. What processing is involved in computing `input` *Environment type*?
-
-i. No processing is performed because the variable is omitted.
-
-ii.
-```python
-trial_input = np.stack([time_to_cue_sec, day_of_training, time_since_start, reward_avail])
-```
-
-iii. The omission is implicit in both the code and the README.
+iii. The only explicit justification is in the README; the trajectory does not defend this against the reference solution’s session-count definition.
 
 ## 5-a. What variables in the raw data is `input` *Time since trial start* derived from?
 
-i. It is derived from the trial alignment point `StartFr` plus the global frame rate `FS`; it is not read from a raw timestamp vector such as `beh['ft']`.
+i. The AI derives `time_since_trial_start` from the fixed frame index within the 32-frame trial window and the constant frame rate `FS`. It does not use `ft` timestamps except indirectly through `StartFr` for alignment.
 
-ii.
+ii. 
 ```python
-time_since_start = np.arange(n_timepoints) / FS
+time_since_start = np.arange(n_timepoints) / FS  # in seconds
 ```
 
-iii. The trajectory shows the agent intentionally used imaging frames as the time basis.
+iii. The README describes this input as “Time from corridor entry (seconds),” consistent with counting elapsed time from the aligned start frame.
 
 ## 5-b. What processing is involved in computing `input` *Time since trial start*?
 
-i. The AI creates a simple linear ramp `0, 1/FS, 2/FS, ...` for 32 bins and copies that same ramp into every trial.
+i. The code sets the first bin to 0 and increments by `1 / FS` for each later bin, producing a simple linear time axis `[0, 1/FS, 2/FS, ...]` for every trial.
 
-ii.
+ii. 
 ```python
 time_since_start = np.arange(n_timepoints) / FS
 ```
 
-iii. This follows directly from the step-33 decision to use raw frame bins instead of the reference position interpolation.
+iii. The AI’s rationale is implicit: once trials are represented as fixed 32-frame windows, elapsed time is just frame index divided by frame rate.
 
 ## 5-c. How is the `input` *Time since trial start* aligned with the neural data?
 
-i. It is aligned to the neural window by construction: the first value is the first neural frame after `StartFr`, and the vector has the same 32 time bins as the neural matrix.
+i. It is aligned by construction to the same 32 neural frames starting at `StartFr`, with time 0 assigned to the first neural frame of each trial.
 
-ii.
+ii. 
 ```python
 trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
-time_since_start = np.arange(n_timepoints) / FS
+...
+trial_input = np.stack([time_to_cue_sec, day_of_training, time_since_start, reward_avail])
 ```
 
-iii. The script’s core alignment logic uses the same `start_fr` for all trial-wise variables.
+iii. The AI consistently treats all signals as sharing the same extracted frame window.
 
 ## 6-a. What variables in the raw data is `input` *Reward availability* derived from?
 
-i. It is derived from `beh['isRew']`.
+i. Reward availability is taken directly from per-trial `isRew`.
 
-ii.
+ii. 
 ```python
 is_rew = beh['isRew']
+```
+```python
 reward_avail = np.full(n_timepoints, float(is_rew[trial]))
 ```
 
-iii. The agent’s README describes this variable as “1 if rewarded corridor, 0 if not.”
+iii. The README describes this as “1 if rewarded corridor, 0 if not.”
 
 ## 6-b. What processing is involved in computing `input` *Reward availability*?
 
-i. The code converts the per-trial Boolean into a constant 32-bin float vector.
+i. No transformation is applied beyond broadcasting the per-trial `isRew` value across all 32 time bins of the trial.
 
-ii.
+ii. 
 ```python
 reward_avail = np.full(n_timepoints, float(is_rew[trial]))
 ```
 
-iii. No extra justification appears in the trajectory; this is a straightforward reading of the instructions.
+iii. The AI provides no additional justification; this is a direct per-trial flag adapted to a time-varying input matrix.
 
 ## 7-a. What variables in the raw data is `output` *Visual stimulus category* derived from?
 
-i. It is derived from `WallName` for each trial and from `UniqWalls` when collecting all possible categories across sessions.
+i. The stimulus output is derived from `WallName` for each trial.
 
-ii.
+ii. 
 ```python
 wall_names = beh['WallName']
 ...
 wall_name = wall_names[trial]
 stim_cat = wall_name
-...
-for w in beh['UniqWalls']:
-    all_stim_names.add(w)
 ```
 
-iii. The trajectory and README both frame this output as the corridor texture identity (for example `circle1`, `leaf2`).
+iii. The README says the output is the trial’s stimulus category, for example `circle1` or `leaf1`.
 
 ## 7-b. What processing is involved in computing `output` *Visual stimulus category*?
 
-i. The AI collects all wall names observed across kept sessions, sorts them globally, maps each trial’s `WallName` to an integer index, and writes that integer into every time bin of the trial.
+i. The AI keeps the full wall-name categories rather than collapsing them to four base textures. It first collects all unique wall names across sessions, sorts them, maps each trial’s `WallName` to an integer index in that 15-class list, and broadcasts that index across the full trial.
 
-ii.
+ii. 
 ```python
-all_stim_sorted = sorted(str(s) for s in all_stim_names)
+for w in beh['UniqWalls']:
+    all_stim_names.add(w)
 ...
+all_stim_sorted = sorted(str(s) for s in all_stim_names)
+```
+```python
 stim_idx = stim_to_idx.get(str(stim_cats[i]), 0)
 output_trials[i][0, :] = stim_idx
 ```
+```python
+output_values = [
+    [str(s) for s in all_stim_sorted],
+    ['no_lick', 'lick'],
+    ['0-1m', '1-2m', '2-3m', '3-4m'],
+    ['Q1', 'Q2', 'Q3', 'Q4'],
+]
+```
 
-iii. In the trajectory the agent treats this as a per-trial categorical label but keeps it time-varying in shape to satisfy the decoder format.
+iii. The README explicitly states “15 stimulus categories across all sessions,” so the AI intentionally used the full stimulus identities instead of broad texture groups.
 
 ## 8-a. What variables in the raw data is `output` *Licking* derived from?
 
-i. It is derived from `LickFr`, `LickTrind`, and the per-trial alignment frame `StartFr`.
+i. Licking is derived from `LickFr` and `LickTrind`: the code uses `LickTrind` to find licks belonging to the current trial and `LickFr` to place them into per-frame bins.
 
-ii.
+ii. 
 ```python
 lick_frs = beh['LickFr']
 lick_trinds = beh['LickTrind']
-...
-fr_idx = int(np.round(lf)) - start_fr
 ```
-
-iii. The trajectory step 32 shows the agent explicitly inspected `LickFr` and `LickTrind` to decide how to build a per-frame binary lick output.
-
-## 8-b. What processing is involved in computing `output` *Licking*?
-
-i. The AI creates a zero vector of length 32 for each trial and sets entries to 1 when a rounded lick frame falls inside that trial window.
-
-ii.
 ```python
-lick_binary = np.zeros(n_timepoints, dtype=float)
 trial_lick_mask = lick_trinds == trial
 if trial_lick_mask.any():
     trial_lick_frs = lick_frs[trial_lick_mask]
-    for lf in trial_lick_frs:
-        fr_idx = int(np.round(lf)) - start_fr
-        if 0 <= fr_idx < n_timepoints:
-            lick_binary[fr_idx] = 1.0
 ```
 
-iii. The justification is implicit in the trajectory: the agent wanted a time-varying binary output aligned to trial start.
+iii. The AI does not explain this separately, but the code reflects a trial-by-trial reconstruction of licking from lick event frame numbers.
+
+## 8-b. What processing is involved in computing `output` *Licking*?
+
+i. For each trial, it initializes a 32-bin zero vector, rounds each lick frame to the nearest integer frame, subtracts the rounded trial start frame, and sets bins with licks to 1. Multiple licks in the same bin remain a single 1.
+
+ii. 
+```python
+lick_binary = np.zeros(n_timepoints, dtype=float)
+...
+for lf in trial_lick_frs:
+    fr_idx = int(np.round(lf)) - start_fr
+    if 0 <= fr_idx < n_timepoints:
+        lick_binary[fr_idx] = 1.0
+```
+
+iii. The AI’s implicit rationale is to make licking a binary time-varying output on the same fixed frame grid as the neural data.
 
 ## 8-c. How is `output` *Licking* aligned with the neural data?
 
-i. Licks are aligned by subtracting the trial’s `start_fr` from each lick frame and placing the result into the same 32-bin trial window used for neural data.
+i. Licking is aligned to the same 32-frame `StartFr`-anchored window as the neural activity, using frame offsets relative to `start_fr`.
 
-ii.
+ii. 
 ```python
 fr_idx = int(np.round(lf)) - start_fr
 if 0 <= fr_idx < n_timepoints:
     lick_binary[fr_idx] = 1.0
 ```
+```python
+trial_output = np.stack([
+    np.zeros(n_timepoints, dtype=int),
+    lick_binary.astype(int),
+    pos_binned.astype(int),
+    speed_binned.astype(int),
+])
+```
 
-iii. This follows the global corridor-entry alignment choice from trajectory step 33.
+iii. This follows the AI’s overall fixed-window alignment strategy.
 
 ## 9-a. What variables in the raw data is `output` *Position in corridor* derived from?
 
-i. It is derived from frame-level position `beh['ft_Pos']`.
+i. Position is derived from frame-level `ft_Pos`.
 
-ii.
+ii. 
 ```python
 ft_pos = beh['ft_Pos'][:n_frames]
+...
 trial_pos = ft_pos[start_fr:end_fr]
 ```
 
-iii. The code ignores the reference interpolation inputs `ft_PosCum`, `ft_trInd`, and `ft_move` even though the trajectory acknowledged them.
+iii. The README states that position is a time-varying output discretized from the corridor position.
 
 ## 9-b. What processing is involved in computing `output` *Position in corridor*?
 
-i. The AI slices raw `ft_Pos` over the 32-frame time window and directly discretizes those decimeter positions. It does not interpolate activity or behavior to uniform position bins per trial.
+i. The AI takes the 32 `ft_Pos` values starting at `StartFr`, bins them by decimeter boundaries into four 1 m bins, and uses those categorical values directly for the output.
 
-ii.
+ii. 
+```python
+def discretize_position(pos_values, n_bins=4):
+    boundaries = [10, 20, 30]
+    binned = np.digitize(pos_values, boundaries)
+    return binned
+```
 ```python
 trial_pos = ft_pos[start_fr:end_fr]
 pos_binned = discretize_position(trial_pos)
 ```
 
-iii. Trajectory step 33 records that the agent considered the reference position-interpolation approach but deliberately replaced it with raw time windows for practicality.
+iii. The README justifies this as “Position in corridor discretized into 4 x 1m bins.”
 
 ## 9-c. How is `output` *Position in corridor* thresholded into categories?
 
-i. Position is thresholded with fixed boundaries at 10, 20, and 30 decimeters, producing four bins corresponding to `0-1m`, `1-2m`, `2-3m`, and `3-4m`. Any values above 40 dm, including gray-space values, also land in the last bin.
+i. The code uses thresholds at 10, 20, and 30 decimeters, which produce four categories corresponding to `0-1m`, `1-2m`, `2-3m`, and `3-4m`. Values beyond 40 dm are still assigned to the last bin.
 
-ii.
+ii. 
 ```python
-boundaries = [10, 20, 30]
-binned = np.digitize(pos_values, boundaries)
-...
+boundaries = [10, 20, 30]  # in decimeters
+binned = np.digitize(pos_values, boundaries)  # 0,1,2,3
+```
+```python
 ['0-1m', '1-2m', '2-3m', '3-4m']
 ```
 
-iii. The docstring states the rationale explicitly and notes that gray-space values are forced into the last bin.
+iii. The README and code comments explicitly describe the categories as 1 m bins over the textured corridor.
 
 ## 9-d. How is `output` *Position in corridor* aligned with the neural data?
 
-i. Position is aligned by taking the same raw frame indices `start_fr:end_fr` used for the neural data. Because the window is fixed at 32 frames rather than bounded by `GrayFr`/`EndFr`, some trials can include gray-space or even next-trial positions.
+i. Position values are taken from the same 32-frame `StartFr`-aligned trial window used for neural data.
 
-ii.
+ii. 
 ```python
 trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
+...
 trial_pos = ft_pos[start_fr:end_fr]
+pos_binned = discretize_position(trial_pos)
 ```
 
-iii. The trajectory shows the agent knew trials had widely varying durations but still chose the fixed 32-frame alignment.
+iii. The AI’s fixed-window trial representation is the only stated alignment principle.
 
 ## 10-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. It is derived from `beh['ft_RunSpeed']`.
+i. Running speed is derived from frame-level `ft_RunSpeed`.
 
-ii.
+ii. 
 ```python
 ft_speed = beh['ft_RunSpeed'][:n_frames]
+```
+```python
 trial_speed = ft_speed[start_fr:end_fr]
 ```
 
-iii. The behavior-variable notebook and the trajectory both identify `ft_RunSpeed` as the frame-level running-speed signal.
+iii. The README describes running speed as a time-varying output later discretized into quartiles.
 
 ## 10-b. What processing is involved in computing `output` *Running speed*?
 
-i. The AI first computes per-trial bins locally, then overwrites them using global quartile boundaries computed from all non-NaN `ft_RunSpeed` values across all kept sessions. It does not restrict the quartiles to running-only frames, so the first quartile boundary is 0 because stationary periods are included.
+i. The AI first defines a per-array percentile-based discretizer, then separately computes global speed quartile boundaries across all sessions, and finally re-discretizes each trial’s 32-frame speed segment with those global thresholds.
 
-ii.
+ii. 
+```python
+def discretize_speed(speed_values, n_bins=4):
+    valid = speed_values[~np.isnan(speed_values)]
+    ...
+    boundaries = np.percentile(valid, percentiles)
+    binned = np.digitize(speed_values, boundaries)
+    return binned
+```
 ```python
 all_speeds = np.concatenate(all_speeds)
 speed_quartiles = np.percentile(all_speeds, [25, 50, 75])
-...
+```
+```python
 trial_speed = beh['ft_RunSpeed'][start_fr:end_fr]
 speed_binned = np.digitize(trial_speed, speed_quartiles)
 output_trials[i][3, :] = speed_binned.astype(int)
 ```
 
-iii. Trajectory step 50 notes the suspicious quartile result: “Q1 is at 0.0—indicating many frames where the mouse isn't moving at all.”
+iii. The conversion log and README say the agent chose “global speed quartiles” for consistency across sessions.
 
 ## 10-c. How is `output` *Running speed* thresholded into categories?
 
-i. Speed is thresholded into four quantile bins using dataset-wide percentile boundaries at 25%, 50%, and 75%.
+i. The final thresholds are the global 25th, 50th, and 75th percentiles computed across all non-`NaN` framewise speeds from all sessions. The output values are labeled `Q1` to `Q4`.
 
-ii.
+ii. 
 ```python
 speed_quartiles = np.percentile(all_speeds, [25, 50, 75])
-speed_binned = np.digitize(trial_speed, speed_quartiles)
-...
-['Q1', 'Q2', 'Q3', 'Q4']
+print(f"Global speed quartile boundaries: {speed_quartiles}")
+```
+```python
+output_values = [
+    ...,
+    ['Q1', 'Q2', 'Q3', 'Q4'],
+]
 ```
 
-iii. The agent justified this as “global speed quartiles” for consistency across sessions.
+iii. The AI explicitly reports “Computing global speed quartiles...” in `conversion_full_out.txt`, so this was an intentional dataset-wide thresholding choice.
 
 ## 10-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Speed is aligned by slicing `ft_RunSpeed` over the same fixed raw-frame trial window as the neural data.
+i. Running speed is aligned by slicing the same `start_fr:end_fr` window used for neural data and discretizing those 32 framewise values.
 
-ii.
+ii. 
 ```python
-trial_speed = ft_speed[start_fr:end_fr]
-trial_output = np.stack([
-    ...,
-    speed_binned.astype(int),
-])
+trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
+...
+trial_speed = beh['ft_RunSpeed'][start_fr:end_fr]
 ```
 
-iii. This is part of the same fixed-window corridor-entry alignment chosen in trajectory step 33.
+iii. As with the other time-varying outputs, the alignment follows the AI’s fixed 32-frame trial window.
 
 ## 11. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Handling is ad hoc. Out-of-bounds trials are set to `None` and later dropped. Missing speed values are ignored when computing quartiles, and if an entire vector were NaN the code would output zeros. Missing stimulus mappings fall back to category index 0. There is no dedicated handling for unusually long cue delays, gray-space contamination, duplicated behavior views beyond the heuristic collapse, or other anomalies.
+i. The AI handles issues mostly by skipping invalid items rather than repairing or trimming them. Trials are dropped if their 32-frame window would exceed the imaged frames, sessions are skipped if behavior keys, spike files, or retinotopy files cannot be loaded, and licks outside the current trial window are ignored. The code also truncates `ft_Pos`, `ft_move`, and `ft_RunSpeed` to `n_frames`, but it does not systematically use the raw per-frame timestamp array to reconcile behavior extending beyond imaging.
 
-ii.
+ii. 
+```python
+ft_pos = beh['ft_Pos'][:n_frames]
+ft_move = beh['ft_move'][:n_frames]
+ft_speed = beh['ft_RunSpeed'][:n_frames]
+```
 ```python
 if start_fr < 0 or end_fr > n_frames:
+    valid_mask.append(False)
     ...
     continue
 ```
-
 ```python
-valid = speed_values[~np.isnan(speed_values)]
-if len(valid) == 0:
-    return np.zeros_like(speed_values, dtype=int)
+if beh_key not in beh_cache[exp_type]:
+    print(f"  WARNING: beh_key {beh_key} not in {exp_type}, skipping")
+    continue
 ...
-stim_idx = stim_to_idx.get(str(stim_cats[i]), 0)
+except Exception as e:
+    print(f"  ERROR loading spk: {e}")
+    continue
 ```
 
-iii. Trajectory step 50 shows the agent recognized extreme cue timings and zero-heavy speed quartiles, but the final code leaves those issues in place.
+iii. There is no explicit justification beyond practical robustness. The agent’s notes file that was supposed to document such handling is missing.
 
 ## 12-a. What are the most time-consuming steps of the code?
 
-i. The most expensive steps are loading multi-gigabyte spike files, concatenating all planes into one dense neuron-by-frame matrix, looping over every trial in every session to slice neural and behavior arrays, computing global speed quartiles over all sessions, and serializing the enormous pickle output.
+i. The most expensive steps are loading and concatenating the large spike files for every session, the extra full-dataset pass to gather global speed quartiles, and the per-trial extraction loops that build full `(neurons x 32)` tensors. The trajectory also shows the agent was primarily worried about neural-data I/O and dataset size.
 
-ii.
+ii. 
 ```python
+spk_data = np.load(spk_path, allow_pickle=True).item()
 spk = np.concatenate([s for s in spk_data['spks']], axis=0)
-...
+```
+```python
+for key, sess_info in sessions.items():
+    ...
+    all_speeds.append(valid_speed)
+all_speeds = np.concatenate(all_speeds)
+speed_quartiles = np.percentile(all_speeds, [25, 50, 75])
+```
+```python
 for trial in range(ntrials):
     ...
-all_speeds = np.concatenate(all_speeds)
-...
-pickle.dump(data, f)
+    trial_neural = spk[:, start_fr:end_fr].astype(np.float32)
 ```
 
-iii. The trajectory repeatedly comments on runtime and memory pressure, especially when loading 4-7 GB spike files and writing multi-GB output.
+iii. In the trajectory, the AI repeatedly discusses session loading times, spike-file size, and the impracticality of very large pickles, which points to I/O and tensor construction as the dominant costs.
 
 ## 12-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The per-trial extraction loop, the per-lick loop inside each trial, the separate post-processing loops that fill day-of-training, re-discretize speed, and fill stimulus categories, and the first-pass loop over behavior files to gather categories and speeds could all be reduced or vectorized.
+i. Several loops could have been vectorized: the per-trial extraction loop, the per-lick loop inside each trial, the loop that fills `day_of_training`, the loop that re-discretizes speed per trial, and the loop that fills stimulus indices. These are all explicit Python loops over data that is mostly already array-structured.
 
-ii.
+ii. 
 ```python
 for trial in range(ntrials):
     ...
     for lf in trial_lick_frs:
-        ...
+        fr_idx = int(np.round(lf)) - start_fr
 ```
-
 ```python
 for i in range(len(input_trials)):
-    ...
+    if valid_mask[i]:
+        input_trials[i][1, :] = float(day)
+```
+```python
 for i in range(len(output_trials)):
-    ...
-for i in range(len(output_trials)):
-    ...
+    if valid_mask[i]:
+        trial_speed = beh['ft_RunSpeed'][start_fr:end_fr]
+        speed_binned = np.digitize(trial_speed, speed_quartiles)
+        output_trials[i][3, :] = speed_binned.astype(int)
 ```
 
-iii. No explicit justification is given; this follows directly from the final implementation structure.
+iii. The AI does not discuss vectorization, but the loops are visible in the implementation.
 
 ## 12-c. What processing does the code repeat multiple times?
 
-i. The code discretizes running speed twice, scans behavior files once to gather stimulus names and again to gather all speeds, iterates over trials once to build outputs and then over trials again to fill day-of-training, speed bins, and stimulus IDs, and repeatedly rounds/derives frame windows from `StartFr`.
+i. The code repeats several computations: it scans behavior once to collect all stimulus names, again to collect all speeds for quartiles, then again to process sessions; it computes a preliminary speed discretization inside `extract_trial_data` and later overwrites it with global discretization; and `compute_day_of_training` re-scans all sessions for each processed session.
 
-ii.
+ii. 
+```python
+for key, sess_info in sessions.items():
+    ...
+    for w in beh['UniqWalls']:
+        all_stim_names.add(w)
+```
+```python
+for key, sess_info in sessions.items():
+    ...
+    all_speeds.append(valid_speed)
+```
 ```python
 speed_binned = discretize_speed(trial_speed, n_bins=4)
-...
-speed_binned = np.digitize(trial_speed, speed_quartiles)
-output_trials[i][3, :] = speed_binned.astype(int)
+```
+```python
+for i in range(len(output_trials)):
+    if valid_mask[i]:
+        ...
+        speed_binned = np.digitize(trial_speed, speed_quartiles)
+        output_trials[i][3, :] = speed_binned.astype(int)
 ```
 
-iii. This repeated work is visible in the code; there is no separate note defending it.
+iii. There is no explicit justification for these repeated passes. They appear to be artifacts of how the script evolved.
 
 ## 12-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. It computes an initial per-trial speed discretization that is always overwritten later, loads `ft_move` but never uses it, stores `days` in the session metadata without using it for `day_of_training`, defines `STIM_NAMES` but never uses it, and expands per-trial stimulus labels into 32-bin time series even though they are constant within trial.
+i. The script computes and stores several intermediate values that are unused or later discarded: `ft_move`, `stim_id`, `uniq_walls`, and the initial per-trial speed discretization are not needed in the final dataset; output row 0 is first filled with zeros as a placeholder and later overwritten; and the code keeps metadata fields like `stim_id`/`n_stim` mainly to choose session variants rather than to build the final decoder data.
 
-ii.
+ii. 
 ```python
 ft_move = beh['ft_move'][:n_frames]
 ...
+stim_id = beh.get('stim_id', None)
+uniq_walls = beh['UniqWalls']
+```
+```python
 speed_binned = discretize_speed(trial_speed, n_bins=4)
 ...
 output_trials[i][3, :] = speed_binned.astype(int)
 ```
-
 ```python
-STIM_NAMES = {
-    0: 'circle1',
-    ...
-}
+trial_output = np.stack([
+    np.zeros(n_timepoints, dtype=int),  # placeholder for stim category
+    lick_binary.astype(int),
+    pos_binned.astype(int),
+    speed_binned.astype(int),
+])
 ```
 
-iii. These are direct observations from the final script. The trajectory does not indicate the agent noticed most of these redundancies.
+iii. The trajectory does not justify these extra computations. They look like implementation leftovers rather than deliberate downstream requirements.
