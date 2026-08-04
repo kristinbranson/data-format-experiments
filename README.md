@@ -16,9 +16,11 @@ Code in `data-format` repo expects this to live in the subdirectory `harbor-jobs
         reward.txt, ctrf.json          the 0/1 reward and per-test pass/fail
         test-stdout.txt                pytest output, including *why* a test failed
         judge/<name>/                  LLM judge verdicts and transcripts
+        judge_unsupervised/<name>/     LLM judge verdicts and transcripts	
         snapshot/
             convert_data.py            the agent's conversion script
             CONVERSION_NOTES.md        the agent's own account of what it did
+	    README.md		       the agent's dataset README: stats, provenance
             *_out.txt                  what its scripts printed
 ```
 
