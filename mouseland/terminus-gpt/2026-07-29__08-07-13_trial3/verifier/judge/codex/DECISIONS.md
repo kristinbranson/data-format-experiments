@@ -2,304 +2,304 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent never implemented a loader. From `CONVERSION_NOTES.md` and the trajectory, its partial plan was to treat `data/spk/` as the canonical session list, load behavior from `data/beh/` condition files, and match behavior keys back to the spike-session ids, including handling `_swap` variants by base session id. It did not document using `beh/Imaging_Exp_info.npy`, did not document loading retinotopy, and never wrote executable loading code.
+i. The AI never reached a concrete loading design. The closest recorded decision is in `CONVERSION_NOTES.md`: behavior was thought to live in `data/beh/*.npy` and neural data in `data/spk/*_neural_data.npy`. It did not document the master index `Imaging_Exp_info.npy`, the per-session retinotopy files, or the reference solution's behavior-file grouping and per-session spike/retinotopy reads.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. This comes from Step 2 notes (`data/spk/` and `data/beh/` only) and the attempted Step 4 edit in the trajectory: “Use neural session list as canonical sessions and map behavior by base session ID, handling `_swap` variants separately.”
+iii. `CONVERSION_NOTES.md` leaves `Step 5: Mapping Planning` as `NOT STARTED` and `Step 6: Script Development` as `NOT STARTED`. The trajectory ends with repeated messages that the shell was stuck in continuation mode and no further commands could execute.
 
-## 1-b. How are the data split into subjects (mice)?
+## 1-b. How are the data split into subjects?
 
-i. Subjects were partially inferred from spike-file names. The notes count 19 subjects and list sessions per subject from the prefixes of the 89 spike filenames. No final `subjects` or `subject_idx` construction was implemented.
+i. No subject-splitting logic was implemented. The notes do record `Subjects | 19` and session counts per animal, which implies the AI inferred subject identity from session/file naming, but it never documented a rule equivalent to the reference solution's grouping by `mname` from the master index.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The Step 2 notes explicitly summarize 19 subjects and per-subject session counts from `data/spk/` filenames rather than from the master experiment index.
+iii. The only support is the Step 2 notes listing 19 subjects and per-subject session counts. No mapping or assembly code was written.
 
 ## 1-c. How are the data split into sessions?
 
-i. Sessions were partially treated as the 89 `*_neural_data.npy` files in `data/spk/`, with behavior matched back to those session ids. The agent also noted that extra behavior keys came from swap variants and aggregate labels. It never implemented the reference session construction from `(mname, datexp, blk)` via `Imaging_Exp_info.npy`.
+i. The AI partially identified that neural files are session-wise and named `<session_id>_neural_data.npy`, and that behavior dictionaries are keyed by session IDs. It never specified the reference session definition `(mname, datexp, blk)`, never handled duplicate listings across experiment types, and never implemented session iteration.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The trajectory records the Step 4 note: all 89 spike sessions are present in the behavior base-session keys, and the neural session list should be treated as canonical.
+iii. This comes from the Step 2 notes only. The reference-style session bookkeeping was never planned or coded.
 
 ## 1-d. How are the data split into trials?
 
-i. The agent identified candidate trial-boundary variables but never chose a trial-splitting procedure. It inspected `ntrials`, `ft_trInd`, `StartFr`, `GrayFr`, and `EndFr`, but it did not document the reference rule of using frames where `ft_trInd == trial` and `ft_CorrSpc` is true.
+i. No trial-splitting decision was made. The notes list `ntrials` and several trial-level variables, but they explicitly say exact trial definition and filtering still had to be extracted.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The only evidence is raw-data inspection in the trajectory; Step 5 mapping planning was never completed.
+iii. The Step 3 notes say: `Trials are defined by corridor traversals ... exact trial filtering still to be extracted.` The agent never progressed to Step 5 mapping or Step 6 implementation.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. No trial-quality filter was specified. The closest partial idea was trimming behavior to the neural frame count because of a possible one-frame mismatch, but no explicit per-trial QC rule was documented or implemented.
+i. No trial-quality-control rule was decided. The AI never discovered or documented the reference solution's removal of empty trials and trials above the global 99th-percentile length threshold.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The notes and trajectory never reach a final trial-filtering decision.
+iii. The notes explicitly leave trial curation unresolved, and no later artifact fills it in.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The agent correctly identified `spks` in each session’s neural `.npy` dict as the source of the neural data. It also inferred that `spks` is a list of three large arrays, likely corresponding to planes or area groups.
+i. The AI identified only part of the raw source: it noted that each neural file is an object with key `spks` whose value is a list. It did not identify the retinotopy `iarea` variable as part of the neural/region derivation.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Step 2 notes say each neural file is a dict with key `spks`, and the attempted Step 4 edit interprets `spks` as “three area/plane-specific neuron-by-time arrays.”
+iii. Step 2 notes say the neural files are dicts with key `spks`. Step 4 adds a tentative interpretation that `spks` is a list of three area/plane-specific arrays, but there is no mention of `iarea` or any implementation.
 
 ## 2-b. How is the `neural` data processed?
 
-i. No final neural-processing pipeline was written. The agent’s partial understanding was that the three `spks` arrays should be interpreted as neuron-by-time arrays and that neural and behavior streams may need trimming to a common frame length. It never documented concatenation across planes, per-trial extraction, padding, or output dtype.
+i. The AI never reached a stable processing decision. Its notes are internally inconsistent: Step 2 says the data are "spike-based" and "not calcium imaging", while Step 3 says the paper uses deconvolved fluorescence traces, and Step 4 reinterprets `spks` as three area/plane-specific neuron-by-time arrays. It never decided on the reference solution's actual processing, which is simply concatenation across planes and slicing per trial.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The Step 4 discrepancy note in the trajectory discusses `spks` interpretation and a possible one-frame alignment trim, but there is no Step 5 mapping or Step 6 code.
+iii. The trajectory and notes show unresolved confusion about what `spks` contains, and Step 6 script development never started.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No neural quality-control filter was implemented. The agent did not document the retinotopy file, did not assign brain regions, and did not specify any keep/drop rule for neurons.
+i. No neural QC rule was implemented. The AI tentatively wrote that there was "No obvious ΔF/F computation or spike-sorting quality filtering" and left exact inclusion/exclusion criteria unresolved. It never recovered the reference solution's visual-area filter based on `iarea`.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Neither `CONVERSION_NOTES.md` nor the late trajectory contains a neuron-filtering rule; the work stopped before mapping or script development.
+iii. Step 1 notes speculate about missing QC filters; Step 3 notes say exact neuron curation rules still had to be extracted. No later decision exists.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Per-trial neural alignment was not decided. The only partial statement was that neural arrays and behavior `ft` are aligned up to a possible one-frame offset and should be trimmed to a common length. The agent never defined corridor-entry alignment or a fixed per-trial window.
+i. The only partial decision is very general: the AI noted that trial-start alignment seemed central and the decoder task specified corridor entry as the alignment event. It never translated that into a concrete per-trial neural window such as the reference solution's `ft_trInd & ft_CorrSpc` frame selection.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. This comes from the attempted Step 4 “Neural-behavior alignment” note in the trajectory.
+iii. The Step 1 notes mention "trial-start alignment", but Step 5 mapping never began and no alignment code was written.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The agent recognized that the data are frame-based deconvolved traces, but it left the exact time bin unresolved (“exact dt pending”) and never stated whether rebinning would occur.
+i. No final time-bin decision was made. The AI only wrote that the neural data seemed "frame-based" and that the exact time step was still pending.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Step 3 notes explicitly say “Neural data time bin | frame-based deconvolved traces (exact dt pending).”
+iii. Step 3 notes say `Neural data time bin | frame-based deconvolved traces (exact dt pending)`. There is no resolution of this question in the trajectory.
 
 ## 3-a. What variables in the raw data is `input` *Time to sound cue* derived from?
 
-i. No final source-variable mapping was documented. The agent inspected both `SoundFr` and `ft`, which are the obvious candidate variables for a frame-aligned time-to-cue signal, but it never committed to them in Step 5 or code.
+i. No mapping decision was recorded. The notes list some sound-related variables such as `SoundTime` and `SoundTimeDelay`, but the AI never identified the reference variables `SoundFr` and `ft`.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The behavior-field dump in the trajectory shows `SoundFr` and `ft` were discovered during dataset inspection.
+iii. Step 2 only inventories available behavior fields. Step 5 mapping never started.
 
 ## 3-b. What processing is involved in computing `input` *Time to sound cue*?
 
-i. No computation was specified for time to sound cue. There is no documented interpolation, subtraction, padding rule, or sign convention.
+i. No processing decision was made. The AI never described interpolation onto the frame-time axis or subtraction from per-frame time.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The notes never progress past field discovery for this variable.
+iii. There is no recorded design beyond listing possible raw variables in the notes.
 
 ## 3-c. How is the `input` *Time to sound cue* aligned with the neural data?
 
-i. No explicit alignment rule was written beyond the generic idea that neural and behavior frames are on a common frame grid after trimming.
+i. No alignment rule was implemented. The AI never specified any shared frame window for this input and the neural data.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. This is only implied by the partial “Neural-behavior alignment” note in the trajectory.
+iii. The agent never reached variable-level temporal alignment decisions.
 
 ## 4-a. What variables in the raw data is `input` *Day of training* derived from?
 
-i. The agent never documented a raw source for day of training. It recorded paper facts about training days, but it did not define day-of-training from session order, session dates, or any other field.
+i. No decision was recorded. The AI never documented the reference solution's derivation from per-mouse session ordering in the session IDs/index.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Step 3 notes summarize the behavioral paradigm, but Step 5 mapping never converts that into a variable definition.
+iii. Although the notes count sessions per subject, they never define a day-of-training variable.
 
 ## 4-b. What processing is involved in computing `input` *Day of training*?
 
-i. No processing rule was given for computing day of training. There is no session-ordering logic, per-subject counting, or broadcasting decision.
+i. No processing decision was made. The AI never described counting sessions per mouse in chronological order or broadcasting the value across frames.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. No Step 5 mapping or Step 6 code exists for this variable.
+iii. Step 5 mapping is untouched, so this variable was never planned in detail.
 
 ## 5-a. What variables in the raw data is `input` *Time since trial start* derived from?
 
-i. No final source-variable mapping was documented, but the agent did inspect `StartFr` and `ft`, which are the natural candidates for time since trial start.
+i. No decision was recorded. The notes mention trial start times generally (`Trial_start_time`), but the AI never identified the reference variables `StartFr` and `ft`.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The behavior-field inspection in the trajectory lists both `StartFr` and `ft`.
+iii. The notes inventory fields but do not map them to decoder inputs.
 
 ## 5-b. What processing is involved in computing `input` *Time since trial start*?
 
-i. No computation was specified for time since trial start. The agent did not describe interpolation from `StartFr`, subtraction from frame times, sign convention, or padding.
+i. No processing decision was made. The AI never described interpolating the start frame onto frame times and subtracting it from each neural bin time.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The work stopped before Step 5 mapping was filled in.
+iii. No mapping or implementation exists for this variable.
 
 ## 5-c. How is the `input` *Time since trial start* aligned with the neural data?
 
-i. No explicit alignment rule was documented beyond the generic idea of trimming neural and behavior to a common frame axis.
+i. No alignment rule was implemented. The AI never specified using the same per-trial frame window as the neural data.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Only the partial Step 4 alignment note exists.
+iii. The notes never reach this level of detail.
 
 ## 6-a. What variables in the raw data is `input` *Reward availability* derived from?
 
-i. The agent identified `isRew` in the behavior structure, but it never explicitly mapped that field to decoder input reward availability.
+i. The AI did not make an explicit mapping decision, but it did at least inventory `isRew` as an available trial-level variable. It never stated that this should be the decoder input for reward availability.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The Step 2 notes list `isRew` among the trial-level behavior variables.
+iii. The only evidence is the Step 2 variable list containing `isRew`.
 
 ## 6-b. What processing is involved in computing `input` *Reward availability*?
 
-i. No processing rule was documented. There is no statement that the variable would simply be cast to 0/1 and broadcast over time bins.
+i. No processing decision was made. The AI never stated whether the value should be used directly, cast to binary, or broadcast across time bins.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The work never reached explicit variable mapping.
+iii. No mapping or implementation exists for this variable.
 
 ## 7-a. What variables in the raw data is `output` *Visual stimulus category* derived from?
 
-i. The agent identified `WallName` and also noted `TrialStim` as available trial-level fields, but it never chose which raw field to use as the output stimulus category.
+i. The AI did not make an explicit mapping decision, but it did inventory `WallName` and `TrialStim` as trial-level fields. It never resolved which one should drive the decoder output or how swap sessions should be handled.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The Step 2 notes list both `WallName` and `TrialStim` in the behavior payload.
+iii. The Step 2 notes list both variables; the reference-style choice between them was never made.
 
 ## 7-b. What processing is involved in computing `output` *Visual stimulus category*?
 
-i. No stimulus-category processing rule was written. There is no mapping from many wall labels to four categories, and no decision about broadcasting the per-trial label across time.
+i. No processing decision was made. The AI never defined the four-category texture collapse, categorical encoding, or per-trial broadcasting used by the reference solution.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The agent never completed Step 5 mapping for visual stimulus.
+iii. There is no mapping plan or implementation for this output.
 
 ## 8-a. What variables in the raw data is `output` *Licking* derived from?
 
-i. The agent discovered several licking-related fields (`LickFr`, `LickTime`, `LickTrind`, `LickPos`) but never chose a final source variable for the output licking signal.
+i. No decision was recorded. The notes never identify `LickFr` specifically.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. These fields appear in the behavior-structure dump captured in the trajectory.
+iii. The AI recognized licking as behavior of interest in the reference code, but not the raw variable needed for conversion.
 
 ## 8-b. What processing is involved in computing `output` *Licking*?
 
-i. No licking-processing rule was written. The agent never specified whether licks would be converted into a framewise binary series, how fractional frame numbers would be handled, or how padding would be encoded.
+i. No processing decision was made. The AI never described constructing a binary per-frame lick series from lick-frame events.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. There is no Step 5 mapping or Step 6 implementation.
+iii. No variable-level decoder-output mapping was written.
 
 ## 8-c. How is `output` *Licking* aligned with the neural data?
 
-i. No explicit licking-alignment rule was written beyond the generic notion of a shared frame grid after trimming.
+i. No alignment rule was implemented. The AI never described indexing the lick time series with the same per-trial frame window as the neural data.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Only the partial common-frame alignment note survives in the trajectory.
+iii. The notes and trajectory never reach this detail.
 
 ## 9-a. What variables in the raw data is `output` *Position in corridor* derived from?
 
-i. The agent identified `ft_Pos` and `VRpos` as available position variables, but it never selected the final raw source for the decoder output position-in-corridor.
+i. The AI did not make an explicit mapping decision, but it did inventory `ft_Pos` and `ft_PosCum` as frame-level variables, which are plausible position sources.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Both fields appear in the raw behavior inspection recorded in the trajectory.
+iii. The Step 2 notes list the raw variables only; no decision chooses between them.
 
 ## 9-b. What processing is involved in computing `output` *Position in corridor*?
 
-i. No position-processing rule was documented. There is no statement about using framewise corridor position, clipping to textured-corridor frames, or padding.
+i. No processing decision was made. The AI never described converting decimeters into four 1 m bins or using the within-corridor frames only.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The notes never progress beyond raw field discovery.
+iii. There is no mapping or implementation for this output.
 
 ## 9-c. How is `output` *Position in corridor* thresholded into categories?
 
-i. No categorical thresholding rule was specified. The agent never described the reference four 1 m bins or any alternative binning.
+i. No thresholding/categorization decision was recorded.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. No Step 5 or Step 6 artifact contains a thresholding decision.
+iii. The agent never reached the discretization stage described in Step 5.
 
 ## 9-d. How is `output` *Position in corridor* aligned with the neural data?
 
-i. No explicit position-alignment rule was written beyond the generic possibility of using the trimmed common frame axis.
+i. No alignment rule was implemented. The AI never specified using the same per-trial frame window as the neural data.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. This is only indirectly implied by the Step 4 alignment note.
+iii. Alignment remained at the level of a vague "trial-start alignment" note.
 
 ## 10-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. The agent identified `ft_RunSpeed` as the relevant running-speed variable in the raw behavior stream, but it never completed the mapping.
+i. The AI did not make an explicit mapping decision, but it did inventory `ft_RunSpeed` as a frame-level variable.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The Step 2 notes list `ft_RunSpeed` among the frame-level fields.
+iii. The Step 2 notes list the raw variable but never define the decoder output.
 
 ## 10-b. What processing is involved in computing `output` *Running speed*?
 
-i. No running-speed processing rule was documented. The agent never described sessionwise quantiles, rank-based quartiles, or padding.
+i. No processing decision was made. The AI never described quartile binning, rank-based handling of ties, or session-specific thresholds over kept frames.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The work stopped before explicit output processing was designed.
+iii. No discretization plan was documented.
 
 ## 10-c. How is `output` *Running speed* thresholded into categories?
 
-i. No thresholding rule was given for running speed. The agent never specified four equal-frequency bins or any other discretization scheme.
+i. No thresholding/categorization decision was recorded.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. There is no completed Step 5 mapping and no conversion code.
+iii. The agent never reached the required discretization stage.
 
 ## 10-d. How is `output` *Running speed* aligned with the neural data?
 
-i. No explicit alignment rule for running speed was documented beyond the partial common-frame trimming idea.
+i. No alignment rule was implemented. The AI never specified using the same per-trial frame window as the neural data.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Only the trajectory’s partial neural-behavior alignment note exists.
+iii. There is no output-alignment implementation because no script was produced.
 
 ## 11. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The only concrete data-quality handling the agent documented was a possible trim to a common neural/behavior frame length because one inspected session had 23193 neural frames versus 23194 behavior `ft` frames. It did not document dropping out-of-range licks, removing empty trials, or any other minor-data-error handling.
+i. No concrete data-cleaning policy was implemented. The AI never documented truncating behavior streams to imaged frames, dropping out-of-range licks, or removing empty trials.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. This comes from the attempted Step 4 “Neural-behavior alignment” note in the trajectory and the inspected session summary for `TX108_2023_01_05_2`.
+iii. The notes leave trial curation unresolved and never discuss imaged-frame truncation.
 
 ## 12-a. What are the most time-consuming steps of the code?
 
-i. The agent never profiled or even implemented the conversion script, so it did not identify actual runtime bottlenecks.
+i. No completed code exists, so there is no real runtime profile. The Step 6 section has placeholders for inefficiencies and speedups, but they were never filled in.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Work stopped before Step 6; no timing output or conversion run exists.
+iii. Because the script was never written or run, any claim about bottlenecks would be speculative.
 
 ## 12-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. No vectorization opportunities were analyzed because no conversion code was written.
+i. No implementation exists, so no actual loops were identified for vectorization.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. There is no Step 6 implementation section beyond the untouched template placeholders.
+iii. Step 6 remains a blank template with `Code inefficiencies identified: [Note]`.
 
 ## 12-c. What processing does the code repeat multiple times?
 
-i. No repeated processing was identified because the conversion logic was never implemented.
+i. No repeated processing was documented, because there is no completed conversion script.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. The notes never reach a concrete algorithm whose repeated work could be assessed.
+iii. The agent never progressed beyond exploratory notes.
 
 ## 12-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. No unnecessary discarded processing was identified because the conversion logic was never implemented.
+i. No unnecessary downstream-discarded processing was documented, because there is no completed conversion script.
 
-ii. No snippet is available from `convert_data.py`. `/app/convert_data.py` is absent in this environment, and the trajectory never shows a successful write to that file.
+ii. `convert_data.py` was never created, so there is no AI code snippet for this decision point.
 
-iii. Again, Step 6 was never reached and `convert_data.py` is missing.
+iii. The script-development and profiling stages were never reached.
