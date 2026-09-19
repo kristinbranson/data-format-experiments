@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI hard-codes a 44-session manifest in `ALL_SESSIONS`, with each entry naming the folder, animal, date, and probe list. For each session it opens `data_structure_<anm>_<date>.mat`, auto-detects whether the MATLAB file is HDF5/v7.3 or v5, and dispatches to separate loaders. Motion energy is loaded from a separate `motionEnergy_<anm>_<date>.mat` file in the same session folder. Trial-level behavioral arrays, cluster spike fields, bottom-camera tracking, and side-camera frame times are all pulled into one per-session dictionary before later processing.
+i. The AI hard-coded a 44-session `ALL_SESSIONS` list spanning `Ephys_Behavior` and `RandomizedDelay_Ephys_Behavior`, with per-session animal, date, folder, and probe assignments. For each session it opens `data_structure_<animal>_<date>.mat`, auto-detects whether it is HDF5/v7.3 or MATLAB v5, and separately opens `motionEnergy_<animal>_<date>.mat`.
 
 ii.
 ```python
@@ -12,149 +12,120 @@ ALL_SESSIONS = [
     {'dir': RD, 'anm': 'JEB24', 'date': '2023-11-03', 'probes': [1]},
 ]
 
+data_path = os.path.join(data_dir, sess['dir'],
+                         f"data_structure_{sname}.mat")
+me_path = os.path.join(data_dir, sess['dir'],
+                       f"motionEnergy_{sname}.mat")
+
 if _is_hdf5(data_path):
     sd = _load_session_h5(data_path, sess)
 else:
     sd = _load_session_v5(data_path, sess)
 ```
 
-```python
-data_path = os.path.join(data_dir, sess['dir'],
-                         f"data_structure_{sname}.mat")
-me_path = os.path.join(data_dir, sess['dir'],
-                       f"motionEnergy_{sname}.mat")
-```
+iii. In the trajectory, the AI said it would include both task folders, use the loading scripts for the session list, skip absent data files, and support both MATLAB formats. It initially considered excluding the first three `JEB15` sessions, then reversed that and decided to include every session explicitly listed in the loading scripts.
 
-iii. The justification is explicit in `CONVERSION_NOTES.md`: the session list was taken from the authors’ MATLAB loading scripts, JEB4/JEB5 were unavailable, and the code needed to support both MATLAB v7.3 and v5 files. The trajectory also shows the AI intentionally decided to include both `Ephys_Behavior` and `RandomizedDelay_Ephys_Behavior` sessions from those loading scripts.
+## 1-b. How are the data split into subjects?
 
-## 1-b. How are the data split into subjects (mice)?
-
-i. Subjects are taken directly from each hard-coded session record’s `anm` field. During assembly, the AI creates one `subjects` list in first-seen order and one `subject_idx` entry per retained session.
+i. Subjects are taken from the hard-coded session metadata field `anm`. During assembly, the script assigns each previously unseen animal a new integer index in order of first appearance and stores that in `subject_idx`.
 
 ii.
 ```python
-subjects = {}  # name → index
-...
 anm = result['anm']
 if anm not in subjects:
     subjects[anm] = len(subjects)
 all_subject_idx.append(subjects[anm])
-```
 
-```python
 subj_list = [''] * len(subjects)
 for name, idx in subjects.items():
     subj_list[idx] = name
 ```
 
-iii. The justification is implicit rather than argued in detail: because the session manifest already stores `anm`, the AI reuses that instead of re-reading subject metadata from inside the files.
+iii. The trajectory justification was simply that each loading-script entry already names the animal, so that metadata should define the subject split.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each dictionary in `ALL_SESSIONS` is treated as one session. `process_session` turns each selected session into one element of `neural`, `input`, and `output`, and keeps the original top-level split between `Ephys_Behavior` and `RandomizedDelay_Ephys_Behavior` only as metadata in the file path and session info.
+i. One entry of `ALL_SESSIONS` is treated as one session. Each such entry points to one `data_structure_...mat` file and one `motionEnergy_...mat` file in its specified folder, and each successful session becomes one element of `neural`, `input`, and `output`.
 
 ii.
 ```python
 for sess in sessions:
     result, err = process_session(sess, data_dir)
-    if result is None:
-        print(f"  SKIPPED: {err}")
-        continue
-
+    ...
     all_neural.append(result['neural'])
     all_input.append(result['input'])
     all_output.append(result['output'])
 ```
 
-iii. The justification comes from `CONVERSION_NOTES.md`: the AI states that the loading scripts define which sessions and probes to use, so it mirrors that session granularity.
+iii. The AI justified this by saying it was following the per-animal MATLAB loading scripts and their probe assignments.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are indexed by array position from `0` to `n_trials - 1` using the behavioral arrays read from `bp`. The later `trial_idx` mask picks the kept trials. Spike times are assigned to trials using `spk['trial'] == (ti + 1)`, and video/motion signals are processed one trial index at a time.
+i. Trials are defined by `bp['Ntrials']`, and the script loops over `range(n_trials)`. Spike data are assigned to trials via `spk['trial'] == (ti + 1)`, while trial-level behavioral arrays are truncated to the first `n_trials` entries.
 
 ii.
 ```python
-n_trials = sd['n_trials']
+n_trials = int(bp['Ntrials'][0, 0])
 ...
-use = ((hit == 1) | (miss == 1)) & (stim_en == 0) & (early == 0)
+for ti in range(n_trials):
+    mask = spk['trial'] == (ti + 1)
+    ...
 trial_idx = np.where(use)[0]
+for ti in trial_idx:
+    neural_list.append(fr[:, :, ti].copy())
 ```
 
-```python
-for ni, spk in enumerate(spike_data):
-    for ti in range(n_trials):
-        mask = spk['trial'] == (ti + 1)
-```
-
-iii. The AI does not justify this separately, but the implementation assumes the Bpod trial arrays are authoritative and that the cluster `trial` field already gives per-spike trial membership.
+iii. In the trajectory, the AI said it would treat the Bpod trial table as authoritative and use the stored per-trial arrays and trial labels directly rather than reconstructing trials.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI keeps only hit or miss trials and excludes photostimulation and early-lick trials. This removes all no-response/ignore trials from the dataset. It does not remove trials after the ephys recording ended; `CONVERSION_NOTES.md` instead acknowledges that some late trials have all-zero neural data and were left in place.
+i. The AI kept only trials with a response (`hit` or `miss`) and then removed early-lick and photostimulation trials. It did not keep ignore/no-response trials, and it did not remove trials that continue after the recording ended except indirectly if an entire session failed later checks.
 
 ii.
 ```python
-# trial filter: (hit|miss) & ~stim & ~early
 use = ((hit == 1) | (miss == 1)) & (stim_en == 0) & (early == 0)
 trial_idx = np.where(use)[0]
+
+if len(trial_idx) < MIN_TRIALS:
+    return None, f"Only {len(trial_idx)} usable trials"
 ```
 
-```markdown
-### Trial Filter
-Matches `findTrials.m` condition `'(hit|miss)&~stim.enable&~early'`:
-- Include hit and miss trials
-- Exclude stimulation trials (`stim.enable == 1`)
-- Exclude early-lick trials (`early == 1`)
-- No-response trials are also excluded (they are neither hit nor miss)
-```
-
-iii. The justification is explicit in the notes: the AI believed `findTrials.m` should be matched exactly, so it excluded no-response trials. It separately noted but did not fix late all-zero-neural trials.
+iii. The trajectory says the AI wanted trials with valid lick direction and outcome labels, so it restricted the dataset to `hit|miss` trials and excluded `stim` and `early`. After verification warned about zero-neural late trials, it acknowledged those were likely end-of-recording trials, but it did not change the code.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The neural matrices come from cluster spike fields `trial` and `trialtm` taken from `obj['clu']` for the selected probes, together with per-trial `goCue` times from `bp.ev.goCue` for alignment. Cluster quality labels are used earlier to decide which clusters enter `spike_data`.
+i. Neural activity is derived from `obj.clu` cluster entries, specifically the per-spike `trial` and `trialtm` arrays. Cluster `quality` is used for filtering, and `goCue` is used to align spike times.
 
 ii.
 ```python
-for ci in valid_clu:
-    spike_data.append({
-        'trial': probe_arr['trial'][0, ci].flatten().astype(float),
-        'trialtm': probe_arr['trialtm'][0, ci].flatten().astype(float),
-    })
+spike_data.append({
+    'trial': probe_arr['trial'][0, ci].flatten().astype(float),
+    'trialtm': probe_arr['trialtm'][0, ci].flatten().astype(float),
+})
+...
+aligned = spk['trialtm'][mask] - goCue[ti]
 ```
 
-```python
-goCue = ev['goCue'][0, 0].flatten()[:n_trials].astype(float)
-```
-
-iii. The justification is implicit in the code and notes: spike times are already stored per trial, so the AI only needed trial id, within-trial spike time, and go-cue time.
+iii. The AI explicitly said in the trajectory that it would align spikes to go cue, filter clusters by quality, and use the selected probe(s) from the loading scripts.
 
 ## 2-b. How is the `neural` data processed?
 
-i. For each neuron and trial, the AI subtracts the trial go cue from each spike time, bins spikes into a fixed time grid, converts counts to firing rate by dividing by `DT`, and then smooths each per-trial firing-rate trace with a causal Gaussian kernel implemented by `gausswin` plus one-sided zeroing and convolution.
+i. For each unit and trial, spikes are histogrammed into 10 ms bins from -2.5 s to +2.5 s around go cue, divided by bin width to form firing rates, and smoothed with a causal Gaussian-like kernel implemented by `causal_smooth`.
 
 ii.
 ```python
-aligned = spk['trialtm'][mask] - goCue[ti]
+DT = 0.01
+EDGES = np.arange(TMIN, TMAX + DT / 2, DT)
+...
 counts, _ = np.histogram(aligned, bins=EDGES)
 fr[ni, :, ti] = causal_smooth(counts.astype(np.float64) / DT)
 ```
 
-```python
-def causal_smooth(x, N=SMOOTH_N, bctype=BC_TYPE):
-    kern = gausswin(N)
-    kern[:N // 2] = 0
-    kern /= kern.sum()
-    ...
-    out = np.convolve(x_padded, kern, mode='same')
-    return out[trim:]
-```
-
-iii. The justification is explicit in `CONVERSION_NOTES.md` and the trajectory: the AI believed the reference used `WorkingWithDataObjs.m`, 10 ms bins, and a causal version of `mySmooth.m`, so it tried to reproduce that path.
+iii. The trajectory repeatedly says the AI believed the reference pipeline used 10 ms bins plus causal Gaussian smoothing from the MATLAB code, and it wrote the implementation to match that interpretation.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. The AI first removes clusters whose quality label is `garbage`, `gabrga`, `noisy`, or `real?`, and also drops empty-string quality labels. It then removes units with mean firing rate `<= 1 Hz`. At the session level it also discards any session with fewer than 10 raw units or fewer than 10 units after the firing-rate filter.
+i. Clusters are kept if their `quality` label is non-empty and not in `{'garbage', 'gabrga', 'noisy', 'real?'}`. After binning, units are removed if their mean firing rate across all bins and trials is not above 1 Hz. Sessions with fewer than 10 units before or after rate filtering are skipped.
 
 ii.
 ```python
@@ -162,195 +133,203 @@ EXCLUDED_QUALITIES = {'garbage', 'gabrga', 'noisy', 'real?'}
 ...
 valid_clu = [i for i, q in enumerate(qualities)
              if q.lower() not in EXCLUDED_QUALITIES and q != '']
-```
-
-```python
+...
 mean_fr = np.mean(fr, axis=(1, 2))
 keep = mean_fr > LOW_FR
-fr = fr[keep]
 ...
+if n_raw < MIN_UNITS:
+    return None, f"Only {n_raw} neurons"
 if n_neurons < MIN_UNITS:
     return None, f"Only {n_neurons} neurons after FR filter"
 ```
 
-iii. The notes justify this by claiming it matches `findClusters.m` in `"all"` mode and `removeLowFRClusters.m`, and by citing a paper-level minimum-units criterion for the extra `MIN_UNITS` session filter.
+iii. The AI justified this as using the reference `findClusters(...,'all')` behavior plus the paper's 1 Hz threshold. It did not mention the human reference's extra exclusion of `Poor` units, and it added session-level minimum-unit filters of its own.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Each spike time is aligned by subtracting the trial’s go-cue time, so the stored neural traces are in seconds relative to go cue onset before binning.
+i. Within each trial, the script subtracts that trial's `goCue` from each spike's `trialtm`, then bins the aligned times.
 
 ii.
 ```python
+mask = spk['trial'] == (ti + 1)
 aligned = spk['trialtm'][mask] - goCue[ti]
 counts, _ = np.histogram(aligned, bins=EDGES)
 ```
 
-iii. The AI explicitly states in the notes that this matches `alignSpikes.m`: align spike times by `trialtm - goCue`.
+iii. The trajectory explicitly says the AI intended to align everything to go cue onset and considered this the correct spike alignment rule from the reference code.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The AI uses 10 ms bins from `-2.5` to `+2.5` s, giving 500 bins per trial. It does not perform a second rebinning step after that.
+i. The converted neural data use 10 ms bins over a 5 s window, giving 500 time bins per trial. No later neural rebinning is applied.
 
 ii.
 ```python
-DT = 0.01           # 10ms bins (params.dt = 1/100)
+DT = 0.01
 EDGES = np.arange(TMIN, TMAX + DT / 2, DT)
 TIME_AXIS = EDGES[:-1] + DT / 2
 T_BINS = len(TIME_AXIS)
 ```
 
-iii. The justification is explicit but mistaken: both comments and notes say this was intended to match the reference `params.dt`, which the AI interpreted as `1/100`.
+iii. The AI repeatedly stated in the trajectory that it thought the reference used 10 ms bins, and the sample verification output it inspected showed `T = 500`, which reinforced that decision.
 
 ## 3-a. What variables in the raw data is `input` *Time from go cue onset in seconds* derived from?
 
-i. The input is not read as a raw variable. It is created from the AI’s chosen analysis time grid, which is defined relative to go cue onset using `TMIN`, `TMAX`, and `DT`.
+i. This input is not read from a dedicated raw field. It is constructed from the fixed bin centers of the global aligned time axis around go cue.
 
 ii.
 ```python
-EDGES = np.arange(TMIN, TMAX + DT / 2, DT)
-TIME_AXIS = EDGES[:-1] + DT / 2  # bin centers
-```
-
-```python
-input_list.append(TIME_AXIS[np.newaxis, :].astype(np.float32).copy())
-```
-
-iii. The justification is implicit: once every stream is aligned to go cue onset, the bin centers themselves become the decoder input.
-
-## 3-b. What processing is involved in computing `input` *Time from go cue onset in seconds*?
-
-i. The AI simply constructs evenly spaced bin centers across the analysis window and copies that same 1D vector into every trial as a `(1, T)` array.
-
-ii.
-```python
-TIME_AXIS = EDGES[:-1] + DT / 2  # bin centers
+TIME_AXIS = EDGES[:-1] + DT / 2
 ...
 input_list.append(TIME_AXIS[np.newaxis, :].astype(np.float32).copy())
 ```
 
-iii. No separate justification is given beyond using the common aligned time axis for the whole dataset.
+iii. The trajectory says the AI treated time-from-go-cue as a constructed decoder input defined by the alignment grid itself.
+
+## 3-b. What processing is involved in computing `input` *Time from go cue onset in seconds*?
+
+i. The script computes the centers of the 10 ms bins spanning -2.5 s to +2.5 s and copies the same 1D vector into every trial as a `(1, T)` array.
+
+ii.
+```python
+EDGES = np.arange(TMIN, TMAX + DT / 2, DT)
+TIME_AXIS = EDGES[:-1] + DT / 2
+...
+input_list.append(TIME_AXIS[np.newaxis, :].astype(np.float32).copy())
+```
+
+iii. No separate justification was given beyond the AI's belief that this matched the reference's aligned bin grid.
 
 ## 3-c. How is the `input` *Time from go cue onset in seconds* aligned with the neural data?
 
-i. The input time series is exactly the same time grid used for neural spike binning and for video interpolation, so alignment is enforced by construction.
+i. The input time series uses the same `TIME_AXIS` that the neural histograms use via `EDGES`, so each input sample corresponds to the center of the same bin used for neural firing rates.
 
 ii.
 ```python
 counts, _ = np.histogram(aligned, bins=EDGES)
 ...
-interp_fn = interp1d(aln, t_spd, kind='linear',
-                     bounds_error=False, fill_value=np.nan)
-...
+TIME_AXIS = EDGES[:-1] + DT / 2
 input_list.append(TIME_AXIS[np.newaxis, :].astype(np.float32).copy())
 ```
 
-iii. The AI’s implied justification is that all modalities should share one common go-cue-centered axis.
+iii. The trajectory justification was that all decoder inputs and outputs should share the go-cue-aligned neural time base.
 
 ## 4-a. What variables in the raw data is `output` *Lick direction* derived from?
 
-i. In the final code, lick direction is derived from the per-trial instructed side `R` only: `R == 1` becomes right and `R == 0` becomes left. The earlier hit/miss arrays are used only for trial filtering, not for the lick-direction label itself.
+i. The script loads `L`, `R`, `hit`, and `miss`, but the final lick-direction output actually uses only `R` after the trial filter has already restricted trials to `hit|miss`.
 
 ii.
 ```python
-L, R = sd['L'], sd['R']
+L = bp['L'][0, 0].flatten()[:n_trials].astype(int)
+R = bp['R'][0, 0].flatten()[:n_trials].astype(int)
+hit = bp['hit'][0, 0].flatten()[:n_trials].astype(int)
+miss = bp['miss'][0, 0].flatten()[:n_trials].astype(int)
 ...
-out[0, :] = int(R[ti])                  # lick direction: L=0, R=1
+out[0, :] = int(R[ti])
 ```
 
-iii. The AI does not defend this explicitly in the notes. The trajectory suggests it focused on the prompt’s binary left/right output and assumed the retained hit/miss trials made the instructed side usable as the label.
+iii. In the trajectory, the AI said it would map lick direction from the `R` and `L` fields and only keep response trials, so it treated the trial-side label as the lick-direction label.
 
 ## 4-b. What processing is involved in computing `output` *Lick direction*?
 
-i. No reconstruction of actual choice is done. The AI converts `R` to an integer and repeats that binary value across all time bins of the trial.
+i. After filtering to hit/miss trials, the script codes `R==1` as right and `R==0` as left, and then repeats that scalar category across all time bins of the trial. It does not derive lick direction from hit versus miss, and it does not include a no-lick class.
 
 ii.
 ```python
+use = ((hit == 1) | (miss == 1)) & (stim_en == 0) & (early == 0)
+...
 out = np.zeros((6, T_BINS), dtype=np.int64)
 out[0, :] = int(R[ti])                  # lick direction: L=0, R=1
 ```
 
-iii. The implied justification is simplicity and compliance with the prompt’s two-class left/right requirement; there is no explicit discussion of miss trials or no-lick trials.
+iii. The trajectory says the AI wanted only trials with valid left/right labels and viewed `R` as identifying the rewarded side the animal licked toward on usable trials.
 
 ## 5-a. What variables in the raw data is `output` *Behavioral context* derived from?
 
-i. Behavioral context is derived directly from the per-trial `autowater` flag.
+i. Behavioral context is derived from the `autowater` field in `bp`.
 
 ii.
 ```python
-autowater, stim_en = sd['autowater'], sd['stim_en']
+autowater = bp['autowater'][0, 0].flatten()[:n_trials].astype(int)
 ...
-out[1, :] = 1 - int(autowater[ti])       # context: WC=0, DR=1
+out[1, :] = 1 - int(autowater[ti])
 ```
 
-iii. The notes justify this as the WC-versus-DR indicator: autowater trials are water-cued, the others are delayed-response.
+iii. The AI justified this in the trajectory by saying `autowater` distinguishes water-cued versus delayed-response context.
 
 ## 5-b. What processing is involved in computing `output` *Behavioral context*?
 
-i. The AI remaps `autowater == 1` to WC (`0`) and `autowater == 0` to DR (`1`), then repeats that label across all bins in the trial.
+i. The script relabels `autowater==1` to WC (`0`) and `autowater==0` to DR (`1`), then repeats that label across time bins within the trial.
 
 ii.
 ```python
 out[1, :] = 1 - int(autowater[ti])       # context: WC=0, DR=1
 ```
 
-iii. The justification is explicit in the notes: this matches the prompt’s coding of WC as `0` and DR as `1`.
+iii. The trajectory explicitly says the AI intended `autowater=0` to mean delayed-response and `autowater=1` to mean water-contingent/water-cued.
 
 ## 6-a. What variables in the raw data is `output` *Outcome* derived from?
 
-i. Outcome is encoded from the `hit` flag after the earlier trial filter has already limited the dataset to hit-or-miss trials. In effect, miss trials become `0` and hit trials become `1`; ignore trials never reach the output stage.
+i. Outcome is derived from the `hit` and `miss` trial flags, although the final code only writes `hit` because the trial filter has already removed ignore trials.
 
 ii.
 ```python
-hit, miss, early = sd['hit'], sd['miss'], sd['early']
+hit = bp['hit'][0, 0].flatten()[:n_trials].astype(int)
+miss = bp['miss'][0, 0].flatten()[:n_trials].astype(int)
 ...
+out[2, :] = int(hit[ti])
+```
+
+iii. The trajectory says the AI wanted both correct and incorrect response trials and therefore filtered to `hit|miss` before encoding outcome.
+
+## 6-b. What processing is involved in computing `output` *Outcome*?
+
+i. The script converts outcome into a binary label repeated across all time bins: `1` for hit/correct, `0` for miss/incorrect. Ignore trials are removed rather than encoded as a third category.
+
+ii.
+```python
 use = ((hit == 1) | (miss == 1)) & (stim_en == 0) & (early == 0)
 ...
 out[2, :] = int(hit[ti])                 # outcome: incorrect=0, correct=1
 ```
 
-iii. The notes justify the earlier trial filter with the claim that no-response trials should be excluded, which is the main reason a binary outcome became possible.
-
-## 6-b. What processing is involved in computing `output` *Outcome*?
-
-i. The AI uses a two-class encoding only: `hit == 1` is correct (`1`), and all retained non-hit trials are treated as incorrect (`0`). The value is repeated across all time bins.
-
-ii.
-```python
-out[2, :] = int(hit[ti])                 # outcome: incorrect=0, correct=1
-```
-
-iii. The justification is implicit in both the notes and the code comments: this follows the prompt’s binary incorrect/correct specification after dropping ignore trials.
+iii. The trajectory justifies this as focusing the decoder on trials with explicit behavioral responses and labels.
 
 ## 7-a. What variables in the raw data is `output` *Tongue velocity* derived from?
 
-i. The AI derives tongue velocity only from the bottom camera’s `top_tongue` DeepLabCut track, using x, y, confidence, frame times, the session video offset, and per-trial go-cue times. It does not use the side camera tongue track in the final code.
+i. Tongue velocity is derived from the bottom-camera DLC feature set in `traj`, specifically `top_tongue` if present, plus its `frameTimes`, the session video shift computed from `bp.ev.bitStart`, `sglx.bitcode.bitstart`, and `sglx.fs`, and the per-trial `goCue`.
 
 ii.
 ```python
-feat_names = bot_cam['feat_names']
 tongue_fi = feat_names.index('top_tongue') if 'top_tongue' in feat_names else 0
-```
-
-```python
+...
 t_spd = compute_speed(
     ts[:, 0, tongue_fi], ts[:, 1, tongue_fi], ft,
     ts[:, 2, tongue_fi], DLC_CONF, fill_missing=True)
+...
+aln = ft - vidshift - goCue[ti]
 ```
 
-iii. The trajectory shows the AI knew both cameras tracked the tongue, but it ultimately simplified to the bottom-camera `top_tongue` feature. `CONVERSION_NOTES.md` also describes “DLC velocities (Bottom Camera)” as the implemented path.
+iii. The trajectory shows the AI inspecting both camera feature sets and then deciding to use bottom-camera tongue tracking for velocity, even while noting that the paper tracked tongue in both cameras.
 
 ## 7-b. What processing is involved in computing `output` *Tongue velocity*?
 
-i. The AI fills low-confidence or missing positions with the nearest valid position, computes frame-to-frame speed from x/y differences, linearly interpolates the resulting speed onto the neural time axis, and then fills any interpolated NaNs with nearest values. It does not smooth x/y with a Gaussian, does not preserve missing bins as missing, and does not combine side and bottom tongue views.
+i. The script computes framewise speed from x/y differences after nearest-filling invalid positions, linearly interpolates the resulting speed trace onto the neural time bins, then nearest-fills missing aligned bins. It does not smooth positions with a Gaussian and does not combine tongue estimates from both cameras.
 
 ii.
 ```python
-if np.any(valid) and not np.all(valid):
-    x, y = fill_positions_nearest(x, y, valid)
-...
-vx = np.diff(x) / dt_vid
-vy = np.diff(y) / dt_vid
-speed = np.sqrt(vx**2 + vy**2)
+def compute_speed(x, y, ft, confidence=None, conf_thresh=DLC_CONF,
+                  fill_missing=True):
+    valid = ~np.isnan(x) & ~np.isnan(y)
+    if confidence is not None:
+        valid = valid & (confidence >= conf_thresh)
+    if np.any(valid) and not np.all(valid):
+        x, y = fill_positions_nearest(x, y, valid)
+    elif not np.any(valid):
+        return np.zeros(len(x))
+    ...
+    vx = np.diff(x) / dt_vid
+    vy = np.diff(y) / dt_vid
+    speed = np.sqrt(vx**2 + vy**2)
 ```
 
 ```python
@@ -359,11 +338,11 @@ interp_fn = interp1d(aln, t_spd, kind='linear',
 tongue_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The justification is explicit in the notes: the AI believed nearest-fill before differentiation gave near-zero velocity when the tongue was not visible and meaningful velocity during licking.
+iii. The trajectory says the AI thought filling missing positions with nearest values matched the paper's kinematic handling and would produce near-zero velocity when the tongue was not visible. After noticing that full-data median-thresholding made tongue almost always "high", it changed the thresholding rule rather than changing the velocity computation.
 
 ## 7-c. How is `output` *Tongue velocity* thresholded into categories?
 
-i. The AI computes a per-session median threshold using only non-zero tongue-velocity values from kept trials, then thresholds each time bin into a binary low/high class. There is no separate “not visible” category.
+i. Tongue velocity is thresholded into only two categories, not three. The threshold is the 50th percentile of nonzero tongue speeds from the kept trials of that session; zero-valued bins remain in the low class.
 
 ii.
 ```python
@@ -377,25 +356,27 @@ else:
 out[3, :] = (tongue_vel[:, ti] >= tongue_thresh).astype(np.int64)
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly justifies this as a workaround for the tongue being visible only rarely; the AI chose to compute the 50th percentile on non-zero values so the threshold would not collapse to zero.
+iii. In the trajectory, the AI explicitly says it changed from full-data median splitting to median-of-nonzero values because tongue visibility is sparse and the ordinary median collapsed to zero.
 
 ## 7-d. How is `output` *Tongue velocity* aligned with the neural data?
 
-i. The AI computes frame times relative to go cue by subtracting the session-wide video shift and the trial’s go cue, then linearly interpolates tongue speed onto the common neural bin-center axis and nearest-fills missing bins.
+i. The script aligns tongue frames by subtracting a session-wide video offset and the trial's `goCue`, then interpolates the resulting speed trace onto the same `TIME_AXIS` used for neural bins.
 
 ii.
 ```python
+vidshift = bc_bs_mode / fs - bitStart_mode
+...
 aln = ft - vidshift - goCue[ti]
 interp_fn = interp1d(aln, t_spd, kind='linear',
                      bounds_error=False, fill_value=np.nan)
 tongue_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The notes justify the video-offset part by citing `findVideoOffset.m`, and justify the fill step as a way to avoid losing bins when the tongue is not visible.
+iii. The trajectory explicitly says the AI measured the offset at about 0.49 s, considered that consistent with a 0.5 s camera shift in the code comments, and therefore used `frameTimes - vidshift - goCue`.
 
 ## 8-a. What variables in the raw data is `output` *Paw velocity* derived from?
 
-i. Paw velocity is derived from bottom-camera DeepLabCut tracks, preferably `top_paw` but falling back to `bottom_paw` if necessary, together with the bottom-camera frame times, video offset, and go-cue times.
+i. Paw velocity is derived from bottom-camera DLC tracking, preferring `top_paw` and falling back to `bottom_paw` if needed, together with that trial's camera `frameTimes`, the session `vidshift`, and the trial `goCue`.
 
 ii.
 ```python
@@ -404,30 +385,33 @@ for pname in ['top_paw', 'bottom_paw']:
     if pname in feat_names:
         paw_fi = feat_names.index(pname)
         break
+...
+p_spd = compute_speed(
+    ts_p[:, 0, paw_fi], ts_p[:, 1, paw_fi], ft_p,
+    ts_p[:, 2, paw_fi], DLC_CONF, fill_missing=True)
 ```
 
-iii. The notes describe bottom-camera paw tracking as the implemented source. The fallback to `bottom_paw` is an implementation choice visible in code rather than something justified in prose.
+iii. The trajectory states that paw velocity would come from the bottom camera and especially from `top_paw`.
 
 ## 8-b. What processing is involved in computing `output` *Paw velocity*?
 
-i. The paw path uses the same processing as the tongue path in the AI code: nearest-fill invalid x/y positions, compute frame-to-frame speed, interpolate onto the neural time axis, and nearest-fill the interpolated NaNs.
+i. Paw velocity uses the same `compute_speed` procedure as tongue velocity: nearest-fill invalid positions, differentiate x and y with respect to frame time, take speed magnitude, linearly interpolate onto the neural time axis, and nearest-fill remaining gaps.
 
 ii.
 ```python
 p_spd = compute_speed(
     ts_p[:, 0, paw_fi], ts_p[:, 1, paw_fi], ft_p,
     ts_p[:, 2, paw_fi], DLC_CONF, fill_missing=True)
-...
 interp_fn = interp1d(aln, p_spd, kind='linear',
                      bounds_error=False, fill_value=np.nan)
 paw_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The justification is only implicit: the AI reused the same velocity helper for both kinematic outputs.
+iii. The AI did not add a separate trajectory justification for paw processing; it presented this as parallel to tongue processing from the selected paw feature.
 
 ## 8-c. How is `output` *Paw velocity* thresholded into categories?
 
-i. The AI uses the 50th percentile of all paw-velocity samples from kept trials as a per-session threshold and converts each time bin to a binary low/high class, again without any third “not visible” category.
+i. Paw velocity is split into only two classes using the 50th percentile of all aligned paw-velocity samples from the kept trials in that session. There is no explicit not-visible category.
 
 ii.
 ```python
@@ -436,11 +420,11 @@ paw_thresh = np.percentile(paw_vel[:, trial_idx], 50)
 out[4, :] = (paw_vel[:, ti] >= paw_thresh).astype(np.int64)
 ```
 
-iii. The notes justify this as the standard per-session median split requested by the prompt.
+iii. The trajectory did not provide a separate justification beyond following the requested per-session median split.
 
 ## 8-d. How is `output` *Paw velocity* aligned with the neural data?
 
-i. Paw speed is aligned the same way as tongue speed: bottom-camera frame times are shifted by the video offset and go cue, then linearly interpolated to the neural time grid and nearest-filled.
+i. Paw frames are aligned exactly like tongue frames: subtract session video offset and trial go cue, then interpolate to the shared neural time axis.
 
 ii.
 ```python
@@ -450,25 +434,27 @@ interp_fn = interp1d(aln, p_spd, kind='linear',
 paw_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The justification is the same offset-based clock alignment described in the notes for video data more generally.
+iii. The trajectory justification was the same as for tongue alignment: use the measured video offset plus go-cue alignment so all streams share the decoder time base.
 
 ## 9-a. What variables in the raw data is `output` *Motion energy* derived from?
 
-i. Motion energy is loaded from the separate `motionEnergy_<session>.mat` file, using the `me['data']` field, and aligned using side-camera frame times when those are available.
+i. Motion energy is read from the separate `motionEnergy_<session>.mat` file, specifically from `me['data']` after loading. Its alignment also uses side-camera frame times when available, together with `vidshift` and `goCue`.
 
 ii.
 ```python
-if os.path.exists(me_path):
-    me_mat = scipy.io.loadmat(me_path, squeeze_me=False)
-    me_struct = me_mat['me']
-    me_trials = me_struct['data'][0, 0]
+me_mat = scipy.io.loadmat(me_path, squeeze_me=False)
+me_struct = me_mat['me']
+me_trials = me_struct['data'][0, 0]
+...
+if ti in side_ft:
+    aln = side_ft[ti] - vidshift - goCue[ti]
 ```
 
-iii. `CONVERSION_NOTES.md` explicitly says motion energy comes from the separate file and that some sessions needed special handling because the struct format varied.
+iii. The trajectory says the AI intended to load motion energy from the companion file rather than recompute it from video.
 
 ## 9-b. What processing is involved in computing `output` *Motion energy*?
 
-i. The AI takes each trial’s motion-energy trace, aligns it in time, linearly interpolates it to the neural time axis, and nearest-fills missing values. If the side-camera frame count does not match the motion-energy length, it falls back to a synthetic `400 Hz` time base with an assumed `-0.5 s` offset. If loading fails, the whole session’s motion energy stays at zeros.
+i. The script treats motion energy as an already-computed per-frame scalar trace, linearly interpolates it onto the neural time axis, and nearest-fills missing aligned bins. If side-camera frame times are missing or length-mismatched, it falls back to a synthetic 400 Hz timeline offset by 0.5 s.
 
 ii.
 ```python
@@ -484,11 +470,11 @@ interp_fn = interp1d(aln, trial_me, kind='linear',
 me_data[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The notes justify the fallback behavior pragmatically: several sessions had motion-energy loading issues, and the AI chose all-zero motion-energy arrays rather than dropping those sessions.
+iii. The trajectory justification was that motion energy was already computed in the source data and only needed to be aligned to the decoder time axis.
 
 ## 9-c. How is `output` *Motion energy* thresholded into categories?
 
-i. The AI computes the 50th percentile of all aligned motion-energy samples from kept trials and thresholds each bin into binary low/high classes. Missing bins are not preserved as missing because they are nearest-filled first.
+i. Motion energy is split into only two classes using the per-session 50th percentile over all aligned motion-energy samples from the kept trials. There is no explicit no-video category.
 
 ii.
 ```python
@@ -497,11 +483,11 @@ me_thresh = np.percentile(me_data[:, trial_idx], 50)
 out[5, :] = (me_data[:, ti] >= me_thresh).astype(np.int64)
 ```
 
-iii. The explicit justification in the notes is that motion energy and paw velocity use the standard per-session median split from the prompt.
+iii. The trajectory did not provide a special justification beyond applying the requested median split.
 
 ## 9-d. How is `output` *Motion energy* aligned with the neural data?
 
-i. The preferred alignment uses side-camera frame times shifted by the session video offset and trial go cue, followed by linear interpolation onto the neural time axis. If those frame times are unavailable or length-mismatched, the AI substitutes an assumed `400 Hz` frame clock with a fixed `-0.5 s` offset.
+i. When side-camera frame times are available, the script subtracts `vidshift` and the trial's `goCue`, then interpolates motion energy onto `TIME_AXIS`. If frame times are unavailable or mismatched, it substitutes a synthetic 400 Hz time base before interpolation.
 
 ii.
 ```python
@@ -513,11 +499,11 @@ else:
     aln = np.arange(len(trial_me)) / 400.0 - 0.5 - goCue[ti]
 ```
 
-iii. The offset-based part is justified in the notes by reference to `findVideoOffset.m`; the synthetic fallback is not justified beyond robustness to malformed files.
+iii. The trajectory justification again relied on the session video-offset estimate and the idea that all streams should land on the same go-cue-centered neural grid.
 
 ## 10. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI generally imputes or papers over missing data rather than preserving missingness. It nearest-fills low-confidence or NaN tracking positions before computing velocity, nearest-fills NaNs after interpolation, uses a default `vidshift = 0.5` when video offset computation fails, substitutes synthetic frame times when motion-energy and frame counts disagree, and leaves failed motion-energy sessions as all zeros. It also keeps late behavioral trials with all-zero neural activity instead of removing them.
+i. Missing or low-confidence kinematic samples are filled with nearest valid positions before speed is computed, and missing aligned bins are then filled with nearest valid values after interpolation. If all positions are invalid, velocity becomes all zeros. If video-offset extraction fails, the script uses `0.5` s as a fallback. If motion-energy frame times are missing or mismatched, the script substitutes a synthetic 400 Hz timeline. Many trial-level exceptions are silently ignored with `except Exception: pass`.
 
 ii.
 ```python
@@ -525,105 +511,100 @@ if np.any(valid) and not np.all(valid):
     x, y = fill_positions_nearest(x, y, valid)
 elif not np.any(valid):
     return np.zeros(len(x))
-```
-
-```python
+...
+arr[nans] = f_interp(np.where(nans)[0])
+...
 except Exception as e:
     vidshift = 0.5
 ...
-me_data[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
+except Exception:
+    pass
 ```
 
-```markdown
-### All-zero Neural Data (Sessions 36, 43)
-Late trials ... have all-zero neural activity. This likely indicates the recording ended before the behavioral session. These trials pass through the pipeline but contribute no information.
-```
-
-iii. The notes explicitly justify these choices as robustness measures that keep sessions and bins usable for decoder training instead of dropping data.
+iii. The trajectory explicitly argues for nearest-filling missing tongue positions so non-visible periods become near-zero velocity, and it accepted approximate/fallback handling for camera timing when exact data were missing.
 
 ## 11-a. What are the most time-consuming steps of the code?
 
-i. The most expensive work in the AI code is the repeated per-neuron, per-trial spike histogramming and smoothing, plus the per-trial interpolation of tongue, paw, and motion-energy traces. File loading is also substantial, but the code adds large nested Python loops that the human reference avoids.
+i. The code's heaviest computations are the nested neuron-by-trial spike histogram loop and the per-trial interpolation loops for tongue, paw, and motion-energy traces. Loading large MATLAB/HDF5 files is also substantial, but unlike the reference implementation this script adds a large amount of Python-loop work after loading.
 
 ii.
 ```python
-fr = np.zeros((n_raw, T_BINS, n_trials), dtype=np.float32)
 for ni, spk in enumerate(spike_data):
     for ti in range(n_trials):
+        mask = spk['trial'] == (ti + 1)
         ...
-        counts, _ = np.histogram(aligned, bins=EDGES)
-        fr[ni, :, ti] = causal_smooth(counts.astype(np.float64) / DT)
-```
 
-```python
 for ti in range(n_trials):
     ...
-    interp_fn = interp1d(aln, t_spd, kind='linear',
-                         bounds_error=False, fill_value=np.nan)
+    interp_fn = interp1d(aln, t_spd, kind='linear', ...)
     tongue_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. There is no explicit runtime analysis in the notes. This conclusion is inferred from the implementation structure.
+iii. The trajectory does not explicitly benchmark these steps, but it does show the AI focusing most of its implementation on spike binning and per-trial camera processing rather than on reducing those loops.
 
 ## 11-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The largest vectorization opportunities are the nested neuron-by-trial spike loop, the per-trial interpolation loops for tongue, paw, and motion energy, and the repeated Python loops used to collect cluster qualities and camera data. The spike loop is the clearest missed optimization relative to the reference.
+i. The neuron-by-trial spike loop could have been vectorized across trials, and the repeated per-trial interpolation for tongue, paw, and motion energy could potentially be replaced by binning/aggregation directly on frame indices. The thresholding and output assembly are already lightweight compared with those loops.
 
 ii.
 ```python
 for ni, spk in enumerate(spike_data):
     for ti in range(n_trials):
-        mask = spk['trial'] == (ti + 1)
         ...
-```
 
-```python
 for ti in range(n_trials):
     ...
-    me_data[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
+    tongue_vel[:, ti] = ...
+    paw_vel[:, ti] = ...
+...
+for ti in range(min(n_trials, me_trials.shape[0])):
+    ...
+    me_data[:, ti] = ...
 ```
 
-iii. No explicit justification is provided. The code comments focus on matching MATLAB behavior, not on vectorization.
+iii. No explicit trajectory justification was given for leaving these loops unvectorized.
 
 ## 11-c. What processing does the code repeat multiple times?
 
-i. The AI repeats several computations across trials that could have been organized more centrally: it recomputes spike masks for every neuron-trial pair, performs separate interpolation/fill passes for tongue, paw, and motion energy on the same session time grid, and processes all trials for neural and video streams even though only `trial_idx` trials are emitted.
+i. The script repeats trial-by-trial alignment and interpolation separately for tongue, paw, and motion energy. It also computes velocities separately for tongue and paw even when the same trial's bottom-camera data have already been loaded. More broadly, it processes all `n_trials` for spikes and videos and only afterwards discards unused trials via `trial_idx`.
 
 ii.
-```python
-for ni, spk in enumerate(spike_data):
-    for ti in range(n_trials):
-        mask = spk['trial'] == (ti + 1)
-```
-
 ```python
 for ti in range(n_trials):
     ...
     tongue_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
     ...
     paw_vel[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
+
+for ti in range(min(n_trials, me_trials.shape[0])):
+    ...
+    me_data[:, ti] = fill_nan_nearest(interp_fn(TIME_AXIS))
 ```
 
-iii. The code offers no explicit justification for these repeated passes; they appear to be straightforward implementation choices.
+iii. The trajectory does not acknowledge this repeated work; it treats the per-stream computations as straightforward separate steps.
 
 ## 11-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The AI computes neural firing rates, camera velocities, and motion-energy traces for all trials, then discards any trial not in `trial_idx` when assembling outputs. It also loads and stores fields such as `L`, `no_resp`, and all side-camera frame times even though they are not needed in the final emitted dataset, and it computes thresholds only after the full per-trial arrays already exist.
+i. The code computes neural firing rates, kinematic traces, and motion-energy traces for every trial before subsetting to `trial_idx`, so work on ignored/no-response/early/stim trials is discarded. It also loads and stores raw fields it never uses downstream, such as `no_resp` and `L`, and constructs diagnostic `q_counts` only for printing.
 
 ii.
 ```python
-for ni, spk in enumerate(spike_data):
-    for ti in range(n_trials):
-        ...
+fr = np.zeros((n_raw, T_BINS, n_trials), dtype=np.float32)
+...
+tongue_vel = np.zeros((T_BINS, n_trials), dtype=np.float32)
+paw_vel    = np.zeros((T_BINS, n_trials), dtype=np.float32)
+...
+for ti in trial_idx:
+    neural_list.append(fr[:, :, ti].copy())
 ```
 
 ```python
-for ti in range(n_trials):
-    ...
-
-for ti in trial_idx:
-    neural_list.append(fr[:, :, ti].copy())
-    ...
+no_resp = bp['no'][0, 0].flatten()[:n_trials].astype(int)
+L = bp['L'][0, 0].flatten()[:n_trials].astype(int)
+...
+q_counts = {}
+for q in qualities:
+    q_counts[q] = q_counts.get(q, 0) + 1
 ```
 
-iii. There is no explicit justification for this extra work. It follows from the AI’s choice to process whole-session arrays first and apply the kept-trial mask only at the end.
+iii. The trajectory does not justify this extra work; it appears to be a consequence of assembling complete per-session arrays first and filtering later.

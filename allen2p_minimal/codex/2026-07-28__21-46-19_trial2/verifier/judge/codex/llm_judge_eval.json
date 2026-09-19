@@ -2,225 +2,225 @@
   "1-a": {
     "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The AI did not follow the reference cohort definition. Instead of using the AllenSDK experiment table filtered to `project_code == 'VisualBehavior'` and then loading all experiments needed to reconstruct sessions, it intersected the table with locally present NWB files and further restricted to `VisualBehavior` or `VisualBehaviorMultiscope`, `active_behavior`, and `VISp`/`VISl` experiments only.",
+    "decision_correctness_justification": "The reference solution loads all VisualBehavior experiments from the SDK experiment table, optionally restricts to a provided DATALIMIT subset, reconstructs sessions by grouping experiments with the same `ophys_session_id`, and then loads every experiment in each session. The AI instead restricted the cohort to locally present NWB files, included `VisualBehaviorMultiscope`, filtered to `VISp`/`VISl` active experiments only, and loaded each experiment independently.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code implements that decision exactly through `get_local_experiment_ids()`, `select_experiments()`, and the per-experiment `get_behavior_ophys_experiment()` loading loop."
+    "code_correctness_justification": "The code does implement that decision: `select_experiments()` filters by local experiment IDs, project code, behavior type, and region, and `run_conversion()` iterates over `ophys_experiment_id` values and loads them one-by-one."
   },
   "1-b": {
     "question": "How are the data split into subjects (mice)?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference define subjects by unique `mouse_id` values from the Allen metadata.",
+    "decision_correctness_justification": "Both the AI and the reference solution use the SDK's `mouse_id` field as the subject identity and derive the subject list from the unique mice present in the selected experiments.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The saved `subjects` list and `subject_idx` are built directly from unique `mouse_id` values."
+    "code_correctness_justification": "The code builds `subjects = sorted({s.mouse_id for s in session_data})` and maps each converted session to a `subject_idx` entry."
   },
   "1-c": {
     "question": "How are the data split into sessions?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference reconstructs sessions by grouping experiments with the same `ophys_session_id`. The AI instead treats each `ophys_experiment_id` as its own output session and does not merge experiments from the same `ophys_session_id`.",
+    "decision_correctness_justification": "The reference solution reconstructs sessions using unique `ophys_session_id` values and groups all experiments recorded simultaneously within a session. The AI instead treated each `ophys_experiment_id` as its own final session and never merged experiments sharing the same `ophys_session_id`.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The main conversion loop iterates over selected experiment IDs and appends one `SessionData` object per experiment."
+    "code_correctness_justification": "The implementation appends one `SessionData` per loaded experiment and never groups rows by `ophys_session_id` before building the output dataset."
   },
   "1-d": {
     "question": "How are the data split into trials?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference uses the Allen `trials` table and extracts each trial's full `start_time` to `stop_time` ophys-frame window. The AI instead defines each trial as the set of active `change_detection` stimulus intervals whose `trials_id` matches that trial.",
+    "decision_correctness_justification": "The reference solution uses the SDK trials table and extracts variable-length trial windows from `start_time` to `stop_time` on the ophys frame axis. The AI instead represented each trial as the sequence of active `change_detection` stimulus intervals linked by `stimulus_presentations.trials_id`, which is a different segmentation and time base.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code filters `stimulus_presentations` by `trials_id` inside the per-trial loop and stores interval-level slices, matching the AI's stated decision."
+    "code_correctness_justification": "The code filters `ds.trials`, builds a change-detection stimulus table, subsets it by `trials_id`, and stores one trial matrix per trial based on the interval rows assigned to that trial."
   },
   "1-e": {
     "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The AI correctly excludes aborted and auto-rewarded trials and keeps go/catch trials, but it diverges from the reference by not explicitly filtering on valid `change_time`, by requiring matching active stimulus intervals, and by adding experiment-level skips tied to its alternative signal choices.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference excludes aborted trials, auto-rewarded trials, trials without valid `change_time`, empty windows, and sessions with fewer than two valid trials. The AI also excludes aborted and auto-rewarded trials and drops experiments with fewer than two retained trials, but it additionally requires `go` or `catch` and relies on the stimulus-interval table rather than `change_time`. This does not match the reference exactly, but it is a defensible interpretation of the user instruction to include Go and Catch while excluding Aborted and Auto-rewarded trials.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The filters and experiment-level skip conditions in `process_experiment()` match the documented decision."
+    "code_correctness_justification": "The implementation applies the described mask, skips trials with no matching interval rows, and rejects experiments with fewer than two retained trials."
   },
   "2-a": {
     "question": "What variables in the raw data is the `neural` data derived from?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference derives neural data from `dff_traces.dff`. The AI switched to `events`, which changes the signal definition materially.",
+    "decision_correctness_justification": "The reference solution derives neural data from `dff_traces.dff`. The AI chose `events['events']` instead. That is a substantial methodological change relative to the human reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The neural matrix is built from `np.vstack(ds.events[\"events\"].values)`."
+    "code_correctness_justification": "The code explicitly builds `event_matrix = np.vstack(ds.events['events'].values)` and never uses `dff_traces`."
   },
   "2-b": {
     "question": "How is the `neural` data processed?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference vertically stacks dF/F traces from experiments within a session and otherwise keeps the native framewise signal. The AI rebins the event signal into stimulus intervals and sums events inside each interval.",
+    "decision_correctness_justification": "The reference mostly preserves the native per-frame dF/F traces and, when needed, stacks neurons across imaging planes within the same ophys session. The AI instead summed event magnitudes within successive stimulus intervals and kept experiments separate rather than merging planes within a session. That is a different neural representation and session construction.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The cumulative-sum interval reducer implements interval-wise event summation exactly."
+    "code_correctness_justification": "The implementation uses `interval_reduce_sum_matrix()` over the event matrix and stores those interval sums as the final per-trial neural arrays."
   },
   "2-c": {
     "question": "How is the `neural` data filtered based on quality controls?",
     "decision_correctness": "OK",
-    "decision_correctness_justification": "The reference adds no extra neuron-level QC beyond AllenSDK outputs. The AI also avoids extra ROI filtering, although it skips entire experiments when `events` is empty. Given the AI's different signal choice, that skip is defensible even though it is not the reference behavior.",
+    "decision_correctness_justification": "The reference applies no extra neuron-level filter beyond the Allen pipeline. The AI also does not apply an ROI-level filter, although it does skip an experiment if `ds.events` is empty. That differs slightly, but it still relies primarily on AllenSDK-provided QC rather than inventing a new neuron filter.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code keeps all rows in `ds.events` and only skips experiments with no events table entries."
+    "code_correctness_justification": "The only explicit neural QC in the code is the experiment-level `if len(ds.events) == 0: return None` check."
   },
   "2-d": {
     "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The instructions and reference align trials on the ophys timebase using frame indices over the `start_time` to `stop_time` trial window. The AI instead aligns to successive active image-presentation intervals from `stimulus_presentations`.",
+    "decision_correctness_justification": "The reference aligns neural data on the ophys frame axis across the full trial window from `start_time` to `stop_time`. The AI instead aligns neural data to active `change_detection` image-presentation intervals and trial membership via `trials_id`, so the neural arrays no longer live on the requested ophys timestamp frame grid.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Neural trial matrices are indexed by interval rows selected from the stimulus table, not by ophys frame windows."
+    "code_correctness_justification": "The code reduces events between interval boundaries and then slices those interval bins into trials using the stimulus table indices."
   },
   "2-e": {
     "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference keeps the native ophys frame rate and explicitly avoids rebinning. The AI uses approximately 750 ms image-presentation bins and therefore performs substantial temporal rebinning.",
+    "decision_correctness_justification": "The reference keeps the native ophys frame rate and reports the median ophys inter-frame interval as the time bin size. The AI rebins the data to roughly 750 ms image-presentation intervals and reports the median interval duration instead.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The time bin size is set from `interval_durations`, and all modalities are reduced into those intervals."
+    "code_correctness_justification": "The metadata stores `time_bin_size` as `np.median(interval_durations) * 1000`, and the neural arrays are built from interval sums rather than native frames."
   },
   "3-a": {
     "question": "What variables in the raw data is `output` *Image identity* derived from?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference derives image identity from `initial_image_name` and `change_image_name` in the trials table, switching at `change_time`. The AI uses `stimulus_presentations.image_name` instead.",
+    "decision_correctness_justification": "The reference derives image identity from the trial-table fields `initial_image_name`, `change_image_name`, and `change_time`. The AI instead derives it from `stimulus_presentations.image_name` on the interval table.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Per-trial image labels are taken directly from `trial_stim[\"image_name\"]`."
+    "code_correctness_justification": "The code reads `trial_stim['image_name']` directly and never uses `initial_image_name` or `change_image_name`."
   },
   "3-b": {
     "question": "What processing is involved in computing `output` *Image identity*?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference constructs a framewise pre-change/post-change image label from the trials table. The AI instead keeps interval-level `image_name` labels, fills missing values with `unknown`, and includes `omitted` as an explicit category.",
+    "decision_correctness_justification": "The reference constructs a framewise image identity signal that switches from the initial image to the change image at `change_time`. The AI instead takes the already-discretized interval-level `image_name` values from the stimulus table, keeps `omitted` as an explicit category, fills missing labels with `unknown`, and integer-codes those labels globally.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The global string-to-index mapping and `fillna(\"unknown\")` behavior are implemented exactly as documented."
+    "code_correctness_justification": "The implementation exactly follows that design by collecting interval `image_name` strings and mapping them through `image_to_idx`."
   },
   "3-c": {
     "question": "How is `output` *Image identity* aligned with the neural data?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference aligns image identity to ophys frames in the `start_time` to `stop_time` trial window. The AI aligns it to the same stimulus intervals used for interval-summed neural data.",
+    "decision_correctness_justification": "The reference aligns image identity per ophys frame using the same frame indices as the neural data. The AI aligns image identity per stimulus interval using the same interval indices as its rebinned neural data, which is a different alignment scheme.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same `stim_idx` interval indices are used for both `neural` and `image_names`."
+    "code_correctness_justification": "Both the interval-level neural arrays and the interval-level image labels are sliced with the same `stim_idx` array."
   },
   "4-a": {
     "question": "What variables in the raw data is `output` *Image change* derived from?",
-    "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference derives image change from `change_time` and `go` in the trials table. The AI instead takes it from `stimulus_presentations.is_change`.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference computes image change from trial-table `change_time` and `go`. The AI uses the interval-table `is_change` flag instead. This does not match the reference variable choice, but it is a reasonable direct source for interval-level change labels.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The stored trial-level image-change vector comes from `trial_stim[\"is_change\"]`."
+    "code_correctness_justification": "The code pulls `trial_stim['is_change']`, fills missing values with `False`, and uses that as the trial-level image-change signal."
   },
   "4-b": {
     "question": "What processing is involved in computing `output` *Image change*?",
-    "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference marks a 750 ms transient window starting at `change_time` and only for go trials. The AI simply uses the interval-level `is_change` flag with missing values filled to `False`.",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference marks the first 750 ms after a true change on go trials. The AI directly uses the interval-level `is_change` flag. On the interval time base this is a coherent simplification, even though it differs from the reference's frame-based construction.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly that boolean extraction and later integer conversion."
+    "code_correctness_justification": "The implementation simply converts the filled `is_change` booleans into integer category labels during output assembly."
   },
   "4-c": {
     "question": "How is `output` *Image change* thresholded into categories?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference represent image change as a binary categorical output with values `no_change` and `change` encoded as 0/1.",
+    "decision_correctness_justification": "Both the AI and the reference treat image change as a binary variable with `no_change` and `change` categories.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code casts the boolean flag to integer and defines output values as `[\"no_change\", \"change\"]`."
+    "code_correctness_justification": "The output metadata defines `['no_change', 'change']`, and the stored values are 0/1 integers."
   },
   "4-d": {
     "question": "How is `output` *Image change* aligned with the neural data?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference aligns image change to the framewise neural data around `change_time`. The AI aligns it to image-presentation intervals.",
+    "decision_correctness_justification": "The reference aligns image change per ophys frame with the framewise neural trial matrices. The AI aligns it on the stimulus-interval axis instead, so the alignment mechanism differs with the chosen time base.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The trial's `image_change` vector and neural matrix are both indexed by the same interval selection."
+    "code_correctness_justification": "The code slices the neural interval sums and the `is_change` interval labels from the same `trial_stim` rows."
   },
   "5-a": {
     "question": "What variables in the raw data is `output` *Running speed* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference use `dataset.running_speed`, specifically the running-wheel speed samples and their timestamps.",
+    "decision_correctness_justification": "Both the AI and the reference derive running speed from the AllenSDK running table, specifically the `speed` values and their timestamps.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `timestamps` and `speed` from `ds.running_speed`."
+    "code_correctness_justification": "The code reads `ds.running_speed['timestamps']` and `ds.running_speed['speed']` directly."
   },
   "5-b": {
     "question": "What processing is involved in computing `output` *Running speed*?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference linearly interpolates running speed to the ophys frame times and then discretizes those framewise values. The AI averages running speed within stimulus intervals before discretization.",
+    "decision_correctness_justification": "The reference linearly interpolates running speed onto the ophys frame timestamps and then segments trials on that frame axis. The AI instead averages running speed within stimulus intervals and never creates a framewise running-speed series on the ophys timestamps.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code uses `interval_reduce_mean()` on running timestamps and values, then bins the resulting interval-level series."
+    "code_correctness_justification": "The implementation uses `interval_reduce_mean()` between interval start and end times and stores those per-interval means."
   },
   "5-c": {
     "question": "How is `output` *Running speed* thresholded into categories?",
     "decision_correctness": "OK",
-    "decision_correctness_justification": "The reference uses percentile edges and `np.digitize`; the AI uses rank-based quintiles with `qcut`. This does not match the reference implementation, but it is still a technically defensible way to produce five global equal-frequency bins, especially in the presence of ties.",
+    "decision_correctness_justification": "The reference uses percentile edges and `np.digitize`. The AI uses rank-based `qcut` to force five equal-frequency bins. That does not match the human implementation, but it is an equally motivated way to satisfy the task's five equal percentile bins requirement.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The `rank_quintiles()` helper is used directly to produce the five running-speed categories."
+    "code_correctness_justification": "The code computes `running_bins = rank_quintiles(all_running)` and uses those discrete labels when assembling trial outputs."
   },
   "5-d": {
     "question": "How is `output` *Running speed* aligned with the neural data?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference aligns running by interpolation onto `ophys_ts` so neural and running share the same frame indices. The AI aligns by averaging running within the same stimulus intervals used for the neural signal.",
+    "decision_correctness_justification": "The reference aligns running speed to the neural data by interpolating onto `ophys_timestamps` and slicing the same frame indices used for neural data. The AI aligns running speed by interval-averaging within the same stimulus intervals used for its rebinned neural representation.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The interval means are sliced with the same interval indices as the neural matrices."
+    "code_correctness_justification": "The code stores `running_raw=running_by_interval[stim_idx]` and later uses the corresponding discrete interval bins alongside the interval-level neural arrays."
   },
   "6-a": {
     "question": "What variables in the raw data is `output` *Pupil diameter* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference use the eye-tracking table's `pupil_width` as the pupil-diameter-like raw variable.",
+    "decision_correctness_justification": "Both the AI and the reference use `eye_tracking['pupil_width']` as the source signal for pupil diameter, together with the eye-tracking timestamps.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code reads `pupil_width` and eye-tracking timestamps from `ds.eye_tracking`."
+    "code_correctness_justification": "The implementation reads `eye_df['pupil_width']` and `eye_df['timestamps']` directly."
   },
   "6-b": {
     "question": "What processing is involved in computing `output` *Pupil diameter*?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference removes blink-marked frames via `likely_blink`, interpolates to ophys frames, and discretizes the framewise values. The AI interpolates all NaNs in `pupil_width` over eye-tracking time and then averages the filled signal inside stimulus intervals before discretizing.",
+    "decision_correctness_justification": "The reference excludes blink frames using `likely_blink`, interpolates the remaining pupil-width samples onto the ophys time base, and then segments framewise trials. The AI instead linearly interpolates across all NaNs in the pupil-width series, averages within stimulus intervals, and discretizes those interval means. That is a materially different processing path.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The `fill_nan_by_time()` and `interval_reduce_mean()` steps implement that decision directly."
+    "code_correctness_justification": "The code applies `fill_nan_by_time()` to the entire pupil-width series and then uses `interval_reduce_mean()` over the stimulus intervals."
   },
   "6-c": {
     "question": "How is `output` *Pupil diameter* thresholded into categories?",
     "decision_correctness": "OK",
-    "decision_correctness_justification": "As with running speed, the AI uses rank-based quintiles rather than the reference's percentile-edge binning. That is not a match, but it is still a reasonable way to create five equal-frequency categories.",
+    "decision_correctness_justification": "As with running speed, the reference uses percentile edges while the AI uses rank-based `qcut`. The implementations differ, but the AI's choice is still a defensible way to create five equal-frequency bins.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code applies `rank_quintiles()` to the pooled pupil values and stores five pupil-bin labels."
+    "code_correctness_justification": "The implementation computes `pupil_bins = rank_quintiles(all_pupil)` and uses those integer bins in the final output arrays."
   },
   "6-d": {
     "question": "How is `output` *Pupil diameter* aligned with the neural data?",
     "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference aligns pupil by interpolation to the ophys frame times. The AI aligns by interval averaging on the stimulus-interval time axis.",
+    "decision_correctness_justification": "The reference aligns pupil diameter by interpolating onto `ophys_timestamps` and slicing the same frame indices as the neural data. The AI aligns pupil by averaging within stimulus intervals and slicing the same interval rows as its interval-level neural data.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Pupil values are reduced over the same interval boundaries used for the neural event sums."
+    "code_correctness_justification": "The code stores `pupil_raw=pupil_by_interval[stim_idx]` for each trial and later converts the aligned interval values to discrete bins."
   },
   "7-a": {
     "question": "What variables in the raw data is `output` *Trial outcome* derived from?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference derive trial outcome from the trial-table booleans `hit`, `miss`, `false_alarm`, and `correct_reject`.",
+    "decision_correctness_justification": "Both the AI and the reference derive trial outcome from the Allen trial-table booleans `hit`, `miss`, `false_alarm`, and `correct_reject`.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The `infer_trial_outcome()` helper checks exactly those columns."
+    "code_correctness_justification": "The code checks those four booleans in `infer_trial_outcome()` and assigns the corresponding label."
   },
   "7-b": {
     "question": "What processing is involved in computing `output` *Trial outcome*?",
     "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both the AI and the reference map the four outcomes to fixed integer codes and repeat the code across all time bins in the trial.",
+    "decision_correctness_justification": "Both implementations map the categorical outcome labels to fixed integer codes and repeat the chosen code across every time bin in the trial.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code builds `outcome_to_idx` from `TRIAL_OUTCOMES` and fills a length-`T` vector with the per-trial code."
+    "code_correctness_justification": "The implementation builds `outcome_to_idx` and then uses `np.full(t, outcome_to_idx[trial.trial_outcome], dtype=np.int64)` for each trial."
   },
   "8": {
     "question": "How are minor mistakes in the data, e.g. missing data, handled?",
     "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The AI does handle missing data, but differently from the reference. It skips whole experiments for missing events or unusable pupil data, interpolates pupil NaNs, fills missing image labels with `unknown`, and interpolates empty interval averages. It does not mirror the reference's `try/except` session skipping and frame-window clipping behavior because it changed the trial representation.",
+    "decision_correctness_justification": "The reference mainly clips truncated trials, skips empty windows or failed sessions, and maps post-interpolation NaNs to bin 0. The AI instead changes the cohort based on local-file availability, interpolates NaN pupil samples across time, fills missing image labels with `unknown`, fills missing `is_change` with `False`, and interpolates interval values when no raw samples land in a bin. These are not obviously nonsensical, but they depart from the reference handling and deserve human review.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The skip conditions, interpolation helpers, and `fillna()` calls are implemented exactly as described."
+    "code_correctness_justification": "The code does implement all of those fallback behaviors explicitly through file-availability filtering, experiment skips, NaN interpolation, and `fillna()` defaults."
   },
   "9-a": {
     "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The reference identifies experiment loading as the main bottleneck. The AI code still has that bottleneck, and it also adds large interval-reduction work on the full event matrix. That differs in detail but is a reasonable characterization of this implementation.",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "As in the reference, the dominant cost is still loading large AllenSDK experiment objects from disk and materializing session-sized neural and behavioral arrays. The AI adds interval reductions over those arrays, but the high-level bottleneck remains the per-experiment data load plus full-session processing.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code repeatedly loads experiments with AllenSDK and performs full-session interval reductions before trial extraction."
+    "code_correctness_justification": "The code structure makes those expensive steps clear: the outer loop repeatedly calls `get_behavior_ophys_experiment()`, then stacks the full event matrix and reduces several full-session streams."
   },
   "9-b": {
     "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The reference says the per-trial loop could theoretically be vectorized but is not the main bottleneck. The AI has similar opportunities, especially repeated per-trial DataFrame filtering by `trials_id` and string-to-index remapping. This is a reasonable efficiency assessment even though the exact loop bodies differ.",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the AI leaves the core per-trial processing in explicit Python loops. In this implementation the most obvious vectorization opportunities are the per-trial `stim[stim['trials_id'] == trial_id]` filtering and the per-trial output assembly loop.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those loops are present in the implementation exactly as summarized."
+    "code_correctness_justification": "Those loops are present exactly as described in `process_experiment()` and `build_decoder_dataset()`."
   },
   "9-c": {
     "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference solution explicitly avoids repeated processing after session loading, but the AI code makes several separate passes over all trials to pool running values, pool pupil values, collect image labels, and then assemble outputs. Relative to the reference, this is a real inefficiency.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference explicitly notes that it does not repeat processing. The AI does repeat some work, such as repeatedly filtering the stimulus table by `trials_id`, remapping image names trial-by-trial, and making separate passes for rank-based binning and quantile summaries. This is more redundant than the human solution, though not a correctness bug.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "The multiple global passes over `session_data` and per-trial arrays are clearly present in `build_decoder_dataset()`."
+    "code_correctness_justification": "The code contains those repeated passes and per-trial repeated DataFrame filters exactly as documented."
   },
   "9-d": {
     "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "INCORRECT",
-    "decision_correctness_justification": "The reference records no such unnecessary processing. The AI code keeps some unused bookkeeping, such as `trial_id` inside `TrialData` and the unused `interval_duration_all` list, and it computes metadata not consumed by downstream decoder training.",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference answer is effectively none. The AI adds extra bookkeeping and reporting work that the downstream decoder does not use, including `selected_summary`, `session_info`, several session counters, extra quantile summaries, and an `interval_duration_all` list that is populated but never consumed. These are not harmful, but they are unnecessary relative to the reference.",
     "code_correctness": "CORRECT",
-    "code_correctness_justification": "Those unused or decoder-irrelevant values are indeed created and either never read again or only stored as metadata."
+    "code_correctness_justification": "The implementation really does compute and/or store those extra values, and `interval_duration_all` is indeed appended to without affecting the final dataset."
   }
 }

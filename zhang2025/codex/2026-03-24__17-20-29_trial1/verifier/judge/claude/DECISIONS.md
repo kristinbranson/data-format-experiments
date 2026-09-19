@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI reads session metadata from a parquet manifest file (`sessions.pqt`) found in the local ONE cache directory structure. It constructs filesystem paths from the manifest fields (lab, subject, date, session number) and reads data files directly from disk using `np.load` and `pd.read_parquet`, rather than using the ONE API. A `pick_one_file` helper resolves versioned ALF directories by selecting the latest revision.
+i. The AI reads a session manifest parquet file (`sessions.pqt`) from the local ONE cache to discover sessions, then resolves each session to a filesystem path (`DATA_ROOT / lab / Subjects / subject / date / number`). It does NOT use the ONE API to load data. Instead, it directly reads files from the resolved paths using `np.load`, `pd.read_parquet`, etc. It searches for the manifest across three possible locations (`2025_Q3_IBL_et_al_BWM`, `Brainwidemap`, `2022_Q4_IBL_et_al_BWM`).
 
 ii.
 ```python
@@ -16,12 +16,10 @@ def load_session_manifest() -> pd.DataFrame:
     for manifest in MANIFEST_FILES:
         if manifest.exists():
             return pd.read_parquet(manifest)
-    raise FileNotFoundError("No session manifests found in data cache")
 
 def resolve_session_specs() -> tuple[list[SessionSpec], list[str]]:
     manifest = load_session_manifest()
     specs: list[SessionSpec] = []
-    missing: list[str] = []
     for eid, row in manifest.iterrows():
         session_path = (
             DATA_ROOT / row["lab"] / "Subjects" / row["subject"]
@@ -31,62 +29,67 @@ def resolve_session_specs() -> tuple[list[SessionSpec], list[str]]:
             missing.append(eid)
             continue
         specs.append(SessionSpec(...))
-    return specs, missing
 ```
 
-iii. The AI chose to bypass the ONE API and read files directly from the local cache. This was documented in CONVERSION_NOTES.md where it noted the data structure of the local ONE cache and built path resolution logic to handle versioned ALF directories.
+iii. The AI chose to bypass the ONE API and load files directly from the local cache. This is documented in CONVERSION_NOTES.md Step 2, where the AI describes the data structure as a local ONE cache with session data stored by lab/subject/date/number.
 
 ## 1-b. How are the data split into subjects?
 
-i. The subject name is extracted from the manifest row for each session. A sorted list of unique subjects is built from the processed sessions, and `subject_idx` maps each session to its index in that list.
+i. Subjects are identified from the `subject` field of the session manifest parquet file. Each `SessionSpec` carries the subject name, and after processing, unique subjects are extracted and sorted to build the `subjects` list.
 
 ii.
 ```python
+specs.append(
+    SessionSpec(
+        eid=eid,
+        lab=str(row["lab"]),
+        subject=str(row["subject"]),
+        ...
+    )
+)
+
+# In build_data_dict:
 subjects = sorted({s.subject for s in sessions})
 subject_to_idx = {s: i for i, s in enumerate(subjects)}
-"subject_idx": np.array([subject_to_idx[s.subject] for s in sessions], dtype=np.int16),
 ```
 
-iii. The subject comes from the manifest's `subject` field, which identifies the mouse.
+iii. The manifest provides subject identity directly as a field.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each row in the manifest represents one session, identified by its `eid`. The AI iterates over manifest rows to construct `SessionSpec` objects, each representing one session.
+i. Each row in the session manifest corresponds to one session. The AI iterates over all rows, resolves each to a local path, and processes them independently.
 
 ii.
 ```python
 for eid, row in manifest.iterrows():
-    session_path = (DATA_ROOT / row["lab"] / "Subjects" / row["subject"]
-                    / str(row["date"]) / f"{int(row['number']):03d}")
-    ...
-    specs.append(SessionSpec(eid=eid, lab=str(row["lab"]), subject=str(row["subject"]), ...))
+    session_path = (
+        DATA_ROOT / row["lab"] / "Subjects" / row["subject"]
+        / str(row["date"]) / f"{int(row['number']):03d}"
+    )
 ```
 
-iii. The manifest already has one row per session, so no splitting is needed.
+iii. Sessions are the natural unit of the manifest; no splitting is needed.
 
 ## 1-d. How are the data split into trials?
 
-i. The trials table (`_ibl_trials.table.pqt`) has one row per trial. The AI reads this parquet file for each session and uses it directly.
+i. The trials table (`_ibl_trials.table.pqt`) has one row per trial. No splitting is needed.
 
 ii.
 ```python
 def load_trials_table(session_path: Path) -> pd.DataFrame:
     trial_file = pick_one_file(session_path / "alf", "_ibl_trials.table.pqt")
-    ...
     return pd.read_parquet(trial_file)
 ```
 
-iii. The trials table already contains one row per trial, so no further splitting is needed.
+iii. The trials table is already one row per trial.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are filtered based on: (1) reaction time between 0.08 and 2.0 s, (2) trial duration `feedback_times - goCue_times <= 10 s`, (3) `choice != 0`, (4) required columns not NaN (`stimOn_times`, `choice`, `feedback_times`, `probabilityLeft`, `firstMovement_times`, `feedbackType`). Additionally, after behavior interpolation, trials where the wheel or whisker data doesn't cover the trial window are dropped, and trials with all-zero neural activity are dropped.
+i. The AI applies four filtering criteria: (1) reaction time between 0.08 and 2.0 s, (2) choice != 0 (no-response excluded), (3) required columns are not NaN (`stimOn_times`, `choice`, `feedback_times`, `probabilityLeft`, `firstMovement_times`, `feedbackType`), and (4) trial duration (`feedback_times - goCue_times`) <= 10 s. Additionally, trials are dropped if wheel or whisker data don't cover the trial window, or if the neural window has all-zero spike counts.
 
 ii.
 ```python
 def compute_trial_mask(trials: pd.DataFrame) -> np.ndarray:
-    required = ["stimOn_times", "choice", "feedback_times", "probabilityLeft",
-                "firstMovement_times", "feedbackType"]
     mask = np.ones(len(trials), dtype=bool)
     rt = trials["firstMovement_times"] - trials["stimOn_times"]
     mask &= rt >= TRIAL_MASK_RT[0]
@@ -96,18 +99,17 @@ def compute_trial_mask(trials: pd.DataFrame) -> np.ndarray:
     for col in required:
         mask &= trials[col].notna().to_numpy()
     return mask
-```
 
-```python
+# Later:
 neural_mask = np.array([np.any(trial) for trial in neural_trials], dtype=bool)
 combined_mask = wheel_mask & whisk_mask & neural_mask
 ```
 
-iii. CONVERSION_NOTES.md documents using the reference code trial mask from `load_trials_and_mask()` which includes RT range, no-choice removal, max trial duration, and missing event exclusions. The all-zero neural trial filter was added after Step 10 review when verification warnings appeared.
+iii. The AI documented that these filters match the reference code's `load_trials_and_mask()` function, and added the all-zero neural trial filter after full verification revealed warnings.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `spikes.times.npy` and `spikes.clusters.npy` from each probe's pykilosort directory, along with `clusters.metrics.pqt` for QC filtering, `clusters.channels.npy` and `channels.brainLocationIds_ccf_2017.npy` for region mapping.
+i. `spikes.times.npy` and `spikes.clusters.npy` from each probe's pykilosort directory, plus `clusters.metrics.pqt` for QC labels and `clusters.channels.npy` / `channels.brainLocationIds_ccf_2017.npy` for region assignment.
 
 ii.
 ```python
@@ -116,77 +118,79 @@ spikes_clusters_file = pick_one_file(pykilo_path, "spikes.clusters.npy")
 metrics_file = pick_one_file(pykilo_path, "clusters.metrics.pqt")
 ```
 
-iii. The AI identified these files in Step 2 (Dataset Exploration) as the spike sorting outputs under `alf/probeXX/pykilosort/`.
+iii. The AI loads spike times and cluster assignments directly from numpy files.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Spikes are binned into 20 ms bins over the [-0.5, 1.5] s window using `bincount2D`. The result is stored as raw spike counts in float16, NOT converted to firing rate. When a session has multiple probes, clusters are merged with an offset so they are numbered continuously.
+i. Spikes are counted into 20 ms bins over the [-0.5, 1.5] s trial window using `bincount2D`. The result is stored as spike counts (NOT divided by bin width), so the values are raw counts, not firing rates. Data is stored as float16.
 
 ii.
 ```python
-trial_counts = np.zeros((n_clusters, n_bins), dtype=np.float16)
-if idx1 > idx0:
+def bin_spikes_for_trials(...):
+    ...
     counts, _, cluster_idx = bincount2D(
-        spike_times[idx0:idx1], spike_clusters[idx0:idx1],
-        xbin=binsize, xlim=[start, end])
+        spike_times[idx0:idx1],
+        spike_clusters[idx0:idx1],
+        xbin=binsize,
+        xlim=[start, end],
+    )
     if counts.size:
         counts = counts[:, :n_bins]
         trial_counts[cluster_idx, : counts.shape[1]] = counts.astype(np.float16)
-```
+    results.append(trial_counts)
 
-```python
+# In build_data_dict:
 data["neural"].append([trial.astype(np.float16) for trial in session.neural])
 ```
 
-iii. The AI's CONVERSION_NOTES.md states neural values are "raw binned spike counts, not standardized z-scores." However, the reference code divides by bin width to get firing rates in Hz. The AI also uses float16 rather than float32.
+iii. The AI used `bincount2D` from `iblutil.numerical` for efficiency. The CONVERSION_NOTES.md Step 6 mentions "raw binned spike counts, not standardized z-scores." Probes are merged within each session.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Only clusters with `clusters.metrics.label >= 1` are kept. This is the "well-isolated neuron" criterion from the data paper (75,708 of 621,733 units).
+i. Only clusters with `clusters.metrics.label >= 1` are kept. The AI does NOT filter by brain region (no void/root filtering). It uses Allen atlas acronyms via `br.id2acronym()` rather than Beryl mapping.
 
 ii.
 ```python
-GOOD_CLUSTER_LABEL = 1
-...
 metrics = pd.read_parquet(metrics_file, columns=["label"])
 cluster_labels = metrics["label"].to_numpy()
-good_mask = cluster_labels >= label_threshold
-selected_cluster_ids = np.flatnonzero(good_mask)
-...
-spike_keep = good_mask[spikes_clusters]
+good_mask = cluster_labels >= label_threshold  # label_threshold = GOOD_CLUSTER_LABEL = 1
+
+# Region assignment:
+cluster_region_ids[valid_channel] = channel_ids[cluster_channels[valid_channel]]
+cluster_regions = br.id2acronym(cluster_region_ids)
 ```
 
-iii. CONVERSION_NOTES.md documents this as matching the data paper's well-isolated neuron count.
+iii. The AI documented in CONVERSION_NOTES.md Step 4 that it chose `label >= 1` to match the data paper's 75,708 well-isolated neuron count.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Each trial's spikes are binned relative to the stimulus onset time (`stimOn_times`). The window is [-0.5, 1.5] s. The `bincount2D` function is called with `xlim=[stimOn + window[0], stimOn + window[1]]`.
+i. Each trial is aligned to `stimOn_times`. The spike binning function creates intervals `[stimOn_time + window[0], stimOn_time + window[1]]` and bins spikes within those intervals.
 
 ii.
 ```python
 align_times = masked_trials["stimOn_times"].to_numpy(dtype=np.float64)
-neural_trials = bin_spikes_for_trials(spike_times, spike_clusters, n_clusters=n_clusters_good, align_times=align_times)
-...
 intervals = np.c_[align_times + window[0], align_times + window[1]]
+idx_starts = np.searchsorted(spike_times, intervals[:, 0], side="left")
+idx_ends = np.searchsorted(spike_times, intervals[:, 1], side="left")
 ```
 
-iii. Documented in CONVERSION_NOTES.md Step 4: "use the executable repository settings of 2 s windows, 20 ms bins, and stimulus-onset alignment."
+iii. Stimulus onset alignment is explicitly required by the instructions and matches the reference code.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. 20 ms bins (0.02 s), producing 100 time bins per trial over the 2 s window. No rebinning is applied.
+i. 20 ms bins over a 2 s window, giving 100 time bins per trial. No rebinning or interpolation is applied to neural data.
 
 ii.
 ```python
 BINSIZE_S = 0.02
-N_BINS = int(round((TIME_WINDOW[1] - TIME_WINDOW[0]) / BINSIZE_S))
+N_BINS = int(round((TIME_WINDOW[1] - TIME_WINDOW[0]) / BINSIZE_S))  # 100
 ```
 
 iii. Matches the reference code's `binsize=0.02`.
 
 ## 3-a. What variables in the raw data is `input` *Time since stimulus onset* derived from?
 
-i. It is a constructed time grid based on the window parameters, not derived from any raw data variable directly. It represents the time axis of the bins.
+i. It is a synthetic variable computed from the time window and bin size parameters, not from any raw data variable. It represents the time grid of the neural bins.
 
 ii.
 ```python
@@ -194,56 +198,46 @@ def make_time_input() -> np.ndarray:
     return np.linspace(TIME_WINDOW[0] + BINSIZE_S, TIME_WINDOW[1], N_BINS, dtype=np.float32)
 ```
 
-iii. This is a computed variable representing the time axis of the trial.
+iii. The AI computes this as a fixed grid that is the same for every trial.
 
 ## 3-b. What processing is involved in computing `input` *Time since stimulus onset*?
 
-i. The AI uses `np.linspace(-0.48, 1.5, 100)`, which produces bin right edges rather than bin centers. This gives values starting at -0.48, -0.4598..., etc.
+i. The AI uses `np.linspace(-0.48, 1.5, 100)` to produce 100 evenly-spaced values from -0.48 to 1.50. These are the RIGHT EDGES of the bins, not the bin centers.
 
 ii.
 ```python
-x_rel = np.linspace(window[0] + binsize, window[1], n_bins)
-# = np.linspace(-0.48, 1.5, 100)
+return np.linspace(TIME_WINDOW[0] + BINSIZE_S, TIME_WINDOW[1], N_BINS, dtype=np.float32)
+# Produces: [-0.48, -0.46, ..., 1.48, 1.50]
 ```
 
-iii. The AI's CONVERSION_NOTES.md confirms the time grid as `[-0.48, ..., 1.50]`. This differs from the reference solution which uses bin centers: `EDGES[:-1] + BIN/2 = [-0.49, -0.47, ..., 1.49]`.
+iii. The AI documented this as matching the behavior interpolation grid (right edges).
 
 ## 3-c. How is the `input` *Time since stimulus onset* aligned with the neural data?
 
-i. The time input uses the same bin grid as the behavior interpolation (`np.linspace(-0.48, 1.5, 100)`). However, note that the neural spike binning uses `bincount2D` with `xlim=[start, end]` which defines a different bin grid (bin edges from -0.5 to 1.5 in 0.02 steps). The time input grid is aligned with the behavior but may not be perfectly aligned with the neural bin grid.
+i. The time input uses the same bin edges as the behavior interpolation. However, it uses right bin edges while the neural binning uses `bincount2D` with `xlim=[start, end]`, so there may be a slight misalignment between the time labels and the actual bin boundaries.
 
 ii.
 ```python
-# Time input and behavior use:
-x_rel = np.linspace(window[0] + binsize, window[1], n_bins)  # right edges
+# Time input uses right edges:
+x_rel = np.linspace(window[0] + binsize, window[1], n_bins)
 
-# Neural binning uses bincount2D with xlim=[start, end]
-# which creates its own bin grid
+# Neural binning uses bincount2D with xlim:
+counts, _, cluster_idx = bincount2D(
+    spike_times[idx0:idx1], spike_clusters[idx0:idx1],
+    xbin=binsize, xlim=[start, end],
+)
 ```
 
-iii. The AI intended these to be aligned but the time input represents right bin edges while the neural bins from `bincount2D` have their own edge/center convention.
+iii. The AI's approach aligns the behavior interpolation with the time input, but the neural binning via `bincount2D` may use a slightly different bin grid definition.
 
 ## 4-a. What variables in the raw data is `input` *Trial number in block* derived from?
 
-i. From `probabilityLeft` in the trials table. Block boundaries are detected when `probabilityLeft` changes value.
-
-ii.
-```python
-block_trial_number = compute_trial_number_in_block(trials["probabilityLeft"].to_numpy())
-```
-
-iii. Documented in CONVERSION_NOTES.md as "Block counter resets whenever `probabilityLeft` changes."
-
-## 4-b. What processing is involved in computing `input` *Trial number in block*?
-
-i. The AI counts from 1 (not 0). The first trial in a block gets count=1, and it increments for each subsequent trial with the same `probabilityLeft`. The count is computed on the full unfiltered trial table before any trial masking.
+i. From `probabilityLeft` in the trials table. A block boundary is detected wherever the value changes.
 
 ii.
 ```python
 def compute_trial_number_in_block(prob_left: np.ndarray) -> np.ndarray:
     counters = np.zeros(len(prob_left), dtype=np.float32)
-    if len(prob_left) == 0:
-        return counters
     count = 1
     counters[0] = count
     for i in range(1, len(prob_left)):
@@ -255,22 +249,26 @@ def compute_trial_number_in_block(prob_left: np.ndarray) -> np.ndarray:
     return counters
 ```
 
-iii. CONVERSION_NOTES.md: "Compute trial number in block on the original unfiltered trial table: Excluded trials should not renumber the latent block progression."
+iii. The AI documented that block boundaries are detected from changes in `probabilityLeft`.
 
-## 5-a. What variables in the raw data is `output` *Choice* derived from?
+## 4-b. What processing is involved in computing `input` *Trial number in block*?
 
-i. From `trials.choice`, which is +1 (left), -1 (right), or 0 (no-go).
+i. The AI counts trials within each block starting from 1 (not 0). The count is computed on the FULL unfiltered trial table before trial masking, so excluded trials still advance the counter. This is computed before the trial mask is applied.
 
 ii.
 ```python
-choice_vals = map_choice_to_binary(masked_keep["choice"].to_numpy(dtype=np.float64))
+block_trial_number = compute_trial_number_in_block(trials["probabilityLeft"].to_numpy())
+# First trial in block = 1, second = 2, etc.
+
+# Applied after masking:
+block_vals = block_trial_number[masked_keep["index"].to_numpy()]
 ```
 
-iii. Matches the standard IBL convention.
+iii. The AI documented in CONVERSION_NOTES.md Step 5 decision 8: "Compute trial number in block on the original unfiltered trial table."
 
-## 5-b. What processing is involved in computing `output` *Choice*?
+## 5-a. What variables in the raw data is `output` *Choice* derived from?
 
-i. Mapped to binary: `choice == 1 -> 0` (left), `choice == -1 -> 1` (right). Trials with `choice == 0` are excluded. The value is repeated across all 100 time bins.
+i. From `trials.choice` in the trials table. Values +1 (left), -1 (right), 0 (no-go).
 
 ii.
 ```python
@@ -278,27 +276,26 @@ def map_choice_to_binary(choice_values: np.ndarray) -> np.ndarray:
     mapped = np.full(choice_values.shape, -1, dtype=np.int16)
     mapped[choice_values == 1] = 0   # left
     mapped[choice_values == -1] = 1  # right
-    if np.any(mapped < 0):
-        raise ValueError("Unexpected choice values after masking")
     return mapped
 ```
 
-iii. Follows the instruction specification: left = 0, right = 1.
+iii. The AI correctly identifies the IBL choice convention.
 
-## 6-a. What variables in the raw data is `output` *Prior probability of left* derived from?
+## 5-b. What processing is involved in computing `output` *Choice*?
 
-i. From `trials.probabilityLeft`, which takes values 0.2, 0.5, and 0.8.
+i. The raw choice values are mapped: +1 (left) -> 0, -1 (right) -> 1. Trials with choice == 0 are excluded by the trial mask. The mapped value is repeated across all 100 time bins.
 
 ii.
 ```python
-prior_vals = map_prior_to_categorical(masked_keep["probabilityLeft"].to_numpy(dtype=np.float64))
+choice_vals = map_choice_to_binary(masked_keep["choice"].to_numpy(dtype=np.float64))
+choice.append(np.full(N_BINS, choice_val, dtype=np.int16))
 ```
 
-iii. Standard IBL block probability variable.
+iii. Matches the decoder task specification.
 
-## 6-b. What processing is involved in computing `output` *Prior probability of left*?
+## 6-a. What variables in the raw data is `output` *Prior probability of left* derived from?
 
-i. Mapped to categorical: 0.2 -> 0, 0.5 -> 1, 0.8 -> 2, using `np.isclose` for floating-point comparison. The value is repeated across all 100 time bins.
+i. From `trials.probabilityLeft` in the trials table, which takes values 0.2, 0.5, or 0.8.
 
 ii.
 ```python
@@ -307,153 +304,161 @@ def map_prior_to_categorical(prob_left: np.ndarray) -> np.ndarray:
     mapped[np.isclose(prob_left, 0.2)] = 0
     mapped[np.isclose(prob_left, 0.5)] = 1
     mapped[np.isclose(prob_left, 0.8)] = 2
-    ...
     return mapped
 ```
 
-iii. Follows the instruction specification.
+iii. Matches the decoder task specification.
+
+## 6-b. What processing is involved in computing `output` *Prior probability of left*?
+
+i. The three values are mapped to categorical integers: 0.2 -> 0, 0.5 -> 1, 0.8 -> 2. The mapped value is repeated across all 100 time bins.
+
+ii.
+```python
+prior_vals = map_prior_to_categorical(masked_keep["probabilityLeft"].to_numpy(dtype=np.float64))
+prior.append(np.full(N_BINS, prior_val, dtype=np.int16))
+```
+
+iii. Follows the instructions exactly.
 
 ## 7-a. What variables in the raw data is `output` *Wheel speed* derived from?
 
-i. From `_ibl_wheel.position.npy` and `_ibl_wheel.timestamps.npy`. The position is interpolated to 1000 Hz and differentiated with a Butterworth filter to get velocity, then the absolute value gives speed.
+i. From `_ibl_wheel.position.npy` and `_ibl_wheel.timestamps.npy`. The raw position is interpolated to 1000 Hz, then velocity is computed with a Butterworth filter, and speed is the absolute value.
 
 ii.
 ```python
 def load_wheel_speed(session_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    ...
+    pos = np.asarray(np.load(wheel_pos_file), dtype=np.float64)
+    ts = np.asarray(np.load(wheel_ts_file), dtype=np.float64)
     pos_interp, ts_interp = interpolate_position(ts, pos, freq=1000)
     vel, _ = velocity_filtered(pos_interp, 1000)
     return ts_interp, np.abs(vel)
 ```
 
-iii. Uses the bundled `brainbox.behavior.wheel` functions from the reference code directory, producing the same wheel processing pipeline.
+iii. The AI reuses wheel processing functions from the bundled ibllib code.
 
 ## 7-b. What processing is involved in computing `output` *Wheel speed*?
 
-i. Wheel position is interpolated to 1000 Hz, velocity is computed with a Butterworth low-pass filter, absolute value gives speed. The speed trace is then interpolated onto the trial time grid using `scipy.interpolate.interp1d` (linear interpolation with extrapolation). Finally it is discretized into 3 bins.
+i. The wheel position is interpolated to 1000 Hz, filtered with `velocity_filtered` to get velocity, and the absolute value gives speed. This speed is then interpolated onto the trial time grid using `scipy.interpolate.interp1d` with linear interpolation. Finally, it is discretized into 3 bins using GLOBAL tertile edges computed across ALL sessions.
 
 ii.
 ```python
-pos_interp, ts_interp = interpolate_position(ts, pos, freq=1000)
-vel, _ = velocity_filtered(pos_interp, 1000)
-return ts_interp, np.abs(vel)
-...
-interp = interp1d(ts, vals, kind="linear", fill_value="extrapolate")
-outputs.append(interp(align_time + x_rel).astype(np.float32))
+# Global tertile computation:
+wheel_edges = compute_tertile_edges(
+    trial_values for session in processed for trial_values in session.wheel_cont
+)
+
+def compute_tertile_edges(values):
+    concat = np.concatenate(flat_values)
+    q1, q2 = np.quantile(concat, [1 / 3, 2 / 3])
+    return float(q1), float(q2)
+
+def discretize_three_bins(values, edges):
+    return np.digitize(values, bins=np.array(edges), right=False)
 ```
 
-iii. The wheel processing follows the reference code's `SessionLoader` logic via the same underlying functions.
+iii. The AI chose global tertiles for discretization rather than per-session percentiles.
 
 ## 7-c. How is `output` *Wheel speed* thresholded into categories?
 
-i. The AI uses **global tertiles** across all sessions: it collects all continuous wheel speed values from all sessions, computes the 1/3 and 2/3 quantiles, then discretizes all values using those two edges. This differs from the reference which uses per-session percentiles.
+i. The wheel speed is discretized into 3 bins (low/medium/high) using dataset-wide tertile edges. The edges are the 33rd and 67th percentiles computed across ALL valid wheel speed values from ALL sessions.
 
 ii.
 ```python
 wheel_edges = compute_tertile_edges(
     trial_values for session in processed for trial_values in session.wheel_cont
 )
-
-def compute_tertile_edges(values: Iterable[np.ndarray]) -> tuple[float, float]:
-    ...
-    concat = np.concatenate(flat_values)
-    q1, q2 = np.quantile(concat, [1 / 3, 2 / 3])
-    ...
-
-def discretize_three_bins(values: np.ndarray, edges: tuple[float, float]) -> np.ndarray:
-    return np.digitize(values, bins=np.array(edges, dtype=np.float32), right=False).astype(np.int16)
+discretize_three_bins(wheel_cont, wheel_edges)
 ```
 
-iii. CONVERSION_NOTES.md: "Discretize wheel speed and whisker motion energy using global tertiles: Global edges preserve a common categorical meaning across sessions."
+iii. The AI documented in CONVERSION_NOTES.md Step 5 decision 7: "Discretize wheel speed and whisker motion energy using global tertiles."
 
 ## 7-d. How is `output` *Wheel speed* aligned with the neural data?
 
-i. The wheel speed is interpolated onto the same time grid as the behavior: `np.linspace(-0.48, 1.5, 100)`, which are right bin edges relative to stimulus onset. This is the same grid used for the time input.
+i. The wheel speed trace is interpolated onto the same time grid as the behavior data using `interp1d`. The interpolation grid uses right bin edges: `np.linspace(window[0] + binsize, window[1], n_bins)`.
 
 ii.
 ```python
-x_rel = np.linspace(window[0] + binsize, window[1], n_bins)
-interp = interp1d(ts, vals, kind="linear", fill_value="extrapolate")
-outputs.append(interp(align_time + x_rel).astype(np.float32))
+def interpolate_behavior_trials(...):
+    x_rel = np.linspace(window[0] + binsize, window[1], n_bins)
+    interp = interp1d(ts, vals, kind="linear", fill_value="extrapolate")
+    outputs.append(interp(align_time + x_rel).astype(np.float32))
 ```
 
-iii. Aligned to the same stimulus onset event and time grid as all other variables.
+iii. Uses the same time grid as the time input, ensuring consistency between behavior outputs and the time input.
 
 ## 8-a. What variables in the raw data is `output` *Whisker motion energy* derived from?
 
-i. From `{left,right}Camera.ROIMotionEnergy.npy` and `_ibl_{left,right}Camera.times.npy`. Left camera is preferred, with right as fallback.
+i. From `leftCamera.ROIMotionEnergy.npy` (preferred) or `rightCamera.ROIMotionEnergy.npy` (fallback), with corresponding camera times files.
 
 ii.
 ```python
-def load_whisker_motion_energy(session_path: Path) -> tuple[np.ndarray, np.ndarray, str]:
+def load_whisker_motion_energy(session_path: Path):
     for camera in ("left", "right"):
         me_file = pick_one_file(session_path / "alf", f"{camera}Camera.ROIMotionEnergy.npy")
         times_file = pick_one_file(session_path / "alf", f"*{camera}Camera.times.npy")
-        ...
-        return times, values, camera
 ```
 
-iii. Left-then-right fallback matches the reference code.
+iii. Left camera preferred, right as fallback, matching the reference code.
 
 ## 8-b. What processing is involved in computing `output` *Whisker motion energy*?
 
-i. The raw motion energy values are loaded as-is (no filtering or normalization). They are interpolated onto the trial time grid using `scipy.interpolate.interp1d`. Then discretized into 3 bins using global tertiles.
+i. The raw motion energy trace is loaded directly (no additional filtering). It is interpolated onto the trial time grid using `interp1d` with linear interpolation. Then it is discretized into 3 bins using GLOBAL tertile edges across all sessions.
 
 ii.
 ```python
 whisk_trials, whisk_mask = interpolate_behavior_trials(whisk_times, whisk_values, align_times)
-```
 
-iii. No additional processing beyond interpolation and discretization.
-
-## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
-
-i. Same as wheel speed: global tertiles across all sessions, using the 1/3 and 2/3 quantiles of all whisker motion energy values.
-
-ii.
-```python
 whisker_edges = compute_tertile_edges(
     trial_values for session in processed for trial_values in session.whisker_cont
 )
+discretize_three_bins(whisk_cont, whisker_edges)
 ```
 
-iii. CONVERSION_NOTES.md: "Bins will be dataset-wide tertiles over valid aligned samples."
+iii. Same approach as wheel speed.
+
+## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
+
+i. Same as wheel speed: dataset-wide tertile edges at the 33rd and 67th percentiles across all sessions.
+
+ii. Same as 7-c, but with `whisker_edges`.
+
+iii. Uses global tertiles for consistency across sessions.
 
 ## 8-d. How is `output` *Whisker motion energy* aligned with the neural data?
 
-i. Same as wheel speed: interpolated onto `np.linspace(-0.48, 1.5, 100)` relative to stimulus onset.
+i. Same interpolation approach as wheel speed: `interp1d` onto the right-edge time grid.
 
-ii.
-```python
-interp = interp1d(ts, vals, kind="linear", fill_value="extrapolate")
-outputs.append(interp(align_time + x_rel).astype(np.float32))
-```
+ii. Same as 7-d, but using whisker times and values.
 
-iii. Aligned to stimulus onset, same grid as all other variables.
+iii. Same alignment strategy as all behavior data.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Multiple layers: (1) Sessions missing required files (wheel, whisker, spikes) are skipped. (2) Trials with NaN in required columns are excluded. (3) Trials where behavior doesn't cover the full window are excluded. (4) Trials with all-zero neural activity are excluded. (5) Sessions with fewer than 2 surviving trials are skipped. (6) When whisker times and values have mismatched lengths, the shorter length is used.
+i. Several levels of handling: (1) Sessions missing required files (wheel, whisker, spikes) are skipped. (2) If whisker motion energy array length doesn't match camera times, both are truncated to the shorter length. (3) Trials with missing required event columns are excluded by the trial mask. (4) Trials where behavior data doesn't cover the window are excluded. (5) Trials with all-zero neural activity are excluded. (6) Sessions with fewer than 2 surviving trials are skipped.
 
 ii.
 ```python
+# Length mismatch handling:
 if len(values) != len(times):
     n = min(len(values), len(times))
     values = values[:n]
     times = times[:n]
-...
+
+# All-zero neural filter:
 neural_mask = np.array([np.any(trial) for trial in neural_trials], dtype=bool)
-combined_mask = wheel_mask & whisk_mask & neural_mask
+
+# Session skip:
 if combined_mask.sum() < 2:
     print(f"[skip] {spec.eid}: fewer than 2 trials after behavior/neural alignment")
     return None
 ```
 
-iii. CONVERSION_NOTES.md documents the all-zero neural trial filter as added after Step 10 review.
+iii. The AI documented these handling strategies across Steps 9 and 10 of CONVERSION_NOTES.md.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. Loading spike sorting data from disk (memory-mapped reads of large spike arrays) and binning spikes into trial-aligned bins. The CONVERSION_NOTES.md reports ~13.1 s mean per session.
+i. The AI identified spike loading and binning as the main bottleneck. Spike arrays are memory-mapped (`mmap_mode="r"`) to avoid full array loads. The AI also mentions that threaded parallelism was added to reduce wall time.
 
 ii.
 ```python
@@ -461,29 +466,37 @@ spikes_times = np.load(spikes_times_file, mmap_mode="r")
 spikes_clusters = np.load(spikes_clusters_file, mmap_mode="r")
 ```
 
-iii. CONVERSION_NOTES.md: "Trial-by-trial spike binning is the main hot path."
+iii. CONVERSION_NOTES.md Step 6 documents spike array loading as the hot path.
 
 ## 10-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The spike binning loop iterates per trial, calling `bincount2D` for each trial individually. The behavior interpolation loop also iterates per trial, creating a separate `interp1d` object for each trial.
+i. The `compute_trial_number_in_block` function uses a Python for-loop over all trials. The `interpolate_behavior_trials` function loops per trial to interpolate behavior. The `bin_spikes_for_trials` function loops per trial to bin spikes.
 
 ii.
 ```python
-for idx0, idx1, (start, end) in zip(idx_starts, idx_ends, intervals):
-    trial_counts = np.zeros((n_clusters, n_bins), dtype=np.float16)
-    ...
+# Trial number in block loop:
+for i in range(1, len(prob_left)):
+    if prob_left[i] == prob_left[i - 1]:
+        count += 1
+    else:
+        count = 1
+    counters[i] = count
 
+# Behavior interpolation loop:
 for i, align_time in enumerate(align_times):
-    ...
     interp = interp1d(ts, vals, kind="linear", fill_value="extrapolate")
     outputs.append(interp(align_time + x_rel).astype(np.float32))
+
+# Spike binning loop:
+for idx0, idx1, (start, end) in zip(idx_starts, idx_ends, intervals):
+    counts, _, cluster_idx = bincount2D(...)
 ```
 
-iii. Both loops could potentially be vectorized, though the per-trial slicing makes this nontrivial.
+iii. The AI addressed this partially through `bincount2D` for spike binning but retained per-trial loops for interpolation and spike binning.
 
 ## 10-c. What processing does the code repeat multiple times?
 
-i. A `BrainRegions()` object is created once per session in the threaded worker (`process_session_worker`), which is redundant. The behavior interpolation function creates a new `interp1d` object per trial rather than reusing a single interpolator.
+i. The `BrainRegions()` object is created once per worker call (`process_session_worker` creates a new `BrainRegions()` for every session). This involves loading atlas data from disk each time.
 
 ii.
 ```python
@@ -491,16 +504,20 @@ def process_session_worker(spec: SessionSpec) -> ProcessedSession | None:
     return process_session(spec, BrainRegions())
 ```
 
-iii. Not explicitly documented as a concern.
+iii. Not explicitly documented by the AI.
 
 ## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The code stores continuous wheel and whisker values (`wheel_cont`, `whisker_cont`) in `ProcessedSession` and only discretizes them later in `build_data_dict`. This means the continuous values are held in memory across all sessions before being discretized. The code also computes `n_clusters_total` (total clusters before QC) which is only used for logging.
+i. The AI creates a new `interp1d` interpolator object per trial for behavior data, which is somewhat wasteful. The AI also stores continuous wheel and whisker data separately before discretizing them in the final assembly step, meaning the continuous data is held in memory across all sessions before discretization.
 
 ii.
 ```python
+# Stores continuous data per session:
 wheel_cont=[np.asarray(x, dtype=np.float32) for x in wheel_keep],
 whisker_cont=[np.asarray(x, dtype=np.float32) for x in whisk_keep],
+
+# Then discretizes later in build_data_dict:
+discretize_three_bins(wheel_cont, wheel_edges)
 ```
 
-iii. The continuous values are needed temporarily for computing global tertile edges, but they consume memory across all sessions.
+iii. This is a consequence of computing global tertile edges, which requires seeing all data before discretizing.

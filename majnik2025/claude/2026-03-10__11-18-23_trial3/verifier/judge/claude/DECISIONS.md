@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI discovers subjects as directories starting with `jm` in the data directory, then iterates over sorted subdirectories within each subject folder as sessions. For each session, it loads `F.npy` and `Fneu.npy` from `suite2p/plane0/` for neural data, and `motion_energy_glob.npy` from `move_deve/` for behavioral data. All sessions are processed in a single loop, and data is accumulated into lists before assembling the final dictionary.
+i. The AI discovers subjects by listing directories starting with `jm` in the data directory, then lists subdirectories within each subject folder as sessions. For each session, it loads `F.npy` and `Fneu.npy` from `suite2p/plane0/` for neural data, and `motion_energy_glob.npy` from `move_deve/` for behavioral data. All subjects and sessions are processed in a single pass.
 
 ii.
 ```python
@@ -17,17 +17,17 @@ def get_subjects_and_sessions():
         all_sessions[subj] = sessions
     return subjects, all_sessions
 
-# In process_session:
+# Per session:
 F = np.load(os.path.join(sess_dir, 'suite2p', 'plane0', 'F.npy'))
 Fneu = np.load(os.path.join(sess_dir, 'suite2p', 'plane0', 'Fneu.npy'))
 me_raw = np.load(os.path.join(sess_dir, 'move_deve', 'motion_energy_glob.npy'))
 ```
 
-iii. The AI identified the standard suite2p directory structure and the motion energy file location. The approach of scanning for `jm*` directories matches the data organization. The AI documented this in CONVERSION_NOTES.md Steps 0-2.
+iii. The AI follows the standard suite2p directory structure and the data organization documented in the data README. All `jm*` directories are treated as subjects. The AI correctly identifies that each session directory contains suite2p outputs and motion energy files.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are identified as sorted directories starting with `jm` in the data directory. However, the AI maps these to paper names ("Mouse_A" through "Mouse_F") using a hardcoded `SUBJECT_MAP` dictionary, and stores these mapped names in the `subjects` field rather than the raw folder names.
+i. Subjects are identified as sorted directories starting with `jm` in the data directory. The AI additionally maps folder names to paper names (e.g., `jm031` -> `Mouse_A`) via a hardcoded `SUBJECT_MAP` dictionary and uses the paper names in the final data structure.
 
 ii.
 ```python
@@ -36,14 +36,17 @@ SUBJECT_MAP = {
     'jm039': 'Mouse_D', 'jm040': 'Mouse_E', 'jm046': 'Mouse_F'
 }
 
-subject_names = list(SUBJECT_MAP.values()) if not sample_mode else [SUBJECT_MAP[subjects_to_process[0]]]
+subjects = sorted([d for d in os.listdir(DATA_DIR)
+                   if os.path.isdir(os.path.join(DATA_DIR, d)) and d.startswith('jm')])
+
+subject_names = list(SUBJECT_MAP.values())  # ['Mouse_A', 'Mouse_B', ...]
 ```
 
-iii. The AI created this mapping based on the paper's naming conventions. CONVERSION_NOTES.md Step 2 lists the correspondence between jm identifiers and Mouse labels.
+iii. The AI noted the correspondence between folder names and paper names and chose to use the paper names for clarity in the output. The reference uses the raw folder names (`jm031`, etc.).
 
 ## 1-c. How are the data split into sessions?
 
-i. Sessions are sorted subdirectories within each subject folder. Each subdirectory contains one daily recording and becomes one session in the output data structure.
+i. Each subdirectory within a subject's folder is treated as a separate session, sorted alphabetically (which corresponds to chronological order since directories are date-named). All sessions for all subjects are included.
 
 ii.
 ```python
@@ -51,11 +54,11 @@ sessions = sorted([d for d in os.listdir(subj_dir)
                   if os.path.isdir(os.path.join(subj_dir, d))])
 ```
 
-iii. The AI correctly identified each subdirectory as a daily recording session. This matches the data organization described in the paper and data README.
+iii. This matches the data organization where each dated subdirectory contains one day's recording.
 
 ## 1-d. How are the data split into trials?
 
-i. The AI splits the continuous recording into **2-minute (120-second) non-overlapping trials**. After 10-frame binning, this yields 360 bins per trial. Any remaining bins that don't fill a complete trial are discarded.
+i. The AI splits each continuous recording into non-overlapping **2-minute (120-second)** trials of 360 bins each (120s * 30Hz / 10 frames/bin). Remainder bins that don't fill a complete trial are discarded. The instructions explicitly state "Split sessions into 60-second trials", but the AI chose 120-second trials based on the paper's mention of "consecutive 2 minute blocks" for cross-validation.
 
 ii.
 ```python
@@ -63,27 +66,25 @@ TRIAL_DURATION_SEC = 120   # 2 minutes (paper: "consecutive 2 minute blocks")
 TRIAL_BINS = int(TRIAL_DURATION_SEC * FRAME_RATE / BIN_SIZE)  # 360 bins per trial
 
 # In process_session:
-n_total_bins = dfof_binned.shape[1]
 n_trials = n_total_bins // TRIAL_BINS
-
 for t in range(n_trials):
     start = t * TRIAL_BINS
     end = (t + 1) * TRIAL_BINS
 ```
 
-iii. The AI chose 2-minute trials based on the paper's cross-validation structure, which uses "consecutive 2 minute blocks of the recording". CONVERSION_NOTES.md Step 5 documents this decision: "Split continuous recording into 2-minute blocks (matching paper's CV structure)".
+iii. The AI justified the 2-minute trial duration by citing the paper's cross-validation structure which uses "consecutive 2 minute blocks". However, the task instructions explicitly say "Split sessions into 60-second trials." The reference uses 60-second trials (180 bins per trial).
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. No trial filtering is applied. All complete trials (full 2-minute blocks) are included.
+i. No trial filtering is applied. All complete trials (that fill a full trial duration) are included. Partial trials at the end of sessions are discarded.
 
-ii. N/A (no filtering code)
+ii. No filtering code; only the trial-splitting loop with integer division implicitly discards remainders.
 
-iii. The AI noted in CONVERSION_NOTES.md Step 3 that there is "No explicit trial curation (continuous spontaneous recording)".
+iii. The continuous spontaneous recording has no natural trial structure, so there are no quality-based reasons to exclude trials. This matches the reference approach.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data is derived from `F.npy` (raw fluorescence) and `Fneu.npy` (neuropil fluorescence) from `suite2p/plane0/` in each session directory.
+i. Neural data is derived from `F.npy` (raw fluorescence) and `Fneu.npy` (neuropil fluorescence) from `suite2p/plane0/` for each session.
 
 ii.
 ```python
@@ -91,16 +92,16 @@ F = np.load(os.path.join(sess_dir, 'suite2p', 'plane0', 'F.npy'))
 Fneu = np.load(os.path.join(sess_dir, 'suite2p', 'plane0', 'Fneu.npy'))
 ```
 
-iii. These are the standard suite2p output files. The AI documented this in CONVERSION_NOTES.md Step 1.
+iii. These are the standard suite2p output files. This matches the reference approach.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI applies three processing steps: (1) neuropil subtraction with coefficient 0.7 (`Fc = F - 0.7 * Fneu`), (2) baseline correction using suite2p's `preprocess` function with the `maximin` method, and (3) **temporal binning by averaging 10 consecutive frames** (~333 ms bins).
+i. The AI applies neuropil subtraction (`Fc = F - 0.7 * Fneu`), then uses suite2p's `preprocess` function with the `maximin` baseline method. The result is then binned by averaging 10 consecutive frames.
 
 ii.
 ```python
 def compute_dfof(F, Fneu, fs=FRAME_RATE):
-    Fc = F - NEUROPIL_COEFF * Fneu
+    Fc = F - NEUROPIL_COEFF * Fneu  # NEUROPIL_COEFF = 0.7
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dfof = s2p_preprocess(
         Fc.copy().astype(np.float32), BASELINE_METHOD, WIN_BASELINE,
@@ -108,8 +109,41 @@ def compute_dfof(F, Fneu, fs=FRAME_RATE):
     )
     return dfof.astype(np.float32)
 
-# Temporal binning:
+# Then binned:
 dfof_binned = bin_timeseries(dfof, BIN_SIZE)  # BIN_SIZE = 10
+```
+
+iii. The AI correctly follows the paper's method: "baseline corrected fluorescence traces as our dF/F (using the default Suite2p parameters)." The preprocessing parameters (win_baseline=60s, sig_baseline=10, prctile_baseline=8, baseline='maximin') match the ops.npy defaults and the reference code. One minor difference: the AI passes `Fc.copy().astype(np.float32)` while the reference passes `Fc` directly (the reference does not explicitly copy or cast to float32 before calling preprocess).
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. No additional neuron filtering is applied. All neurons in `F.npy` are included. The AI notes that iscell values are all 1.0 (pre-filtered by Track2p), so no filtering is needed.
+
+ii. No filtering code is present.
+
+iii. The AI correctly identifies that the data is already filtered through Track2p matching. This matches the reference approach, which also does not filter neurons.
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Trials are aligned to session start. Since there is no stimulus event, trials are contiguous segments starting from the beginning of the continuous recording.
+
+ii.
+```python
+'temporal_alignment_event': 'start of continuous recording session',
+'off_start': 0.0,
+'off_end': None,
+```
+
+iii. There is no stimulus or event to align to. The recording is continuous spontaneous activity. This matches the reference approach (which uses `temporal_alignment_event: 'session_start'` and `off_start: None`).
+
+## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+
+i. Both neural and motion energy traces are averaged into non-overlapping bins of 10 consecutive frames, converting from 30 Hz to 3 Hz (333.33 ms time bins). This rebinning is applied before discretization of motion energy.
+
+ii.
+```python
+BIN_SIZE = 10  # frames per bin
+TIME_BIN_MS = BIN_SIZE / FRAME_RATE * 1000  # ~333.33 ms
 
 def bin_timeseries(data, bin_size):
     n_frames = data.shape[-1]
@@ -119,47 +153,11 @@ def bin_timeseries(data, bin_size):
     return truncated.reshape(new_shape).mean(axis=-1)
 ```
 
-iii. CONVERSION_NOTES.md Step 3 states: "Temporal binning: Average dF/F and behavior in bins of 10 consecutive timestamps for decoding", citing the paper's description. CONVERSION_NOTES.md Step 5 confirms: "Binning = 10 frames: Matches paper's decoding preprocessing".
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. No additional neural filtering is applied. The AI notes that the data is already pre-filtered through Track2p matching (all `iscell` values are 1).
-
-ii. N/A (no filtering code)
-
-iii. CONVERSION_NOTES.md Step 1: "All iscell values are 1 (pre-filtered through Track2p matching)." Step 4: "Data is pre-filtered (Track2p output in suite2p format). No additional filtering needed."
-
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
-
-i. Trials are aligned to the start of the continuous recording session. Since there are no stimulus events, no event-based alignment is applied. The neural data is simply split into contiguous blocks.
-
-ii.
-```python
-'temporal_alignment_event': 'start of continuous recording session',
-'off_start': 0.0,
-'off_end': None,
-```
-
-iii. CONVERSION_NOTES.md Step 5: "No discrete trials in the original experiment (continuous spontaneous recording)."
-
-## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. The AI applies temporal rebinning by averaging 10 consecutive frames, resulting in a time bin size of ~333.33 ms (10 frames / 30 Hz). The final `time_bin_size` in metadata is set to 333.33 ms.
-
-ii.
-```python
-BIN_SIZE = 10              # frames per bin
-TIME_BIN_MS = BIN_SIZE / FRAME_RATE * 1000  # ~333.33 ms
-
-dfof_binned = bin_timeseries(dfof, BIN_SIZE)
-me_binned = bin_timeseries(me.reshape(1, -1), BIN_SIZE).squeeze()
-```
-
-iii. CONVERSION_NOTES.md Step 3: "Decoding bin size: 10 frames = 333ms" citing the paper's statement about "averaging in bins of 10 consecutive timestamps".
+iii. The paper states "for all decoding analysis we slightly denoised the dF/F as well as the behaviour traces by averaging in bins of 10 consecutive timestamps." This matches the reference approach exactly.
 
 ## 3-a. What variables in the raw data is `input` *Time from start of experiment* derived from?
 
-i. Time is not derived from any raw data variable. It is computed from the bin index multiplied by the bin duration.
+i. Time is computed from the bin indices and bin duration, not from any raw data variable. It represents seconds elapsed from the start of the recording session.
 
 ii.
 ```python
@@ -167,35 +165,34 @@ time_sec = np.arange(start, end) * (BIN_SIZE / FRAME_RATE)
 input_trials.append(time_sec.reshape(1, -1).astype(np.float32))
 ```
 
-iii. Since the frame rate is constant and there are no explicit timestamps in the data, computing time from indices is equivalent.
+iii. Since the frame rate is constant at 30 Hz and bins are 10 frames each, computing time from bin indices is equivalent to using timestamps.
 
 ## 3-b. What processing is involved in computing `input` *Time from start of experiment*?
 
-i. Time is computed as `bin_index * (10 / 30)` seconds for each bin within a trial. The bin index is absolute within the session (not reset per trial), so time is cumulative from session start.
+i. Each bin index is multiplied by the bin duration (10/30 = 1/3 second) to get time in seconds from session start. The time is computed per trial but runs continuously across trials within a session (i.e., trial 2 starts at 120s for 2-minute trials, not at 0s).
 
 ii.
 ```python
 time_sec = np.arange(start, end) * (BIN_SIZE / FRAME_RATE)
-# start and end are absolute bin indices within the session
+# For trial 0: start=0, end=360 -> time from 0.0 to 119.67s
+# For trial 1: start=360, end=720 -> time from 120.0 to 239.67s
 ```
 
-iii. No special processing beyond multiplication by the bin duration.
+iii. The time input is straightforward arithmetic. The reference uses the same approach but with 60-second trial boundaries.
 
 ## 3-c. How is the `input` *Time from start of experiment* aligned with the neural data?
 
-i. The time input is computed from the same bin indices used to slice the neural data, so it is inherently aligned.
+i. The time input is derived from the same bin indices used for neural data, so they are inherently aligned. Each time bin corresponds exactly to the same temporal bin of neural activity.
 
 ii.
 ```python
-for t in range(n_trials):
-    start = t * TRIAL_BINS
-    end = (t + 1) * TRIAL_BINS
-    neural_trials.append(dfof_binned[:, start:end].astype(np.float32))
-    time_sec = np.arange(start, end) * (BIN_SIZE / FRAME_RATE)
-    input_trials.append(time_sec.reshape(1, -1).astype(np.float32))
+# Same start/end indices used for both:
+neural_trials.append(dfof_binned[:, start:end].astype(np.float32))
+time_sec = np.arange(start, end) * (BIN_SIZE / FRAME_RATE)
+input_trials.append(time_sec.reshape(1, -1).astype(np.float32))
 ```
 
-iii. Using the same indices ensures perfect alignment.
+iii. Since both are derived from the same binning structure, alignment is guaranteed.
 
 ## 4-a. What variables in the raw data is `output` *Motion energy* derived from?
 
@@ -206,15 +203,15 @@ ii.
 me_raw = np.load(os.path.join(sess_dir, 'move_deve', 'motion_energy_glob.npy'))
 ```
 
-iii. This is the pre-computed global motion energy signal from behavioral video. The AI does NOT load or use `interframe_int.npy` for dropped frame detection (unlike the reference).
+iii. This is the pre-computed global motion energy signal from the behavioral video. The reference also loads interframe interval data (`interframe_int.npy`) for dropped frame detection, while the AI uses `np.interp` instead.
 
 ## 4-b. What processing is involved in computing `output` *Motion energy*?
 
-i. Three processing steps: (1) linear interpolation to match neural frame count when lengths differ, (2) temporal binning by averaging 10 consecutive frames, (3) discretization into 5 equal-percentile bins **per session**.
+i. Three processing steps: (1) interpolation of motion energy to match neural frame count (using `np.interp` linear interpolation), (2) temporal binning by averaging 10 consecutive frames, (3) discretization into 5 equal-percentile bins computed per session.
 
 ii.
 ```python
-# Interpolation:
+# Step 1: Interpolation
 def interpolate_motion_energy(me, n_frames):
     if len(me) == n_frames:
         return me.astype(np.float64)
@@ -223,10 +220,10 @@ def interpolate_motion_energy(me, n_frames):
     me_interp = np.interp(x_new, x_orig, me.astype(np.float64))
     return me_interp
 
-# Binning:
+# Step 2: Binning
 me_binned = bin_timeseries(me.reshape(1, -1), BIN_SIZE).squeeze()
 
-# Discretization (per session):
+# Step 3: Discretization
 def discretize_motion_energy(me_binned, n_bins=N_OUTPUT_BINS):
     percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]
     thresholds = np.percentile(me_binned, percentiles)
@@ -234,41 +231,24 @@ def discretize_motion_energy(me_binned, n_bins=N_OUTPUT_BINS):
     return labels
 ```
 
-iii. CONVERSION_NOTES.md Step 5: "Normalize motion energy per session" and "Discretize motion energy into 5 equal-percentile bins (per session)". The AI does NOT apply std normalization before discretization.
+iii. The AI correctly bins and discretizes motion energy per session into 5 quintile bins. The interpolation method differs from the reference (see 4-d).
 
 ## 4-c. How is `output` *Motion energy* thresholded into categories?
 
-i. Motion energy is discretized into 5 equal-percentile (quintile) bins **per session** using `np.digitize`. The percentile boundaries are [20, 40, 60, 80].
+i. Motion energy is discretized into 5 equal-percentile (quintile) bins per session. Percentile boundaries at [20, 40, 60, 80] are computed, and `np.digitize` assigns each value to bins 0-4.
 
 ii.
 ```python
-def discretize_motion_energy(me_binned, n_bins=N_OUTPUT_BINS):
-    percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]  # [20, 40, 60, 80]
-    thresholds = np.percentile(me_binned, percentiles)
-    labels = np.digitize(me_binned, thresholds).astype(np.int64)
-    return labels
+percentiles = np.linspace(0, 100, n_bins + 1)[1:-1]  # [20, 40, 60, 80]
+thresholds = np.percentile(me_binned, percentiles)
+labels = np.digitize(me_binned, thresholds).astype(np.int64)
 ```
 
-iii. The AI chose per-session discretization. This yields exactly 20% per bin within each session.
+iii. The instructions specify "five equal-percentile bins, selected per session." The AI follows this correctly. The reference uses a slightly different approach: `np.linspace(0, 100, n_levels + 1)` to get `[0, 20, 40, 60, 80, 100]`, then uses `np.digitize(me, bin_edges[1:-1])` which is functionally equivalent.
 
 ## 4-d. How is `output` *Motion energy* aligned with the neural data?
 
-i. When the motion energy array is shorter than the neural data, the AI uses `np.interp` for linear interpolation to match the neural frame count. After interpolation and binning, the same bin indices are used to slice both neural and motion energy data.
-
-ii.
-```python
-me = interpolate_motion_energy(me_raw, n_frames)
-# ...
-me_binned = bin_timeseries(me.reshape(1, -1), BIN_SIZE).squeeze()
-# ...
-output_trials.append(me_discrete[start:end].reshape(1, -1))
-```
-
-iii. The AI uses generic linear interpolation rather than the reference approach of detecting specific dropped frames via `interframe_int.npy`.
-
-## 5. How are minor mistakes in the data, e.g. missing data, handled?
-
-i. Missing camera frames (motion energy shorter than neural data) are handled by linear interpolation via `np.interp`. Remainder bins that don't fill a complete trial are discarded. No other error handling is present.
+i. When the motion energy array is shorter than the neural data (due to dropped camera frames), the AI uses `np.interp` for global linear interpolation to stretch the motion energy signal to match the neural frame count. The reference instead uses `interframe_int.npy` to identify specific dropped frames and inserts interpolated values at those positions.
 
 ii.
 ```python
@@ -281,25 +261,34 @@ def interpolate_motion_energy(me, n_frames):
     return me_interp
 ```
 
-iii. The AI noted in CONVERSION_NOTES.md Step 2 that some sessions have fewer motion energy frames, and Step 4 resolved this with interpolation.
+iii. The AI's approach is a simpler global interpolation that doesn't use the interframe interval data to identify where frames were dropped. The reference uses `interframe_int.npy` to detect specific dropped frames (`dt * 1000 > 0.04`) and inserts interpolated values at those positions. Both approaches produce similar results when only a few frames are missing, but the reference approach is more precise in placing interpolated values at the correct temporal positions.
 
-## 6-a. What are the most time-consuming steps of the code?
+## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The most time-consuming step is `s2p_preprocess` (suite2p baseline correction), which performs sliding window operations across all neurons. This is GPU-accelerated when available.
+i. Missing camera frames (motion energy shorter than neural data) are handled by linear interpolation to match lengths. Remainder frames at the end of sessions that don't fill a complete trial are discarded. No NaN/Inf checking is performed in the code.
 
 ii.
 ```python
-dfof = s2p_preprocess(
-    Fc.copy().astype(np.float32), BASELINE_METHOD, WIN_BASELINE,
-    SIG_BASELINE, fs, PRCTILE_BASELINE, device=device
-)
+# Interpolation for missing frames:
+me_interp = np.interp(x_new, x_orig, me.astype(np.float64))
+
+# Discarding remainders (implicit via integer division):
+n_trials = n_total_bins // TRIAL_BINS
 ```
 
-iii. CONVERSION_NOTES.md Step 7 shows ~0.5-1.0s per session, with total ~25s for 41 sessions. The baseline correction dominates.
+iii. The interpolation ensures motion energy and neural data have matching lengths. Discarding remainder frames is a minor data loss (at most one trial duration minus one bin per session).
+
+## 6-a. What are the most time-consuming steps of the code?
+
+i. The most time-consuming step is the suite2p `preprocess` baseline correction (`s2p_preprocess`), which runs the `maximin` baseline estimation for every neuron across the full session length. The AI reports ~0.5-0.7s per session, with the full conversion completing in ~25s.
+
+ii. N/A (timing is reported via `time.time()` calls around session processing)
+
+iii. The baseline correction involves sliding window operations over the full session for every neuron. GPU acceleration is used when available.
 
 ## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The trial splitting loop iterates over trials one at a time, but each iteration is just an array slice, so the overhead is minimal. No significant vectorization opportunities exist in the AI's code since the binning is already vectorized.
+i. The trial-splitting loop iterates over trials to slice arrays, which could be done with a single reshape operation. However, since the number of trials is small, this has negligible performance impact.
 
 ii.
 ```python
@@ -307,26 +296,23 @@ for t in range(n_trials):
     start = t * TRIAL_BINS
     end = (t + 1) * TRIAL_BINS
     neural_trials.append(dfof_binned[:, start:end].astype(np.float32))
+    ...
 ```
 
-iii. The AI's code is reasonably efficient; the main loop is I/O bound.
+iii. The loop-based approach is clear and the overhead is minimal since the number of trials per session is small (10-15).
 
 ## 6-c. What processing does the code repeat multiple times?
 
-i. The code does not appear to repeat any processing multiple times. Each session is processed once.
+i. No significant redundant processing is identified. Each session is processed once in a single pass.
 
 ii. N/A
 
-iii. N/A
+iii. The code processes each session sequentially without repeating operations.
 
 ## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The AI applies temporal binning (averaging 10 frames), which is an additional processing step. Additionally, the per-session motion energy discretization computes quintiles that may not align with the global distribution.
+i. No significant unnecessary processing is identified. The code computes only what is needed for the final output.
 
-ii.
-```python
-dfof_binned = bin_timeseries(dfof, BIN_SIZE)
-me_binned = bin_timeseries(me.reshape(1, -1), BIN_SIZE).squeeze()
-```
+ii. N/A
 
-iii. The binning reduces temporal resolution from 30 Hz to 3 Hz. Whether this is "unnecessary" depends on the decoder architecture, but the reference solution does not bin.
+iii. The processing pipeline is straightforward and minimal.

@@ -2,7 +2,7 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads data by reading NWB files directly from disk using `BehaviorOphysExperiment.from_nwb_path()`. It first reads the experiment metadata CSV to get a list of all experiment IDs, filters to active behavior experiments (and excludes Multiscope/MESO.1 sessions), then loads each NWB file individually. This contrasts with the reference, which uses the Allen SDK's `VisualBehaviorOphysProjectCache.from_s3_cache()` to load experiments via `get_behavior_ophys_experiment()`.
+i. The AI loads data by listing NWB files in the data directory, reading the experiment table CSV, filtering to `active_behavior` experiments, and excluding Multiscope (`MESO.1`) sessions. Each experiment is loaded individually via `BehaviorOphysExperiment.from_nwb_path()`. This differs from the reference, which uses `VisualBehaviorOphysProjectCache.from_s3_cache()` and filters by `project_code == 'VisualBehavior'`.
 
 ii.
 ```python
@@ -20,11 +20,11 @@ def load_experiment(exp_id):
     return BehaviorOphysExperiment.from_nwb_path(nwb_path)
 ```
 
-iii. The AI justified loading from NWB files directly rather than the SDK cache. It filtered to `behavior_type == 'active_behavior'` and excluded MESO.1 (Multiscope) sessions because they have a different frame rate (11 Hz vs 31 Hz), which violates the requirement that time bins be consistent across sessions.
+iii. The AI chose to load NWB files directly rather than using the SDK cache, and explicitly excluded MESO.1 equipment for consistent frame rates. The CONVERSION_NOTES.md states: "Exclude Multiscope (11 Hz) sessions - different frame rate than Scientifica (31 Hz). The format requires consistent time bins across all sessions."
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are identified from the metadata of each loaded experiment using `meta['mouse_id']`. Each unique mouse_id is assigned an index.
+i. Subjects are identified by `mouse_id` from the experiment metadata. Each unique mouse_id is assigned an index.
 
 ii.
 ```python
@@ -34,42 +34,39 @@ if mouse_id not in subject_set:
 all_subject_idx.append(subject_set[mouse_id])
 ```
 
-iii. The AI uses the mouse_id from each experiment's metadata to track subjects, which is equivalent to the reference's approach of using `mouse_id` from the experiment table.
+iii. The AI used the metadata's `mouse_id` field to identify unique subjects, same as the reference.
 
 ## 1-c. How are the data split into sessions?
 
-i. The AI treats each ophys experiment (one imaging plane) as a separate session. This differs from the reference, which groups experiments by `ophys_session_id` (combining multiple imaging planes from the same behavioral session into one session, merging neurons across planes).
+i. The AI treats each individual experiment (imaging plane) as a separate session. This differs from the reference, which groups experiments by `ophys_session_id` and merges neurons from multiple imaging planes within a session.
 
 ii.
 ```python
 for i, exp_id in enumerate(exp_ids):
-    # Each experiment is treated as its own session
-    dataset = load_experiment(exp_id)
+    # ...
     session_data = extract_session_data(dataset, temp_image_to_idx)
     # ...
+    neural_trials, output_trials = segment_trials(session_data, running_edges, pupil_edges)
     all_neural.append(neural_trials)
 ```
 
-iii. The AI's CONVERSION_NOTES state: "Each experiment = one session: Each imaging plane treated as independent session." Since the filtered data (Scientifica only) predominantly has 1 experiment per session, this results in a similar but not identical split. Multi-plane Scientifica sessions would be split into multiple sessions rather than merged.
+iii. The CONVERSION_NOTES.md states: "Each experiment = one session: Each imaging plane treated as independent session." This is because the AI loaded NWB files individually rather than grouping by session.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials are defined using the built-in `dataset.trials` table. The AI filters to Go and Catch trials (excluding Aborted and Auto-rewarded), then extracts ophys frames from `start_time` to `stop_time` for each valid trial, giving variable-length trials.
+i. Trials are defined using the `dataset.trials` table. Go and catch trials are included; aborted and auto-rewarded trials are excluded. Trial boundaries are from `start_time` to `stop_time` (variable length), using `ophys_ts >= start_time & ophys_ts < stop_time`.
 
 ii.
 ```python
 valid_trials = trials[(trials['go'] | trials['catch']) & ~trials['aborted'] & ~trials['auto_rewarded']]
 # ...
-for _, trial_row in valid_trials.iterrows():
-    start_time = trial_row['start_time']
-    stop_time = trial_row['stop_time']
-    frame_mask = (ophys_ts >= start_time) & (ophys_ts < stop_time)
-    frame_indices = np.where(frame_mask)[0]
-    if len(frame_indices) < 5:
-        continue
+frame_mask = (ophys_ts >= start_time) & (ophys_ts < stop_time)
+frame_indices = np.where(frame_mask)[0]
+if len(frame_indices) < 5:
+    continue
 ```
 
-iii. The AI used the SDK's trials table and filtered by go/catch status. The minimum trial length threshold of 5 frames is more aggressive than the reference's threshold of 0 frames (end_idx > start_idx). The AI uses `ophys_ts >= start_time` (inclusive) and `< stop_time` (exclusive), while the reference uses `np.searchsorted` which finds the first frame at or after the boundary.
+iii. The AI's trial filtering matches the reference (go + catch, excluding aborted and auto-rewarded). However, the AI requires `len(frame_indices) >= 5` instead of just `> 0`, and does not additionally filter on `change_time.notna()`. The AI uses `>=` for start_time (same as reference's `searchsorted`) but `<` for stop_time (reference uses `searchsorted` which gives `<=` behavior for the stop boundary).
 
 ## 1-e. How are trials filtered based on quality controls?
 
@@ -88,11 +85,11 @@ if len(valid_trials) < 2:
     return None
 ```
 
-iii. The reference additionally filters on `change_time.notna()`. The AI does not explicitly filter on `change_time` validity. The AI adds a neuron count filter (< 2) not in the reference.
+iii. The AI does not explicitly filter on `change_time.notna()` as the reference does. Instead, it filters on `go | catch`, which is similar but not identical. The reference requires valid `change_time` to ensure a well-defined change point.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The AI uses `dataset.events` (calcium events from FastLZeroSpikeInference deconvolution), NOT `dataset.dff_traces`. This is a significant difference from the reference, which uses `dff_traces`.
+i. The AI uses `dataset.events` (deconvolved calcium events from FastLZeroSpikeInference), NOT `dataset.dff_traces` (delta F/F). This is a significant difference from the reference, which uses `dff_traces`.
 
 ii.
 ```python
@@ -100,11 +97,11 @@ events = dataset.events
 events_array = np.vstack(events['events'].values).astype(np.float32)
 ```
 
-iii. The AI justified this choice by citing methods.txt: "For all analysis of neural data we used the detected calcium events." The methods text from the paper does specify using calcium events, so the AI followed the paper's stated methodology. However, the reference solution uses dff_traces.
+iii. The AI's CONVERSION_NOTES.md explicitly states: "Neural data: Use events (calcium events from FastLZeroSpikeInference) NOT dff_traces. Per methods.txt: 'For all analysis of neural data we used the detected calcium events'." The AI followed the paper's methods section rather than using raw dF/F.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The neural data (events) is extracted as-is with no additional processing. Since the AI treats each experiment as a single session, there is no merging across imaging planes (unlike the reference which stacks dF/F from multiple planes).
+i. No additional processing is applied beyond extracting the events array and casting to float32. Unlike the reference, which merges neurons across multiple imaging planes within a session, the AI treats each plane as a separate session so no merging is needed.
 
 ii.
 ```python
@@ -112,11 +109,11 @@ events = dataset.events
 events_array = np.vstack(events['events'].values).astype(np.float32)
 ```
 
-iii. The AI noted that the Allen SDK pipeline already applies quality control (ROI segmentation, filtering). No additional processing is applied.
+iii. The AI noted that ROI filtering is already applied by the Allen pipeline, so no additional filtering was needed.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No additional quality filtering is applied beyond the Allen pipeline's built-in ROI filtering. Sessions with fewer than 2 neurons are excluded.
+i. No additional quality filtering is applied. Sessions with fewer than 2 neurons are skipped.
 
 ii.
 ```python
@@ -124,11 +121,11 @@ if n_neurons < 2:
     return None
 ```
 
-iii. The AI stated that ROI filtering is already applied by the Allen pipeline classifier. The reference also does not apply additional neural filtering.
+iii. The AI noted that ROI filtering is already applied by the Allen pipeline classifier.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural data is aligned to the trial start time. Ophys frames from `start_time` to `stop_time` are extracted using boolean masking on the ophys timestamps array.
+i. Neural data is aligned to `trial_start` (start_time from the trials table). Ophys frames from `start_time` to `stop_time` are extracted, giving variable-length trials.
 
 ii.
 ```python
@@ -137,28 +134,28 @@ frame_indices = np.where(frame_mask)[0]
 neural_trial = events_array[:, frame_indices]
 ```
 
-iii. The AI uses `ophys_ts >= start_time` and `ophys_ts < stop_time`, which is slightly different from the reference's `np.searchsorted(ophys_ts, start_time)` and `np.searchsorted(ophys_ts, stop_time)`. Both approaches align to the ophys timebase; the difference is in boundary handling (inclusive vs exclusive at stop_time).
+iii. Same approach as the reference: align to trial start time and extract variable-length windows.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The AI hardcodes the time bin size as `1000.0 / 31.0` (~32.3 ms) rather than computing it from the data. No temporal rebinning is applied. The reference computes it from `np.median(np.diff(ophys_timestamps))`.
+i. No rebinning is applied. The AI hardcodes the time bin size as `1000.0 / 31.0` (~32.3 ms), unlike the reference which computes it from the median inter-frame interval.
 
 ii.
 ```python
 'time_bin_size': 1000.0 / 31.0,  # ~32.3 ms
 ```
 
-iii. The AI noted that Scientifica rigs run at 31 Hz. Hardcoding is functionally equivalent since only Scientifica sessions are included, but the reference dynamically computes this value.
+iii. The AI excluded Multiscope sessions to maintain a consistent ~31 Hz frame rate. The hardcoded value assumes all remaining sessions are at 31 Hz.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. The AI derives image identity from the `stimulus_presentations` table, specifically using `image_name`, `start_time`, and `end_time` columns. It filters to the `change_detection_behavior` stimulus block and excludes `omitted` stimuli. This contrasts with the reference which uses `initial_image_name` and `change_image_name` from the trials table.
+i. Image identity is derived from `stimulus_presentations` (filtered to `change_detection_behavior` block), using the `image_name` column with forward-filling during gray periods. This differs from the reference, which uses `initial_image_name` and `change_image_name` from the trials table with the `change_time` as the switch point.
 
 ii.
 ```python
 sp = dataset.stimulus_presentations
 sp_active = sp[sp['stimulus_block_name'] == 'change_detection_behavior'].copy()
-
+# ...
 def get_image_at_ophys(sp_active, ophys_ts, image_to_idx):
     for j in range(len(starts)):
         img_name = names[j]
@@ -175,29 +172,24 @@ def get_image_at_ophys(sp_active, ophys_ts, image_to_idx):
             image_idx[i] = last_img
 ```
 
-iii. The AI used the stimulus_presentations table to get precise timing of each image display, then forward-filled through gray screen periods. This provides frame-accurate image identity that accounts for the actual stimulus timing (250ms on, 500ms off) rather than using the simpler trial-level split at change_time.
+iii. The AI uses the stimulus_presentations table to determine which image is on screen at each timepoint, which provides more precise timing than the trials table approach. Omitted stimuli are skipped. Gray screen periods are forward-filled with the last shown image.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. Image names are mapped to integer codes via a global sorted mapping. During image presentations, the corresponding image index is assigned. Between presentations (gray screen), the last shown image index is forward-filled. Before the first stimulus in a trial, -1 values are replaced with the next valid image index.
+i. Image names are mapped to integer indices using a global sorted mapping. The mapping is built after collecting all unique image names across all sessions. Gray screen periods and times before first stimulus are forward-filled.
 
 ii.
 ```python
 all_image_names = sorted(list(all_image_names))
 image_to_idx = {name: idx for idx, name in enumerate(all_image_names)}
-# ...
-# Fix any -1 image indices (before first stimulus)
-neg_mask = img_trial < 0
-if neg_mask.any():
-    first_valid = img_trial[~neg_mask][0] if (~neg_mask).any() else 0
-    img_trial[neg_mask] = first_valid
+# Forward-fill handles gray screens
 ```
 
-iii. A global mapping ensures consistent codes across sessions. The forward-fill approach means gray screen periods carry the last-shown image identity, which differs from the reference approach of simply splitting the trial at `change_time`.
+iii. Same global mapping approach as reference, but the source of image identity differs (stimulus_presentations vs trials table).
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Image identity is computed at the full session level on ophys timestamps, then indexed per trial using the same frame indices as the neural data.
+i. Image identity is computed at each ophys timestamp using the stimulus_presentations start/end times, then extracted per trial using the same frame indices as neural data.
 
 ii.
 ```python
@@ -206,11 +198,11 @@ image_idx_full = get_image_at_ophys(sp_active, ophys_ts, image_to_idx)
 img_trial = image_idx_full[frame_indices]
 ```
 
-iii. Using the same ophys timestamps and frame indices guarantees alignment with neural data.
+iii. The image identity is computed over the full session at ophys timestamps, ensuring alignment with neural data.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. The AI derives image change from the `stimulus_presentations` table using the `is_change` column and the presentation's `start_time`/`end_time`. This differs from the reference which uses `change_time` from the trials table and a 750ms window.
+i. Image change is derived from the `is_change` column in `stimulus_presentations`, filtered to the `change_detection_behavior` block. This differs from the reference, which computes it from `change_time` and the `go` flag in the trials table.
 
 ii.
 ```python
@@ -222,11 +214,11 @@ def get_change_at_ophys(sp_active, ophys_ts):
     return change
 ```
 
-iii. The AI uses the stimulus presentation's own start/end times (which is the ~250ms image display period) for the change marker. The reference uses a 750ms window (one full image presentation + gray period) and only marks go trials.
+iii. The AI marks change=1 only during the change stimulus presentation window (start_time to end_time of the change flash, ~250ms), while the reference marks a 750ms window (flash + gray period). Also, the AI does not distinguish go vs catch trials for the change signal -- `is_change` is True for both go and catch trials in the stimulus_presentations table.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. A binary array is created at ophys timestamps, set to 1 only during the presentation time of stimuli marked as `is_change`. No additional processing.
+i. Binary 0/1 variable. 1 during the change stimulus presentation window (ophys frames within start_time to end_time of the change flash), 0 otherwise.
 
 ii.
 ```python
@@ -236,19 +228,19 @@ for _, row in change_sp.iterrows():
     change[mask] = 1
 ```
 
-iii. The `is_change` flag in stimulus_presentations marks both go trial changes and catch trial "sham changes". The reference only marks go trials (where an actual image change occurs), not catch trials.
+iii. No additional processing beyond the binary indicator.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. Image change is already binary (0 or 1), no thresholding needed.
+i. Image change is already binary (0 or 1). No thresholding is needed.
 
-ii. N/A
+ii. N/A - binary by construction.
 
 iii. N/A
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. Same approach as image identity - computed at full session level on ophys timestamps, then indexed per trial.
+i. Computed at ophys timestamps over the full session, then extracted per trial using the same frame indices.
 
 ii.
 ```python
@@ -257,11 +249,11 @@ change_full = get_change_at_ophys(sp_active, ophys_ts)
 change_trial = change_full[frame_indices]
 ```
 
-iii. Using the same frame indices guarantees alignment with neural data.
+iii. Same alignment approach as image identity.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. Running speed is derived from `dataset.running_speed`, using the `timestamps` and `speed` columns.
+i. Running speed is derived from `dataset.running_speed`, same as the reference.
 
 ii.
 ```python
@@ -269,38 +261,41 @@ running = dataset.running_speed
 running_full = resample_to_ophys(running['timestamps'].values, running['speed'].values, ophys_ts)
 ```
 
-iii. Same source as the reference.
+iii. Standard SDK interface for locomotion data.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Running speed is resampled to ophys timestamps using `np.interp` (linear interpolation), then discretized into 5 percentile-based bins computed globally across all sessions.
+i. Running speed is resampled to ophys timestamps using `np.interp` (linear interpolation), then discretized into 5 percentile bins computed globally across all sessions.
 
 ii.
 ```python
 def resample_to_ophys(signal_timestamps, signal_values, ophys_timestamps):
     return np.interp(ophys_timestamps, signal_timestamps, signal_values).astype(np.float32)
-# ...
+
+# Global percentile edges
+all_running_concat = np.concatenate(all_running_values)
 running_edges = np.percentile(all_running_concat, np.linspace(0, 100, 6))
+
+# Binning
 running_binned = np.clip(np.digitize(running_full, running_edges[1:-1]), 0, 4).astype(np.int32)
 ```
 
-iii. The AI uses `np.interp` which extrapolates at boundaries (using edge values) rather than `interp1d` with `fill_value=np.nan` as in the reference. The reference then handles NaN values by mapping them to bin 0. The AI's approach avoids NaN but may be slightly different at edges.
+iii. The AI uses `np.interp` (which extrapolates edge values) rather than `scipy.interpolate.interp1d` with `fill_value=np.nan` as in the reference. This means edge cases are handled differently: `np.interp` extends the last value instead of producing NaN. Also, percentiles are computed from full-session data rather than trial-segmented data only.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Running speed is discretized into 5 equal percentile bins using global percentiles across all sessions, with `np.digitize` and `np.clip` to ensure values stay in [0, 4].
+i. Discretized into 5 bins using global percentile edges via `np.digitize`.
 
 ii.
 ```python
-running_edges = np.percentile(all_running_concat, np.linspace(0, 100, 6))
 running_binned = np.clip(np.digitize(running_full, running_edges[1:-1]), 0, 4).astype(np.int32)
 ```
 
-iii. Similar to the reference approach. The AI computes percentile bin edges from all sessions combined (global binning), matching the reference.
+iii. Same 5-bin approach as reference. The AI clips values to 0-4 range.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is interpolated to ophys timestamps before trial segmentation, ensuring alignment with neural data via the same frame indices.
+i. Running speed is interpolated to ophys timestamps before trial segmentation, ensuring alignment.
 
 ii.
 ```python
@@ -309,11 +304,11 @@ running_full = resample_to_ophys(running['timestamps'].values, running['speed'].
 running_trial = running_binned[frame_indices]
 ```
 
-iii. Same alignment approach as neural data - both use the same ophys frame indices.
+iii. Same alignment approach as reference.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. Pupil diameter is derived from `dataset.eye_tracking`, using the `pupil_width` column.
+i. Pupil diameter is derived from `dataset.eye_tracking`, using the `pupil_width` column. Same as reference.
 
 ii.
 ```python
@@ -322,11 +317,11 @@ pupil_raw = eye['pupil_width'].values
 pupil_ts = eye['timestamps'].values
 ```
 
-iii. Same source variable as the reference (`pupil_width`).
+iii. Standard SDK interface for eye tracking data.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. The AI filters out NaN values from pupil data (but does NOT filter blinks using `likely_blink` as the reference does), then resamples to ophys timestamps using `np.interp`, and discretizes into 5 percentile bins.
+i. Pupil data is filtered for NaN values (not `likely_blink` as in the reference), then resampled to ophys timestamps using `np.interp`, then discretized into 5 percentile bins.
 
 ii.
 ```python
@@ -337,25 +332,26 @@ if valid_mask.sum() > 10:
     pupil_full = resample_to_ophys(pupil_ts[valid_mask], pupil_raw[valid_mask], ophys_ts)
 ```
 
-iii. The AI removes NaN values before interpolation but does not explicitly filter blink frames using `likely_blink`. If blink frames produce NaN values in `pupil_width`, the NaN filtering may partially address blinks, but blink frames with non-NaN but corrupted values would not be filtered.
+iii. The AI filters NaN values rather than using the `likely_blink` flag. This may miss some blink artifacts that are not NaN but are flagged by the blink detector.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Pupil diameter is discretized into 5 equal percentile bins using global percentiles, same approach as running speed.
+i. Same as running speed: 5 percentile bins computed globally.
 
 ii.
 ```python
-pupil_edges = np.percentile(all_pupil_concat, np.linspace(0, 100, 6))
-pupil_binned[valid_pupil_mask] = np.clip(
-    np.digitize(pupil_full[valid_pupil_mask], pupil_edges[1:-1]), 0, 4
-).astype(np.int32)
+pupil_binned = np.zeros(len(ophys_ts), dtype=np.int32)
+if valid_pupil_mask.any() and pupil_edges is not None:
+    pupil_binned[valid_pupil_mask] = np.clip(
+        np.digitize(pupil_full[valid_pupil_mask], pupil_edges[1:-1]), 0, 4
+    ).astype(np.int32)
 ```
 
-iii. Same global percentile approach as running speed.
+iii. NaN pupil values are mapped to bin 0 (same default as reference).
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Pupil diameter is interpolated to ophys timestamps before trial segmentation, then indexed per trial using the same frame indices as neural data.
+i. Same approach as running speed: interpolated to ophys timestamps, then extracted per trial.
 
 ii.
 ```python
@@ -364,11 +360,11 @@ pupil_full = resample_to_ophys(pupil_ts[valid_mask], pupil_raw[valid_mask], ophy
 pupil_trial = pupil_binned[frame_indices]
 ```
 
-iii. Same alignment approach as running speed and neural data.
+iii. Same alignment approach.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. Trial outcome is derived from the `hit`, `miss`, `false_alarm`, and `correct_reject` boolean columns in the trials table.
+i. Trial outcome is derived from the `hit`, `miss`, `false_alarm`, and `correct_reject` boolean columns in the trials table. Same as reference.
 
 ii.
 ```python
@@ -380,11 +376,11 @@ def get_trial_outcome(trial_row):
     return -1
 ```
 
-iii. Same source as the reference.
+iii. Same four categories and mapping order as reference.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. Trial outcomes are mapped to integer codes (0-3) matching the order [hit, miss, false_alarm, correct_reject]. The outcome code is replicated across all time bins in the trial.
+i. Boolean columns mapped to integer codes (0-3). The outcome is constant across all timepoints in a trial.
 
 ii.
 ```python
@@ -392,17 +388,16 @@ outcome = get_trial_outcome(trial_row)
 outcome_trial = np.full(len(frame_indices), outcome, dtype=np.int32)
 ```
 
-iii. Same processing as the reference. The mapping order matches: hit=0, miss=1, false_alarm=2, correct_reject=3.
+iii. Same approach as reference: static per-trial value replicated across all frames.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Several cases are handled:
-- Failed experiment loading: try/except with skip and error message
-- Short trials (< 5 frames): skipped
-- Missing eye tracking data: replaced with NaN array
-- NaN pupil values: filtered before interpolation, remaining NaN set to bin 0
-- Negative image indices (before first stimulus): forward/backward-filled
-- Sessions with < 2 valid trials or < 2 neurons: skipped
+i. Several cases handled:
+- Failed experiment loads are caught by try/except and skipped.
+- Trials with fewer than 5 frames are skipped.
+- Sessions with < 2 neurons or < 2 trials are skipped.
+- Image indices of -1 (before first stimulus) are forward-filled with the next valid image.
+- Pupil NaN values are handled gracefully (fallback to all-NaN array).
 
 ii.
 ```python
@@ -413,36 +408,32 @@ except Exception as e:
     all_session_data.append(None)
     continue
 # ...
-if len(frame_indices) < 5:
-    continue
-# ...
-try:
-    eye = dataset.eye_tracking
-    # ...
-except:
-    pupil_full = np.full(len(ophys_ts), np.nan, dtype=np.float32)
+neg_mask = img_trial < 0
+if neg_mask.any():
+    first_valid = img_trial[~neg_mask][0] if (~neg_mask).any() else 0
+    img_trial[neg_mask] = first_valid
 ```
 
-iii. The AI handles edge cases robustly. The reference similarly uses try/except for sessions and handles truncated trials and NaN values.
+iii. The AI handles edge cases robustly but uses a minimum 5-frame threshold instead of any valid frames.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. The most time-consuming step is loading each NWB experiment file from disk via `BehaviorOphysExperiment.from_nwb_path()`. The AI uses a two-pass approach which loads experiments once in Pass 1 and reuses the data in Pass 2.
+i. Loading each experiment via `BehaviorOphysExperiment.from_nwb_path()` is the most time-consuming step, as it reads large NWB files from disk.
 
-ii. N/A
+ii. N/A (I/O bound, not a code inefficiency)
 
-iii. From CONVERSION_NOTES: "Processing time: ~24 min for full dataset (202 experiments)". Loading NWB files is I/O bound.
+iii. The AI noted total processing time of ~24 minutes for full dataset.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The `get_image_at_ophys` function loops through all stimulus presentations individually, applying a boolean mask for each one. The forward-fill loop also iterates through all ophys timepoints. These could be vectorized using `np.searchsorted` and pandas forward-fill.
+i. The `get_image_at_ophys` function has a loop over stimulus presentations that could be vectorized. The forward-fill loop is also sequential.
 
 ii.
 ```python
 for j in range(len(starts)):
     mask = (ophys_ts >= starts[j]) & (ophys_ts < ends[j])
     image_idx[mask] = image_to_idx[img_name]
-# Forward-fill loop
+# Forward-fill
 last_img = -1
 for i in range(n_tp):
     if image_idx[i] >= 0:
@@ -451,30 +442,34 @@ for i in range(n_tp):
         image_idx[i] = last_img
 ```
 
-iii. The per-stimulus loop could be replaced with vectorized `np.searchsorted` calls. The forward-fill could use `pd.Series.ffill()`.
+iii. These loops iterate over stimulus presentations and timepoints. The forward-fill could use `pd.Series.ffill()` or similar.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. The AI's two-pass approach means image identity indices are computed twice: once in Pass 1 (with a temporary mapping) and again in Pass 2 (with the global mapping). The Pass 1 computation is effectively wasted.
+i. The AI uses a two-pass approach: Pass 1 loads all experiments and collects global statistics, then Pass 2 re-extracts image indices with the global mapping. The `get_image_at_ophys` function is called twice for each session (once in each pass). The reference avoids this by collecting image names as strings first and mapping to codes after all data is loaded.
 
 ii.
 ```python
-# Pass 1: temporary mapping
-temp_image_to_idx = {name: idx for idx, name in enumerate(sorted(all_image_names))}
+# Pass 1: temp_image_to_idx
 session_data = extract_session_data(dataset, temp_image_to_idx)
-# Pass 2: re-compute with global mapping
+# ...
+# Pass 2: Re-compute image indices with global image_to_idx
 session_data['image_idx_full'] = get_image_at_ophys(session_data['sp_active'], session_data['ophys_ts'], image_to_idx)
 ```
 
-iii. The two-pass approach was needed to compute global percentile edges and image mappings before final trial assembly, but the image identity computation in Pass 1 is redundant.
+iii. The two-pass approach is needed because the global image mapping is not known until all sessions are processed.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The AI computes and stores full-session running speed and pupil values (`running_full`, `pupil_full`) in the session data during Pass 1, concatenates them all for global percentile computation, then also collects them per-trial. The full-session arrays are kept in memory across all passes even though only per-trial segments are needed for the output. Additionally, the `sp_active` stimulus presentations table is stored in session_data and persists through both passes.
+i. The AI stores full-session `sp_active` (stimulus presentations) data in memory across both passes, which is only needed for computing image indices. The plot_processing function recomputes binned running and pupil data instead of reusing already-computed values.
 
 ii.
 ```python
-all_session_data.append(session_data)  # Keeps full session data in memory
+# sp_active stored in session_data for Pass 2
+'sp_active': sp_active,
+# ...
+# plot_processing recomputes bins
+running_binned = np.clip(np.digitize(session_data['running_full'], running_edges[1:-1]), 0, 4)
 ```
 
-iii. The reference avoids this by computing per-trial data immediately and discarding the full-session arrays.
+iii. These are minor inefficiencies that don't affect correctness.

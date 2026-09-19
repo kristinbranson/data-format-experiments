@@ -2,47 +2,46 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI hardcodes the seven animal IDs, loads one joblib file per animal from `data/`, extracts `trace`, `position`, and `envs`, and then iterates over all days in each animal file. Trials are not loaded directly; they are created later inside `process_session`.
+i. The AI loads a hard-coded list of seven animal files from `/app/data` using `joblib.load`. For each animal file, it reads the nested dictionary entries `trace`, `position`, and `envs`, then iterates through all days/sessions and later splits them into trials.
 
 ii.
 ```python
 ANIMALS = ["QLAK-CA1-08", "QLAK-CA1-30", "QLAK-CA1-50", "QLAK-CA1-51",
            "QLAK-CA1-56", "QLAK-CA1-74", "QLAK-CA1-75"]
-
+...
 for animal_idx, animal in enumerate(animals):
     dat = joblib.load(os.path.join(data_dir, animal))
-
-    trace_all = dat[animal]['trace']      # (n_days, n_cells, n_frames)
-    position_all = dat[animal]['position']  # (n_days, 2, n_frames)
-    envs_all = dat[animal]['envs']          # (n_days, 1)
+    trace_all = dat[animal]['trace']
+    position_all = dat[animal]['position']
+    envs_all = dat[animal]['envs']
 ```
 
-iii. In `CONVERSION_NOTES.md` Step 1-2 and trajectory steps 4-6, the AI states that the reference repository uses joblib-format animal files and that these files directly expose the needed arrays, so it chose them as the primary source.
+iii. In `CONVERSION_NOTES.md` Step 1 and trajectory steps 4-6, the AI justified this by concluding that the reference repository primarily uses Python joblib animal files via `load_dat(..., format='joblib')`, and treated those files as the canonical source to match the paper code.
 
 ## 1-b. How are the data split into subjects?
 
-i. Each hardcoded animal ID is treated as one subject. The `subjects` list is just the `ANIMALS` list, and each exported session gets the loop index of its animal in `subject_idx`.
+i. The AI treats each hard-coded animal ID as one subject, and uses the ordered `ANIMALS` list directly as the `subjects` field.
 
 ii.
 ```python
+ANIMALS = ["QLAK-CA1-08", "QLAK-CA1-30", "QLAK-CA1-50", "QLAK-CA1-51",
+           "QLAK-CA1-56", "QLAK-CA1-74", "QLAK-CA1-75"]
+...
 subjects = list(animals)  # animal IDs as subject names
-
-for animal_idx, animal in enumerate(animals):
-    ...
-    all_subject_idx.append(animal_idx)
 ```
 
-iii. The notes say there are 7 animals and treat animal IDs as the subject identifiers.
+iii. In `CONVERSION_NOTES.md` Step 2 and trajectory steps 11-13, the AI noted that there are seven animal files and that each corresponds to one mouse, so it used those animal IDs as subject identifiers.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each day in an animal file is treated as one session. The AI reads `trace_all.shape[0]` as the number of days/sessions and appends one session to the output for each `day`.
+i. The AI treats each recording day within an animal file as one session. It iterates over the first dimension of `trace`, `position`, and `envs`, processes that day, and appends one session to the output lists.
 
 ii.
 ```python
 n_days = trace_all.shape[0]
-
+...
 for day in range(n_days):
+    env_name = envs_all[day, 0] if envs_all.ndim > 1 else envs_all[day]
     neural_trials, input_trials, output_trials, n_registered = process_session(
         trace_all[day], position_all[day], env_name
     )
@@ -52,21 +51,21 @@ for day in range(n_days):
     all_output.append(output_trials)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 5 explicitly says “Each day for each animal = 1 session. Total 207 sessions.”
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 13, 16, and 17, the AI concluded that one day in the joblib arrays corresponds to one 40-minute recording session, matching the paper’s one-session-per-day structure.
 
 ## 1-d. How are the data split into trials?
 
-i. Within each session, the AI first rebins the data to 100 ms bins, then splits the rebinned time series into non-overlapping 1-minute trials. Since 60 seconds at 10 Hz is 600 bins, each trial is 600 pooled time bins. Any leftover pooled bins are dropped by floor division.
+i. Each session is split into consecutive, non-overlapping 1-minute trials. The AI first temporally bins the session to 100 ms bins, then divides the result into chunks of 600 bins per trial; any remainder is discarded.
 
 ii.
 ```python
 TRIAL_DURATION_SEC = 60
-FRAMES_PER_TRIAL = TRIAL_DURATION_SEC * FPS
-TIME_BINS_PER_TRIAL = FRAMES_PER_TRIAL // TEMPORAL_BIN_SIZE  # 600
-
+FRAMES_PER_TRIAL = TRIAL_DURATION_SEC * FPS  # 1800 frames
+TIME_BINS_PER_TRIAL = FRAMES_PER_TRIAL // TEMPORAL_BIN_SIZE  # 600 time bins
+...
 n_timebins_total = neural_binned.shape[1]
 n_trials = n_timebins_total // TIME_BINS_PER_TRIAL
-
+...
 for t in range(n_trials):
     t_start = t * TIME_BINS_PER_TRIAL
     t_end = (t + 1) * TIME_BINS_PER_TRIAL
@@ -74,29 +73,29 @@ for t in range(n_trials):
     output_trial = pos_category[t_start:t_end].astype(np.int64).reshape(1, -1)
 ```
 
-iii. The notes justify this as matching the task’s 1-minute trial requirement after applying the reference decoder’s 3-frame temporal binning pipeline.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 17 and 29, the AI justified this as the required adaptation from continuous 40-minute sessions to the decoder task’s 1-minute trial structure.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. There is no explicit trial-level quality filtering. The AI only skips entire sessions with zero registered cells and implicitly drops incomplete final trial fragments.
+i. The AI does not apply explicit trial-level quality-control filtering. It keeps all 1-minute trial segments from any session that has at least one registered cell.
 
 ii.
 ```python
 if n_registered == 0:
     return [], [], [], 0
-
-n_trials = n_timebins_total // TIME_BINS_PER_TRIAL
-
-if len(neural_trials) == 0:
-    print(f"  Day {day}: skipped (no registered cells)")
-    continue
+...
+for t in range(n_trials):
+    ...
+    neural_trials.append(neural_trial)
+    input_trials.append(input_trial)
+    output_trials.append(output_trial)
 ```
 
-iii. In the notes, the AI says there is “No explicit trial-level curation” and that it would not apply the decoder’s movement filter to the exported dataset.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory step 17, the AI explicitly decided against velocity-based or place-cell-based trial curation, arguing those filters were specific to the paper’s within-session Bayesian decoder rather than required by this task.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The exported `neural` data is derived from the per-animal `trace` array, specifically one day/session slice `trace_all[day]`.
+i. The AI derives neural data from the per-animal `trace` array in the joblib files.
 
 ii.
 ```python
@@ -107,97 +106,89 @@ neural_trials, input_trials, output_trials, n_registered = process_session(
 )
 ```
 
-iii. The AI’s notes describe `trace` as the binarized rising-phase calcium event trace used throughout the paper code.
+iii. In `CONVERSION_NOTES.md` Steps 1-3 and trajectory steps 9, 11, and 13, the AI states that `trace` already contains the paper’s preprocessed binarized calcium-event traces, so this is the appropriate neural source variable.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI keeps only registered cells, converts to `float32`, Gaussian-smooths each cell’s time series with sigma 3 frames, and then average-pools with kernel/stride 3 to produce 100 ms bins. It exports these pooled values as the `neural` signal.
+i. The AI keeps only registered cells, converts remaining NaNs to zero, applies Gaussian smoothing with sigma 3 frames, then temporally averages with `AvgPool1d` over non-overlapping 3-frame windows to produce continuous-valued neural signals at 100 ms resolution.
 
 ii.
 ```python
 registered_trace = trace_day[registered_mask]
 registered_trace = np.nan_to_num(registered_trace, nan=0.0)
-
+...
 smoothed_trace = gaussian_filter1d(registered_trace.astype(np.float32),
                                     sigma=GAUSS_SIGMA, axis=1)
-
 pooling = AvgPool1d(kernel_size=TEMPORAL_BIN_SIZE, stride=TEMPORAL_BIN_SIZE)
 neural_binned = pooling(torch.tensor(smoothed_trace)).numpy()
 ```
 
-iii. The main justification appears in `CONVERSION_NOTES.md` Step 1 and Step 5 and in trajectory step 23: the AI decided to reuse the reference decoder’s `fit_decoder` preprocessing and also reacted to the format checker warning that raw binary traces lacked variability.
+iii. In `CONVERSION_NOTES.md` Steps 1 and 5 and trajectory steps 9, 17, 23, 28, and 29, the AI justified this by trying to match the paper’s `fit_decoder` preprocessing and by reacting to the downstream validator’s complaint that purely binary 0/1 neural data would be rejected.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Cells are kept if the first frame is not `NaN`, which the AI uses as a proxy for being registered that day. It skips sessions with zero such cells. Any remaining `NaN` values are replaced with zeros. The AI does not apply place-cell filtering or the decoder’s `>5` events threshold.
+i. The AI filters neural data by removing cells it considers unregistered on a session: cells whose trace is NaN at the first frame. It does not apply place-cell filtering or the decoder code’s `>5` event threshold, and it zero-fills any remaining NaNs after registration filtering.
 
 ii.
 ```python
 registered_mask = ~np.isnan(trace_day[:, 0])
 registered_trace = trace_day[registered_mask]
 ...
-if n_registered == 0:
-    return [], [], [], 0
-
 registered_trace = np.nan_to_num(registered_trace, nan=0.0)
 ```
 
-iii. The notes say that `NaN` indicates a cell was not registered on that day and explicitly justify using all registered cells rather than place cells or activity-thresholded cells.
+iii. In `CONVERSION_NOTES.md` Steps 2-5 and trajectory steps 13, 16, and 17, the AI justified this by observing that NaNs indicate cells not registered on that day, and by deciding that place-cell and movement/activity thresholds were specific to the reference decoder analysis rather than mandatory for the exported dataset.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. There is no experimental event alignment. In practice, the AI treats the start of each artificial 1-minute segment as the alignment point and records that synthetic event in metadata.
+i. The AI does not align neural data to an experimental event. Instead, it treats the start of each artificial 1-minute segment as the alignment point and records that in metadata.
 
 ii.
 ```python
-for t in range(n_trials):
-    t_start = t * TIME_BINS_PER_TRIAL
-    t_end = (t + 1) * TIME_BINS_PER_TRIAL
-    neural_trial = neural_binned[:, t_start:t_end].astype(np.float32)
-
 'metadata': {
+    'task_description': 'Decode mouse position (3x3 spatial bins) from CA1 calcium imaging during geometric environment exploration',
+    'time_bin_size': TIME_BIN_MS,
     'temporal_alignment_event': 'Start of 1-minute trial segment within 40-minute recording session',
     'off_start': 0.0,
     'off_end': float(TRIAL_DURATION_SEC),
-}
 ```
 
-iii. The notes say the recordings are continuous and the “trials” are imposed by the task, so the AI chose trial-start as the metadata alignment event.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 17 and 29, the AI justified this as a consequence of the task-defined trialization of continuous sessions, since there is no natural stimulus onset event in the source data.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted data uses 100 ms bins. Yes, temporal rebinning is applied: 3 native 30 Hz frames are averaged into one bin after Gaussian smoothing.
+i. The converted neural data has 100 ms bins. The AI rebins the original 30 Hz data by smoothing and averaging every 3 frames.
 
 ii.
 ```python
 FPS = 30
 TEMPORAL_BIN_SIZE = 3
 TIME_BIN_MS = 1000.0 * TEMPORAL_BIN_SIZE / FPS  # 100 ms
-
-smoothed_trace = gaussian_filter1d(..., sigma=GAUSS_SIGMA, axis=1)
+...
 pooling = AvgPool1d(kernel_size=TEMPORAL_BIN_SIZE, stride=TEMPORAL_BIN_SIZE)
+neural_binned = pooling(torch.tensor(smoothed_trace)).numpy()
 ```
 
-iii. `CONVERSION_NOTES.md` Step 5 says this was chosen to mirror the reference decoder’s preprocessing rather than the raw recording resolution.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 15, 17, 23, and 29, the AI justified this as matching the paper’s decoder preprocessing and as necessary to transform binary events into continuous-valued neural features accepted by the downstream decoder.
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. The AI derives `input` from the `envs` variable, not from `blocked`. For each day, it reads the environment name string and converts it to a 3x3 geometry matrix.
+i. The AI derives environment geometry from the `envs` session labels, not from the raw `blocked` arrays.
 
 ii.
 ```python
 envs_all = dat[animal]['envs']          # (n_days, 1)
 ...
 env_name = envs_all[day, 0] if envs_all.ndim > 1 else envs_all[day]
+...
 env_mat = get_env_mat(env_name)
-env_flat = env_mat.flatten()
 ```
 
-iii. In Step 5 of the notes, the AI’s variable mapping is explicitly `envs → get_env_mat()`.
+iii. In `CONVERSION_NOTES.md` Steps 1 and 5 and trajectory steps 9 and 10, the AI justified this by finding `get_env_mat` in the paper code and concluding that the named geometry itself was the most direct representation of arena structure for the decoder input.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The AI maps each environment name to a hardcoded 3x3 binary matrix of open cells, flattens the matrix to length 9, casts it to `float32`, and reuses the same vector for every trial in that session.
+i. The AI maps each environment name to a 3×3 binary occupancy matrix with `get_env_mat`, flattens it to a 9-element vector, casts it to `float32`, and reuses the same static vector for every trial in that session.
 
 ii.
 ```python
@@ -208,16 +199,19 @@ def get_env_mat(env):
         ...
     }
     return env_mats.get(env, np.full((3,3), np.nan)).astype(float)
-
-input_trial = env_flat.astype(np.float32)  # (9,) static per trial
+...
+env_mat = get_env_mat(env_name)
+env_flat = env_mat.flatten()
+...
+input_trial = env_flat.astype(np.float32)
 input_trials.append(input_trial)
 ```
 
-iii. The notes justify this by pointing to the paper utility `get_env_mat` and by arguing that the 3x3 geometry is the relevant static decoder input.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 10, 17, and 29, the AI justified this as matching the paper’s geometry utilities and as a natural way to provide static contextual information for each 1-minute trial.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. The `output` data is derived from the per-animal `position` array, specifically `position_all[day]` for each session.
+i. The AI derives mouse position from the `position` array in each animal file.
 
 ii.
 ```python
@@ -228,49 +222,50 @@ neural_trials, input_trials, output_trials, n_registered = process_session(
 )
 ```
 
-iii. The notes identify `position` as the raw 2D `(x, y)` trajectory in centimeters.
+iii. In `CONVERSION_NOTES.md` Steps 1-3 and trajectory steps 9, 11, and 13, the AI identified `position` as the raw x-y trajectory in centimeters and used it as the source for decoder targets.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The AI temporally averages position with the same 3-frame pooling used for neural data, computes per-axis 3-bin indices by dividing by a 25 cm bin width, clips them to `[0, 2]`, and converts the 2D bin into one categorical label per time bin.
-
-ii.
-```python
-pos_binned_temporal = pooling(torch.tensor(position_day.astype(np.float32))).numpy()
-
-bin_size = (POSITION_MAX + BUFFER) / N_SPATIAL_BINS
-pos_bins = (pos_binned_temporal / bin_size).astype(int)
-pos_bins = np.clip(pos_bins, 0, N_SPATIAL_BINS - 1)
-
-pos_category = pos_bins[0] * N_SPATIAL_BINS + pos_bins[1]
-```
-
-iii. The notes say this was intended to keep position on the same 100 ms grid as neural activity while reducing the arena to a 3x3 decoding target.
-
-## 4-c. How is `output` *Mouse position* thresholded into categories?
-
-i. The AI thresholds each axis into three bins spanning the 75 cm arena, using floor-division-like casting after dividing by `(75 + 1e-5) / 3`. It then combines the two 1D bins into a single category `0..8` using `x_bin * 3 + y_bin`.
-
-ii.
-```python
-bin_size = (POSITION_MAX + BUFFER) / N_SPATIAL_BINS
-pos_bins = (pos_binned_temporal / bin_size).astype(int)
-pos_bins = np.clip(pos_bins, 0, N_SPATIAL_BINS - 1)
-pos_category = pos_bins[0] * N_SPATIAL_BINS + pos_bins[1]
-```
-
-iii. The notes say the 3x3 categorization was chosen to match the environment’s 3x3 partition structure.
-
-## 4-d. How is `output` *Mouse position* aligned with the neural data?
-
-i. The AI uses the same pooling operation for neural and position streams and then slices both with the same trial indices. Alignment is therefore at the pooled 100 ms time base.
+i. The AI temporally averages x and y positions with the same 3-frame pooling used for neural data, then converts the pooled coordinates into 3×3 spatial bins.
 
 ii.
 ```python
 pooling = AvgPool1d(kernel_size=TEMPORAL_BIN_SIZE, stride=TEMPORAL_BIN_SIZE)
+...
+pos_binned_temporal = pooling(torch.tensor(position_day.astype(np.float32))).numpy()
+...
+bin_size = (POSITION_MAX + BUFFER) / N_SPATIAL_BINS
+pos_bins = (pos_binned_temporal / bin_size).astype(int)
+pos_bins = np.clip(pos_bins, 0, N_SPATIAL_BINS - 1)
+```
+
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 15, 17, and 29, the AI justified this as keeping position aligned with the 100 ms neural bins while adapting the paper’s position-decoding preprocessing to the required 3×3 output grid.
+
+## 4-c. How is `output` *Mouse position* thresholded into categories?
+
+i. The AI divides both x and y position ranges into three equal 25 cm bins over a 75 cm arena, clips them to `[0, 2]`, and combines the two axis bins into one category with `x_bin * 3 + y_bin`.
+
+ii.
+```python
+bin_size = (POSITION_MAX + BUFFER) / N_SPATIAL_BINS
+pos_bins = (pos_binned_temporal / bin_size).astype(int)
+pos_bins = np.clip(pos_bins, 0, N_SPATIAL_BINS - 1)
+
+# Convert to single category: x_bin * 3 + y_bin
+pos_category = pos_bins[0] * N_SPATIAL_BINS + pos_bins[1]
+```
+
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 16, 17, and 33, the AI justified this as matching the arena’s 3×3 partition structure and giving the decoder nine coarse spatial classes.
+
+## 4-d. How is `output` *Mouse position* aligned with the neural data?
+
+i. The AI aligns position to neural data by applying the same temporal pooling to both streams and then slicing both into trials using the same trial-bin indices.
+
+ii.
+```python
 neural_binned = pooling(torch.tensor(smoothed_trace)).numpy()
 pos_binned_temporal = pooling(torch.tensor(position_day.astype(np.float32))).numpy()
-
+...
 for t in range(n_trials):
     t_start = t * TIME_BINS_PER_TRIAL
     t_end = (t + 1) * TIME_BINS_PER_TRIAL
@@ -278,49 +273,45 @@ for t in range(n_trials):
     output_trial = pos_category[t_start:t_end].astype(np.int64).reshape(1, -1)
 ```
 
-iii. The notes and trajectory repeatedly say that position should be binned “same as neural” so the two streams stay synchronized.
+iii. In `CONVERSION_NOTES.md` Step 5 and trajectory steps 17, 29, and 48, the AI justified this as preserving frame-to-frame correspondence after rebinning, and later reported that its sanity checks showed exact agreement between its processed neural and output trial slices and the raw inputs under that processing scheme.
 
 ## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Unregistered cells are removed via the first-frame `NaN` mask, any leftover `NaN`s are replaced with zeros, sessions with zero registered cells are skipped, and incomplete final trial fragments are dropped by floor division.
+i. The AI treats NaN traces as missing registration, removes those cells session-wise, replaces any remaining NaNs with zeros, skips sessions with zero registered cells, and discards leftover frames/time bins that do not fill a complete pooled trial.
 
 ii.
 ```python
 registered_mask = ~np.isnan(trace_day[:, 0])
 registered_trace = trace_day[registered_mask]
-registered_trace = np.nan_to_num(registered_trace, nan=0.0)
-
+...
 if n_registered == 0:
     return [], [], [], 0
-
+...
+registered_trace = np.nan_to_num(registered_trace, nan=0.0)
+...
 n_trials = n_timebins_total // TIME_BINS_PER_TRIAL
 ```
 
-iii. The notes justify this mainly by the interpretation that `NaN` marks a cell that was not registered that day; they do not describe any more elaborate missing-data repair.
+iii. In `CONVERSION_NOTES.md` Steps 2-5 and trajectory steps 13, 16, 17, and 29, the AI justified this by interpreting NaNs as unregistered cells, assuming any residual NaNs were anomalous but safest to coerce to zero, and accepting truncation of incomplete tails when forming fixed-length trials.
 
 ## 6-a. What are the most time-consuming steps of the code?
 
-i. According to the notes, the slowest steps are loading each large animal joblib file and then processing each session with smoothing and pooling. The code also times animal-level and day-level work explicitly.
+i. The AI’s notes identify file loading as the dominant cost, with per-animal `joblib.load` taking tens of seconds, while per-session processing is much faster.
 
 ii.
 ```python
 for animal_idx, animal in enumerate(animals):
-    t_animal_start = time.time()
+    ...
     t0 = time.time()
     dat = joblib.load(os.path.join(data_dir, animal))
     print(f"  Loaded in {time.time()-t0:.1f}s")
-    ...
-    t_day_start = time.time()
-    neural_trials, input_trials, output_trials, n_registered = process_session(
-        trace_all[day], position_all[day], env_name
-    )
 ```
 
-iii. `CONVERSION_NOTES.md` Step 7 gives runtime estimates of roughly 20-80 seconds per animal for loading and roughly 0.7-1.0 seconds per session for processing.
+iii. In `CONVERSION_NOTES.md` Step 7 and trajectory steps 37, 41, 44, and 47, the AI explicitly reported timing estimates showing that loading each large animal file dominated total runtime.
 
 ## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The clearest vectorization opportunity is the per-trial Python loop inside `process_session`, where regular contiguous slices are appended one by one. The outer animal/day loops reflect the dataset structure and are less avoidable.
+i. The clearest vectorization target is the explicit loop over trials inside `process_session`, which slices and appends each trial one by one rather than reshaping the binned arrays. The outer animal/day loops are structurally necessary, but the per-trial assembly could have been more vectorized.
 
 ii.
 ```python
@@ -334,46 +325,41 @@ for t in range(n_trials):
     neural_trial = neural_binned[:, t_start:t_end].astype(np.float32)
     input_trial = env_flat.astype(np.float32)
     output_trial = pos_category[t_start:t_end].astype(np.int64).reshape(1, -1)
-
     neural_trials.append(neural_trial)
     input_trials.append(input_trial)
     output_trials.append(output_trial)
 ```
 
-iii. The AI did not explicitly justify leaving this loop unvectorized in the notes or trajectory; it appears to be a straightforward implementation choice.
+iii. The AI did not give an explicit justification for keeping this loop. This assessment is inferred from the code structure rather than from `CONVERSION_NOTES.md`.
 
 ## 6-c. What processing does the code repeat multiple times?
 
-i. The code repeatedly casts the same static environment vector once per trial, rebuilds the `AvgPool1d` module once per session, and constructs trial lists via repeated slicing and appending even though the slices are regular.
+i. The code repeatedly reconstructs the pooling layer for each session, repeatedly casts the same environment vector to `float32` once per trial, and repeatedly slices trial windows in Python for every session.
 
 ii.
 ```python
 pooling = AvgPool1d(kernel_size=TEMPORAL_BIN_SIZE, stride=TEMPORAL_BIN_SIZE)
 ...
+env_flat = env_mat.flatten()
+...
 for t in range(n_trials):
     ...
     input_trial = env_flat.astype(np.float32)
-    ...
-    input_trials.append(input_trial)
 ```
 
-iii. There is no explicit justification for these repeats in the notes; they look like convenience-oriented choices rather than deliberate optimizations.
+iii. The AI did not explicitly discuss these repetitions in its notes or trajectory. This is inferred from direct inspection of `convert_data.py`.
 
 ## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The main extra work is optional diagnostics: the script can generate large processing plots, prints timing summaries, and computes display-only summary information that is not stored in the final dataset.
+i. In the default conversion path, there is not much discarded scientific processing, but the script includes optional visualization work (`save_processing_plot`) and logging/timing instrumentation that are not used by downstream decoder analyses. It also computes `n_cells` only for printing.
 
 ii.
 ```python
+n_cells = trace_all.shape[1]
+print(f"  {n_days} days, {n_cells} cells, {trace_all.shape[2]} frames/day")
+...
 if show_processing and sessions_processed <= 2:
-    save_processing_plot(trace_all[day], position_all[day], env_name,
-                        neural_trials, input_trials, output_trials,
-                        animal, day)
-
-print(f"\n=== Conversion Summary ===")
-print(f"Sessions: {total_sessions}")
-print(f"Trials: {total_trials}")
-print(f"Subjects: {len(subjects)}")
+    save_processing_plot(...)
 ```
 
-iii. The notes describe these as sanity checks and visual review steps rather than part of the exported analysis dataset itself.
+iii. The AI’s notes justify the optional plotting as a sanity-check tool in Step 7, but there is no explicit justification that this processing is needed for the final exported dataset.

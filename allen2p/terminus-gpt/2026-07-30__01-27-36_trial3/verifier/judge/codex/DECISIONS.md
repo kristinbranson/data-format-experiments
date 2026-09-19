@@ -2,9 +2,9 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI loads all available local NWB files by globbing `data/visual-behavior-ophys-1.1.0/behavior_ophys_experiments/*.nwb`. Each file is opened with `pynwb`, converted to an AllenSDK `BehaviorOphysExperiment`, and then processed one-by-one. It does not use `VisualBehaviorOphysProjectCache` or the project experiment table to discover the full VisualBehavior dataset.
+i. The agent loads all locally available `.nwb` files from `data/visual-behavior-ophys-1.1.0/behavior_ophys_experiments/`, opens each file with `pynwb`, and constructs an AllenSDK `BehaviorOphysExperiment` from the NWB object. It does not use `VisualBehaviorOphysProjectCache` or the experiment table as the primary loader.
 
-ii. 
+ii.
 ```python
 DATA_ROOT = Path('data/visual-behavior-ophys-1.1.0')
 NWB_DIR = DATA_ROOT / 'behavior_ophys_experiments'
@@ -26,29 +26,30 @@ for i, p in enumerate(files, 1):
     sess = build_session(exp, image_to_idx, run_edges, pupil_edges, outcome_to_idx)
 ```
 
-iii. The justification is explicit in `CONVERSION_NOTES.md`: the agent decided that the local `behavior_ophys_experiments/` folder is a subset of the larger release and that conversion should operate on the locally available NWB files only. The trajectory repeats that decision and treats file-by-file NWB loading as the canonical input source.
+iii. In `CONVERSION_NOTES.md`, the agent explicitly justified converting "only locally available NWB experiment files" because the metadata tables described a larger release than the files actually present locally. The trajectory also shows an early decision to avoid fetching absent experiments and to operate directly on the local subset.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are inferred from each loaded experiment's metadata. After all files are processed, the AI forms `subjects` as the sorted set of session-level `mouse_id` values and builds `subject_idx` from that mapping.
+i. Subjects are split using `mouse_id` read from each experiment's metadata. After all sessions are processed, unique mouse IDs are collected into a sorted subject list, and each session is assigned an index into that list.
 
-ii. 
+ii.
 ```python
 meta = exp.metadata if isinstance(exp.metadata, dict) else {}
 mouse_id = str(meta.get('mouse_id', 'unknown'))
-
+...
 subjects = sorted({s['mouse_id'] for s in sessions})
 subject_to_idx = {s: i for i, s in enumerate(subjects)}
+...
 'subject_idx': np.array([subject_to_idx[s['mouse_id']] for s in sessions], dtype=np.int64),
 ```
 
-iii. The notes say the mapping for `subjects / subject_idx` should come from metadata `mouse_id`, and the final code follows that plan.
+iii. The notes describe mapping `metadata mouse_id` to `subjects / subject_idx`, and the trajectory shows the agent treating `mouse_id` as the canonical subject identifier exposed by AllenSDK metadata.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each NWB file is treated as one session. The AI does not group multiple experiments by `ophys_session_id`; instead, file order defines session order in the output.
+i. Each `.nwb` file is treated as one session. The code does not group multiple experiments by `ophys_session_id`; instead, each loaded experiment object becomes one output session entry.
 
-ii. 
+ii.
 ```python
 def list_session_files(sample=False):
     files = sorted(NWB_DIR.glob('*.nwb'))
@@ -61,55 +62,60 @@ for i, p in enumerate(files, 1):
     sessions.append(sess)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 2 describes the local data as “one file per available ophys experiment,” and the trajectory consistently uses file-level processing rather than reconstructing multi-plane sessions from metadata.
+iii. `CONVERSION_NOTES.md` says the raw data are "one file per available ophys experiment" and that conversion should "operate on the locally available NWB files only." The agent therefore operationalized "session" as one locally available NWB experiment file.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials come from `exp.trials`. The AI filters that table with `valid_trials_table`, then for each remaining row takes all ophys timestamps satisfying `start_time <= ts < stop_time`. Each such slice becomes one trial.
+i. Trials are split using the AllenSDK `exp.trials` table. For each kept trial, the code uses `start_time` and `stop_time` (or `end_time` if needed) to select the ophys timestamps within that interval and slices all per-trial signals with that mask.
 
-ii. 
+ii.
 ```python
-def valid_trials_table(trials):
-    df = trials.copy()
-    ...
-    return df.reset_index(drop=True)
-
 trials = valid_trials_table(exp.trials)
-
+...
 for _, tr in trials.iterrows():
     start = float(tr['start_time'])
     stop = float(tr['stop_time']) if 'stop_time' in tr.index else float(tr['end_time'])
     idx = np.flatnonzero((ts >= start) & (ts < stop))
     if idx.size < 2:
         continue
+    trial_ts = ts[idx]
+    trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
 ```
 
-iii. The notes and trajectory say trial segmentation should use experiment-defined trial intervals from the SDK trial table. The code implements that directly.
+iii. The notes state "Trial segmentation: Use experiment-defined trial intervals from the trial table" and the trajectory repeatedly describes segmentation by experiment-defined trials while aligning everything to `ophys_timestamps`.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI removes trials marked `aborted`, `auto_rewarded`, `auto_rewarded_trial`, or `is_auto_rewarded`, and then keeps only `go` or `catch` trials if those columns exist. It also drops trials with fewer than two ophys frames. It does not explicitly require non-null `change_time`.
+i. Trials are filtered by excluding rows marked as aborted or auto-rewarded across several possible column names, then keeping only go/catch trials when the relevant columns are present. Trials with fewer than 2 ophys frames are skipped. The code does not explicitly require non-null `change_time`, and it does not explicitly drop sessions with fewer than 2 valid trials.
 
-ii. 
+ii.
 ```python
-for col in ['aborted', 'auto_rewarded', 'auto_rewarded_trial', 'is_auto_rewarded']:
-    if col in df.columns:
-        df = df[~df[col].fillna(False)]
-if 'go' in df.columns and 'catch' in df.columns:
-    keep = df['go'].fillna(False) | df['catch'].fillna(False)
+def valid_trials_table(trials):
+    df = trials.copy()
+    for col in ['aborted', 'auto_rewarded', 'auto_rewarded_trial', 'is_auto_rewarded']:
+        if col in df.columns:
+            df = df[~df[col].fillna(False)]
+    keep = None
+    if 'go' in df.columns and 'catch' in df.columns:
+        keep = df['go'].fillna(False) | df['catch'].fillna(False)
+    elif 'trial_type' in df.columns:
+        keep = df['trial_type'].astype(str).str.lower().isin(['go', 'catch'])
+    if keep is not None:
+        df = df[keep]
+    return df.reset_index(drop=True)
 ...
 idx = np.flatnonzero((ts >= start) & (ts < stop))
 if idx.size < 2:
     continue
 ```
 
-iii. The stated justification in the notes is to include Go and Catch trials and exclude Aborted and Auto-rewarded trials per the task instructions. The extra column-name fallbacks suggest a robustness-oriented choice for schema variation. No separate justification is given for omitting a `change_time` validity check.
+iii. The notes say "include Go and Catch trials, exclude Aborted and Auto-rewarded trials." The trajectory also shows the agent explicitly reconciling the task instruction with the trial table fields and choosing a tolerant implementation that handles several possible auto-reward column names.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The final neural signal is derived from `exp.dff_traces['dff']`.
+i. The final neural data are derived from `exp.dff_traces`, specifically the `dff` column of the DataFrame returned by AllenSDK.
 
-ii. 
+ii.
 ```python
 def get_cell_matrix(exp):
     dff = exp.dff_traces.copy()
@@ -120,41 +126,45 @@ def get_cell_matrix(exp):
         return mat, cell_ids, 'dff'
 ```
 
-iii. The trajectory shows the agent originally considered events, then switched to dF/F after observing that event traces were extremely sparse in this local subset. `CONVERSION_NOTES.md` Step 7 also says verification passed “after switching neural data to dF/F.”
+iii. The notes document that the agent initially preferred detected events to match the paper, but the trajectory shows that after debugging sparsity and poor decoder behavior it switched to dF/F traces and recorded that switch in the notes.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI stacks all per-cell dF/F traces from one NWB experiment into a dense `neurons x time` matrix, then slices that matrix into trial windows. There is no additional normalization, denoising, or multi-plane merging.
+i. The code converts each cell's dF/F trace to `float32`, stacks cells into a neuron-by-time matrix, and then slices that session-level matrix into per-trial matrices using the trial timestamp mask. No extra normalization, denoising, or temporal rebinning is applied.
 
-ii. 
+ii.
 ```python
 traces = [np.asarray(v, dtype=np.float32) for v in dff['dff'].values]
 mat = np.stack(traces, axis=0)
 ...
 trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
+session_neural.append(trial_neural)
 ```
 
-iii. The documented justification is pragmatic rather than paper-faithful: the trajectory says the agent forced dF/F because events were too sparse for decoder training, and the notes explicitly mention the switch from events to dF/F during debugging.
+iii. The notes describe the implemented script as using AllenSDK `BehaviorOphysExperiment` with ophys-timestamp alignment and per-trial slicing, and the trajectory shows the switch from events to dF/F was motivated by sample verification and decoder performance.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No additional neuron-level quality filtering is applied in the conversion script. Every cell present in `dff_traces` is used.
+i. No additional neural quality filtering is applied in the conversion script. All cells present in `exp.dff_traces` are kept.
 
-ii. 
+ii.
 ```python
-if isinstance(dff, pd.DataFrame) and 'dff' in dff.columns:
-    cell_ids = np.asarray(dff.index)
-    traces = [np.asarray(v, dtype=np.float32) for v in dff['dff'].values]
-    mat = np.stack(traces, axis=0)
+def get_cell_matrix(exp):
+    dff = exp.dff_traces.copy()
+    if isinstance(dff, pd.DataFrame) and 'dff' in dff.columns:
+        cell_ids = np.asarray(dff.index)
+        traces = [np.asarray(v, dtype=np.float32) for v in dff['dff'].values]
+        mat = np.stack(traces, axis=0)
+        return mat, cell_ids, 'dff'
 ```
 
-iii. No explicit neural QC rule is implemented. The notes only say to rely on the data exposed by `BehaviorOphysExperiment` unless additional reference filtering is confirmed.
+iii. In the notes, neuron-quality rules were left unresolved and no later step added an explicit filter. The trajectory likewise contains no later neuron curation pass beyond choosing dF/F instead of events.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural activity is aligned to the ophys timestamps inside each trial window. For a given trial, the AI takes all ophys frames between `start_time` and `stop_time`, so trial arrays begin at trial start rather than at `change_time`.
+i. The neural data are aligned to the ophys time base by selecting frames whose `ophys_timestamps` fall within each trial's start and stop times. The code keeps the original ophys frame positions rather than re-centering time around a within-trial event.
 
-ii. 
+ii.
 ```python
 ts = np.asarray(exp.ophys_timestamps, dtype=float)
 ...
@@ -165,83 +175,98 @@ trial_ts = ts[idx]
 trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
 ```
 
-iii. The notes repeatedly state that `ophys_timestamps` are the master clock. The metadata field `temporal_alignment_event` was set to “ophys timestamps within experiment-defined trial window,” which matches that design.
+iii. The notes repeatedly state that `ophys_timestamps` are the master clock and that all streams should be aligned to the ophys time base, which is the alignment strategy the code implements.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The AI keeps the native ophys frame rate and records `time_bin_size` as the median difference between consecutive ophys timestamps from the first file. No temporal rebinning is applied to neural data.
+i. The temporal resolution is the native ophys frame spacing, estimated as the median difference between consecutive `ophys_timestamps` in the first file. No temporal rebinning is applied.
 
-ii. 
+ii.
 ```python
 dt_ms = float(np.median(np.diff(load_experiment(files[0]).ophys_timestamps)) * 1000.0)
 ...
 'time_bin_size': dt_ms,
 ```
 
-iii. The notes and code both treat ophys timestamps as the canonical time base, so keeping the native resolution is the intended behavior.
+iii. The notes say the agent would use `ophys_timestamps` as the master clock. The trajectory shows the agent debugging representation issues without adding any extra temporal aggregation step.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. Image identity is derived from `exp.stimulus_presentations['image_name']`, not from trial-table fields like `initial_image_name` or `change_image_name`.
+i. Image identity is derived from `exp.stimulus_presentations`, especially the `image_name` and `start_time` columns. The code defines each stimulus interval as `start_time + 0.75` seconds and uses that table rather than the trials table's `initial_image_name` / `change_image_name`.
 
-ii. 
+ii.
 ```python
 stim = exp.stimulus_presentations.copy().sort_values('start_time')
+stim_start = np.asarray(stim['start_time'], dtype=float)
+stim_end = stim_start + 0.75
+stim = stim.copy()
+stim['_end_time'] = stim_end
 ...
 name = str(srow['image_name']) if 'image_name' in srow.index else 'blank'
 image_series[smask] = image_to_idx.get(name, image_to_idx['blank'])
 ```
 
-iii. The justification is documented in the notes and trajectory: the agent wanted image labels based on stimulus presentation intervals on the ophys clock, and later expanded those intervals to 750 ms to match the methods text more closely.
+iii. The notes explicitly planned to derive image identity from `stimulus_presentations.image_name` over image-presentation intervals, and the trajectory shows the agent changing to 750 ms image intervals after discovering that the 250 ms flash duration alone caused poor image decoding.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. The AI initializes every time bin in a trial to a `blank` class, then overwrites bins covered by overlapping stimulus-presentation intervals with the corresponding `image_name`. Stimulus intervals are extended to `start_time + 0.75`, and a global mapping from image names to integer codes is built using names seen in a probe subset plus reserved `blank` and `omitted` classes.
+i. The code builds a global image vocabulary from a probe subset of up to 8 files, adds `blank` and `omitted`, maps names to integer codes, initializes each trial as `blank`, and then fills in codes for overlapping 750 ms stimulus intervals inside the trial.
 
-ii. 
+ii.
 ```python
-image_names = set(['blank', 'omitted'])
-...
-stim_start = np.asarray(stim['start_time'], dtype=float)
-stim_end = stim_start + 0.75
-stim['_end_time'] = stim_end
-...
+def collect_global_info(files):
+    image_names = set(['blank', 'omitted'])
+    ...
+    probe_files = files[:min(8, len(files))]
+    for p in probe_files:
+        exp = load_experiment(p)
+        stim = exp.stimulus_presentations.copy()
+        if 'image_name' in stim.columns:
+            names = stim['image_name'].dropna().astype(str).unique().tolist()
+            image_names.update(names)
+    ...
+    image_values = sorted(image_names)
+    image_to_idx = {name: i for i, name in enumerate(image_values)}
+
 image_series = np.full(len(trial_ts), image_to_idx['blank'], dtype=np.int64)
 ...
 image_series[smask] = image_to_idx.get(name, image_to_idx['blank'])
-...
-image_values = sorted(image_names)
-image_to_idx = {name: i for i, name in enumerate(image_values)}
 ```
 
-iii. The explicit comment in `collect_global_info` says the agent estimated global information from a small probe subset for efficiency. The trajectory also says the 750 ms interval expansion was introduced to reduce blank dominance and better reflect the methods description of image-presentation intervals.
+iii. The notes justify a "global" categorical mapping and the trajectory shows an explicit speed optimization: only probe a small subset up front rather than loading every NWB file twice. The same debugging episode motivated the use of 750 ms intervals and the `blank` background class.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Image identity is aligned frame-by-frame on the same per-trial ophys timestamps used for the neural slices. For each stimulus interval overlapping the trial, a boolean mask on `trial_ts` is used to write image labels.
+i. Image identity is aligned frame-by-frame on the same per-trial `trial_ts` array used to slice neural activity. For each stimulus interval overlapping a trial, the code marks the ophys frames whose timestamps fall inside that interval.
 
-ii. 
+ii.
 ```python
+idx = np.flatnonzero((ts >= start) & (ts < stop))
 trial_ts = ts[idx]
-trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
 ...
-smask = (trial_ts >= s0) & (trial_ts < s1)
-image_series[smask] = image_to_idx.get(name, image_to_idx['blank'])
+stim_trial = stim[(stim['start_time'] < stop) & (stim['_end_time'] > start)]
+for _, srow in stim_trial.iterrows():
+    s0 = max(start, float(srow['start_time']))
+    s1 = min(stop, float(srow['_end_time']))
+    smask = (trial_ts >= s0) & (trial_ts < s1)
+    image_series[smask] = image_to_idx.get(name, image_to_idx['blank'])
 ```
 
-iii. The justification is the same master-clock decision: `ophys_timestamps` are used for all time-varying signals.
+iii. The notes say all time-varying streams should be aligned to `ophys_timestamps`, and the trajectory shows the agent debugging the image labeling specifically by checking how stimulus intervals overlapped the ophys frame grid.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. Image change is derived from transitions in consecutive rows of `stimulus_presentations['image_name']` within a trial, not from the trial table's `change_time` and `go` fields.
+i. Image change is derived from changes in consecutive `stimulus_presentations.image_name` values within a trial, not from `trials.change_time`. The code compares each stimulus name to the immediately previous stimulus name seen in that trial.
 
-ii. 
+ii.
 ```python
+change_series = np.zeros(len(trial_ts), dtype=np.int64)
 stim_trial = stim[(stim['start_time'] < stop) & (stim['_end_time'] > start)]
 prev_name = None
 for _, srow in stim_trial.iterrows():
     ...
     name = str(srow['image_name']) if 'image_name' in srow.index else 'blank'
+    ...
     if prev_name is not None and name != prev_name:
         hit = np.flatnonzero(smask)
         if hit.size:
@@ -249,13 +274,13 @@ for _, srow in stim_trial.iterrows():
     prev_name = name
 ```
 
-iii. No separate written justification is given beyond the general choice to derive stimulus labels from `stimulus_presentations` on the ophys clock.
+iii. The notes planned to derive image change from image identity transitions, and the trajectory shows the agent pivoting toward stimulus-interval labeling after inspecting the stimulus table and the paper's 750 ms interval description.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. The AI starts with an all-zero vector and sets a single frame to `1` at the first frame of any overlapping stimulus interval whose `image_name` differs from the previous overlapping stimulus interval.
+i. The code starts with an all-zero vector and sets a `1` at the first ophys frame of a stimulus interval whenever that interval's image name differs from the previous interval's image name within the same trial.
 
-ii. 
+ii.
 ```python
 change_series = np.zeros(len(trial_ts), dtype=np.int64)
 ...
@@ -265,26 +290,28 @@ if prev_name is not None and name != prev_name:
         change_series[hit[0]] = 1
 ```
 
-iii. The code implies a “mark the transition point” interpretation of change. The trajectory frames this as an image-identity transition signal rather than a `go`-trial change window.
+iii. The notes frame image change as a time-varying binary output derived from image transitions. The trajectory indicates the agent wanted an event-like signal tied to the start of a changed image interval.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. It is represented as a binary categorical variable with values `0 = no_change` and `1 = change`. There is no additional thresholding step.
+i. There is no numeric thresholding step. The output is directly converted into two categories, `no_change` and `change`, by keeping the vector binary: 0 everywhere except the marked frame(s) at the start of changed stimulus intervals.
 
-ii. 
+ii.
 ```python
 change_series = np.zeros(len(trial_ts), dtype=np.int64)
 ...
-'output_values': [image_values, ['no_change', 'change'], ...]
+change_series[hit[0]] = 1
+...
+'output_values': [image_values, ['no_change', 'change'], [f'bin_{i}' for i in range(5)], [f'bin_{i}' for i in range(5)], TRIAL_OUTCOME_VALUES],
 ```
 
-iii. The justification is implicit in the decoder target itself: image change is treated as a binary output.
+iii. The notes explicitly planned a binary time-varying image-change signal. The trajectory does not show any later threshold refinement beyond this binary event coding.
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. It is aligned on the same `trial_ts` grid as the neural data and image-identity output, using per-trial boolean masks derived from ophys timestamps.
+i. Image change is aligned on the same per-trial ophys timestamps as the neural data. The code computes `smask` on `trial_ts`, then writes change labels into the matching frames of `change_series`.
 
-ii. 
+ii.
 ```python
 trial_ts = ts[idx]
 trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
@@ -294,13 +321,13 @@ smask = (trial_ts >= s0) & (trial_ts < s1)
 change_series[hit[0]] = 1
 ```
 
-iii. The notes consistently justify time-varying outputs by direct alignment to `ophys_timestamps`.
+iii. The notes say all outputs should be aligned on the ophys clock, and the trajectory's image-label debugging centered on fixing the per-frame alignment against `trial_ts`.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. Running speed comes from `exp.running_speed`, using one timestamp column and one value column selected by `get_running_series`.
+i. Running speed is derived from `exp.running_speed`, using one column for timestamps and one for speed. The code will fall back to the first two DataFrame columns if the standard names are absent.
 
-ii. 
+ii.
 ```python
 def get_running_series(run_df):
     cols = list(run_df.columns)
@@ -309,124 +336,139 @@ def get_running_series(run_df):
     return np.asarray(run_df[tcol], dtype=float), np.asarray(run_df[vcol], dtype=float)
 ```
 
-iii. This follows the notes’ plan to use the SDK running-speed stream and align it to ophys timestamps.
+iii. The notes map `running_speed` directly to a time-varying decoder output and the trajectory shows the agent implementing defensive column selection to tolerate AllenSDK table differences.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. The AI collects running values from only the first up to eight files to estimate global bin edges, computes 20/40/60/80% quantiles with `np.quantile`, then linearly interpolates each trial’s running speed onto `trial_ts` and discretizes the interpolated values with `np.digitize`.
+i. The code gathers running values from up to 8 probe files to estimate 5-bin quantile edges, then linearly interpolates the running speed onto each trial's ophys timestamps with `np.interp` and discretizes each frame into those bins.
 
-ii. 
+ii.
 ```python
 probe_files = files[:min(8, len(files))]
 ...
-run_all = np.concatenate(run_vals) if run_vals else np.array([0.0])
+rt, rv = get_running_series(exp.running_speed.copy())
+run_vals.append(rv[np.isfinite(rv)])
+...
 run_edges = np.quantile(run_all, [0, .2, .4, .6, .8, 1])
 ...
 run_interp = np.interp(trial_ts, run_t, run_v).astype(np.float32)
 run_bins = np.digitize(run_interp, run_edges[1:-1], right=False).astype(np.int64)
 ```
 
-iii. The code comment gives the justification directly: “Efficiency optimization: estimate bin edges from a small subset to avoid loading all NWB files twice.”
+iii. In the notes, the agent planned percentile binning over pooled valid samples. The trajectory later records an explicit speed optimization: estimate bin edges from a small subset rather than loading all sessions twice.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. It is discretized into five bins defined by the 0/20/40/60/80/100% quantiles of the pooled running-speed values from the probe subset.
+i. Running speed is thresholded into five quantile bins using edges at 0%, 20%, 40%, 60%, 80%, and 100% of the pooled probe-session distribution.
 
-ii. 
+ii.
 ```python
 run_edges = np.quantile(run_all, [0, .2, .4, .6, .8, 1])
 ...
 run_bins = np.digitize(run_interp, run_edges[1:-1], right=False).astype(np.int64)
 ...
-'output_values': [..., [f'bin_{i}' for i in range(5)], ...]
+[f'bin_{i}' for i in range(5)]
 ```
 
-iii. The justification is again the efficiency optimization in `collect_global_info`.
+iii. The notes explicitly say running speed should be "discretize[d] into 5 equal-percentile bins." The only extra justification in the trajectory is runtime: estimate those percentiles from a smaller subset to reduce up-front cost.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running speed is interpolated directly onto the same per-trial ophys timestamps `trial_ts` used for neural slices.
+i. Running speed is aligned directly onto the per-trial ophys timestamps with linear interpolation. The neural data and running labels then use the same frame mask for each trial.
 
-ii. 
+ii.
 ```python
+idx = np.flatnonzero((ts >= start) & (ts < stop))
 trial_ts = ts[idx]
 trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
 ...
 run_interp = np.interp(trial_ts, run_t, run_v).astype(np.float32)
+run_bins = np.digitize(run_interp, run_edges[1:-1], right=False).astype(np.int64)
 ```
 
-iii. The notes explicitly say `ophys_timestamps` are the master alignment clock for all streams.
+iii. The notes identify `ophys_timestamps` as the master clock and specifically map `running_speed` to an ophys-aligned time-varying output.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. Pupil diameter is derived from `exp.eye_tracking`, but the AI chooses the first available pupil-like numeric column from a candidate list rather than fixing the source to `pupil_width`.
+i. Pupil diameter is derived from `exp.eye_tracking`, but the code does not hard-code one field. It chooses the first available column among `pupil_diameter`, `pupil_area`, `pupil_width`, `pupil_height`, `pupil_radius`, or `pupil_size`, or another numeric pupil-like column if needed.
 
-ii. 
+ii.
 ```python
-candidate_cols = ['pupil_diameter', 'pupil_area', 'pupil_width', 'pupil_height', 'pupil_radius', 'pupil_size']
-value_col = next((c for c in candidate_cols if c in cols), None)
-if value_col is None:
-    value_col = next((c for c in cols if 'pupil' in c.lower() and np.issubdtype(eye_tracking[c].dtype, np.number)), None)
+def pick_pupil_series(eye_tracking):
+    ...
+    candidate_cols = ['pupil_diameter', 'pupil_area', 'pupil_width', 'pupil_height', 'pupil_radius', 'pupil_size']
+    value_col = next((c for c in candidate_cols if c in cols), None)
+    if value_col is None:
+        value_col = next((c for c in cols if 'pupil' in c.lower() and np.issubdtype(eye_tracking[c].dtype, np.number)), None)
+    ...
+    return np.asarray(eye_tracking[time_col], dtype=float), np.asarray(eye_tracking[value_col], dtype=float), value_col
 ```
 
-iii. No explicit written justification is given beyond schema robustness. The code clearly prefers “whatever pupil-like column exists” over a reference-specific choice.
+iii. The notes planned to use "pupil diameter / eye tracking pupil area-equivalent" and the trajectory shows this was a deliberate robustness choice because the agent was unsure which pupil column would be consistently available.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. The AI gathers finite pupil values from up to eight probe files to estimate quantile bin edges. For each trial, if at least two finite pupil samples exist, it linearly interpolates that pupil signal onto `trial_ts`; otherwise it fills the whole trial with zeros. It does not remove `likely_blink` frames.
+i. The code collects finite pupil samples from up to 8 probe files to estimate quantile edges, then linearly interpolates the selected pupil signal onto each trial's ophys timestamps. If too few valid pupil samples are available, the trial is filled with zeros. No blink filtering is applied.
 
-ii. 
+ii.
 ```python
 probe_files = files[:min(8, len(files))]
 ...
+eye = exp.eye_tracking.copy()
+pt, pv, _ = pick_pupil_series(eye)
 if pv is not None:
     pupil_vals.append(pv[np.isfinite(pv)])
 ...
 pupil_edges = np.quantile(pupil_all, [0, .2, .4, .6, .8, 1])
 ...
-valid = np.isfinite(pupil_t) & np.isfinite(pupil_v)
-if valid.sum() >= 2:
-    pupil_interp = np.interp(trial_ts, pupil_t[valid], pupil_v[valid]).astype(np.float32)
-    pupil_bins = np.digitize(pupil_interp, pupil_edges[1:-1], right=False).astype(np.int64)
+if pupil_t is not None and pupil_v is not None:
+    valid = np.isfinite(pupil_t) & np.isfinite(pupil_v)
+    if valid.sum() >= 2:
+        pupil_interp = np.interp(trial_ts, pupil_t[valid], pupil_v[valid]).astype(np.float32)
+        pupil_bins = np.digitize(pupil_interp, pupil_edges[1:-1], right=False).astype(np.int64)
+    else:
+        pupil_bins = np.zeros(len(trial_ts), dtype=np.int64)
 else:
     pupil_bins = np.zeros(len(trial_ts), dtype=np.int64)
 ```
 
-iii. The only explicit justification is the same efficiency comment for subset-based binning. The fallback-to-zero behavior is an implicit robustness choice for missing or unusable eye-tracking data.
+iii. The notes planned alignment to `ophys_timestamps` and 5-bin percentile discretization over pooled valid samples. The trajectory shows the same subset-based speed optimization used for running speed.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. It is discretized into five bins from the pooled 0/20/40/60/80/100% quantiles of finite pupil values from the probe subset.
+i. Pupil values are thresholded into five quantile bins using pooled finite values from the probe subset and `np.digitize`.
 
-ii. 
+ii.
 ```python
 pupil_edges = np.quantile(pupil_all, [0, .2, .4, .6, .8, 1])
 ...
 pupil_bins = np.digitize(pupil_interp, pupil_edges[1:-1], right=False).astype(np.int64)
 ...
-'output_values': [..., [f'bin_{i}' for i in range(5)], ...]
+[f'bin_{i}' for i in range(5)]
 ```
 
-iii. The justification is the efficiency optimization documented in `collect_global_info`.
+iii. The notes say pupil should be discretized into "5 equal-percentile bins." The trajectory indicates the agent kept that strategy but approximated the pooled distribution from a small subset for speed.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. As with running speed, pupil is aligned by interpolation onto the per-trial ophys timestamps `trial_ts`.
+i. Pupil data are aligned to neural data by interpolating the selected pupil signal onto each trial's ophys timestamps and then writing the discretized values into the same trial-length frame grid as the neural data.
 
-ii. 
+ii.
 ```python
 trial_ts = ts[idx]
+trial_neural = neural_mat[:, idx].astype(np.float32, copy=False)
 ...
 pupil_interp = np.interp(trial_ts, pupil_t[valid], pupil_v[valid]).astype(np.float32)
+pupil_bins = np.digitize(pupil_interp, pupil_edges[1:-1], right=False).astype(np.int64)
 ```
 
-iii. The code follows the notes’ master-clock decision to align all time-varying streams to ophys timestamps.
+iii. The notes consistently treat `ophys_timestamps` as the common alignment clock for all behavioral and neural signals.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. Trial outcome is derived from the boolean trial-table fields `hit`, `miss`, `false_alarm`, and `correct_reject`, with a fallback category `other`.
+i. Trial outcome is derived from the trial-table boolean columns `hit`, `miss`, `false_alarm`, and `correct_reject`. If none are true, the code assigns `other`.
 
-ii. 
+ii.
 ```python
 TRIAL_OUTCOME_VALUES = ['hit', 'miss', 'false_alarm', 'correct_reject', 'other']
 
@@ -437,40 +479,44 @@ def infer_trial_outcome(row):
     return 'other'
 ```
 
-iii. No detailed written justification is given. The fallback `other` appears to be a defensive coding choice for unexpected trial rows.
+iii. The notes planned to use the trial outcome fields from the trials table and the trajectory shows the fallback `other` category was kept as a defensive edge-case handler.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. The AI maps the inferred string outcome to an integer code and repeats that code across every frame in the trial.
+i. The inferred outcome label is mapped to an integer code using `outcome_to_idx`, and that code is repeated across every ophys frame in the trial so that outcome is represented as a static per-trial output in time-series form.
 
-ii. 
+ii.
 ```python
 outcome_to_idx = {name: i for i, name in enumerate(TRIAL_OUTCOME_VALUES)}
 ...
 outcome = infer_trial_outcome(tr)
 outcome_idx = outcome_to_idx.get(outcome, outcome_to_idx['other'])
 outcome_series = np.full(len(trial_ts), outcome_idx, dtype=np.int64)
+...
+output = np.vstack([image_series, change_series, run_bins, pupil_bins, outcome_series]).astype(np.int64)
 ```
 
-iii. The justification is implicit in the target format: the decoder expects categorical outputs, and the agent chose to make the static per-trial label time-aligned by repeating it across the trial.
+iii. The notes say trial outcome should be "static per trial," and the trajectory shows the agent encoding that by broadcasting the per-trial category over the trial's full time axis.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The script is robust to a range of schema and missing-data issues. It accepts several auto-reward column names, falls back from `stop_time` to `end_time`, chooses the first available pupil-like column, returns `(None, None, None)` if eye tracking is missing, and fills pupil bins with zeros when there are too few valid samples. For trials, it skips any with fewer than two ophys frames. It does not explicitly catch session-level load failures in the final code.
+i. The code handles missing or inconsistent fields defensively. It accepts multiple possible trial and auto-reward column names, falls back to generic running/pupil column choices, fills missing or unusable pupil traces with zeros, defaults unknown image names to `blank`, and skips trials with fewer than 2 frames. It does not use a try/except to skip failed sessions, and `np.interp` will extrapolate endpoint values rather than producing NaNs.
 
-ii. 
+ii.
 ```python
 for col in ['aborted', 'auto_rewarded', 'auto_rewarded_trial', 'is_auto_rewarded']:
     if col in df.columns:
         df = df[~df[col].fillna(False)]
 ...
-stop = float(tr['stop_time']) if 'stop_time' in tr.index else float(tr['end_time'])
+tcol = 'timestamps' if 'timestamps' in cols else cols[0]
+vcol = 'speed' if 'speed' in cols else cols[1]
 ...
-if eye_tracking is None or len(eye_tracking) == 0:
-    return None, None, None
+value_col = next((c for c in candidate_cols if c in cols), None)
+...
+image_series[smask] = image_to_idx.get(name, image_to_idx['blank'])
 ...
 if valid.sum() >= 2:
-    ...
+    pupil_interp = np.interp(...)
 else:
     pupil_bins = np.zeros(len(trial_ts), dtype=np.int64)
 ...
@@ -478,79 +524,88 @@ if idx.size < 2:
     continue
 ```
 
-iii. The notes and trajectory show a repeated concern with handling the “local subset” and schema variation. The code reflects that through multiple fallbacks, but the final script no longer has the broader `try/except` session-skip behavior that earlier trajectory versions discussed.
+iii. The notes and trajectory both show the agent emphasizing robustness to dataset/schema variation. The strongest explicit justification in the trajectory is that the local data and metadata were not perfectly matched, so the agent favored tolerant loaders and fallbacks.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. The expensive steps are repeated NWB loading with `load_experiment`, building `BehaviorOphysExperiment` objects, and then the per-session/per-trial output construction in `build_session`.
+i. The most time-consuming work is repeatedly opening NWB files and constructing `BehaviorOphysExperiment` objects, then iterating through all trials and stimulus intervals per session. The code also incurs a large final serialization cost when writing the full pickle.
 
-ii. 
+ii.
 ```python
 for p in probe_files:
     exp = load_experiment(p)
-    ...
-
+...
 for i, p in enumerate(files, 1):
     exp = load_experiment(p)
     sess = build_session(exp, image_to_idx, run_edges, pupil_edges, outcome_to_idx)
+...
+with open(args.outpicklefile, 'wb') as f:
+    pickle.dump(data, f)
 ```
 
-iii. The notes discuss runtime and the code contains an explicit optimization comment about avoiding loading all NWB files twice, which implies that file I/O and session construction were identified as the bottleneck.
+iii. The trajectory explicitly discusses startup cost from `collect_global_info(files)` and later records a 14 GB output file and a long save/finalization step, so the agent clearly understood I/O and session loading as the main runtime bottlenecks.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The main non-vectorized loops are the session loop, the per-trial loop inside each session, and the nested loop over overlapping stimulus rows inside each trial. The repeated boolean-mask construction for every stimulus interval is especially vectorizable.
+i. The code contains several Python-level loops that could have been vectorized or pre-indexed: the per-trial loop over `trials.iterrows()`, the nested loop over overlapping stimulus presentations inside each trial, and the probe-file loop used to estimate global bin edges.
 
-ii. 
+ii.
 ```python
-for i, p in enumerate(files, 1):
-    ...
-
 for _, tr in trials.iterrows():
     ...
     for _, srow in stim_trial.iterrows():
-        smask = (trial_ts >= s0) & (trial_ts < s1)
+        ...
+
+for p in probe_files:
+    exp = load_experiment(p)
 ```
 
-iii. No explicit justification is given for leaving these loops as-is. The only explicit performance decision the AI documented was subset-based quantile estimation.
+iii. The notes leave the "Code inefficiencies identified" section blank, but the trajectory repeatedly focuses on runtime, especially the up-front probe pass and the session-by-session loop. That provides indirect evidence that the agent knew these loops were the places where efficiency was being traded against simplicity.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. The AI repeats data loading and some per-session work. It loads a probe subset in `collect_global_info`, then loads every file again for full conversion, and then re-loads the first file a third time just to compute `time_bin_size`. It also repeatedly filters `stim` per trial.
+i. The code repeats session loading at least twice for some files: once in `collect_global_info()` for up to 8 probe files, again in the main conversion loop, and once more for the first file when estimating `time_bin_size`. It also repeatedly filters the stimulus table per trial.
 
-ii. 
+ii.
 ```python
+probe_files = files[:min(8, len(files))]
 for p in probe_files:
     exp = load_experiment(p)
-    ...
-
+...
 for i, p in enumerate(files, 1):
     exp = load_experiment(p)
-    ...
-
+...
 dt_ms = float(np.median(np.diff(load_experiment(files[0]).ophys_timestamps)) * 1000.0)
 ...
 stim_trial = stim[(stim['start_time'] < stop) & (stim['_end_time'] > start)]
 ```
 
-iii. The subset pass is explicitly justified by an efficiency comment, but it still repeats loading work relative to a single-pass design. The reload of the first file for `dt_ms` has no separate justification.
+iii. The trajectory directly mentions this as a speed issue: the agent changed `collect_global_info` so it would not load every session twice, but it still accepted a smaller amount of repeated loading as a runtime compromise.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. Several values are computed but not used downstream: `stim_start`, `pupil_col`, `image_names_seen`, `trial_outcomes_seen`, and `neural_source` are collected or returned but never affect the saved outputs. The command-line flag `--show-processing` is parsed but unused.
+i. The code computes and stores several pieces of information that are not used in the final saved dataset: `image_names_seen`, `trial_outcomes_seen`, `neural_source`, and `cell_ids` inside each session dict; the chosen `pupil_col`; and the `--show-processing` argument, which is parsed but never used. It also defaults unknown images to `blank`, which can silently discard information.
 
-ii. 
+ii.
 ```python
-stim_start = np.asarray(stim['start_time'], dtype=float)
+ap.add_argument('--show-processing', action='store_true', help='Save processing plots for up to 2 sessions')
 ...
 pupil_t, pupil_v, pupil_col = pick_pupil_series(eye)
 ...
 image_names_seen = []
 trial_outcomes_seen = []
 ...
-'neural_source': neural_source,
-'image_names_seen': sorted(set(image_names_seen)),
-'trial_outcomes_seen': sorted(set(trial_outcomes_seen)),
+return {
+    'neural': session_neural,
+    'input': session_input,
+    'output': session_output,
+    'cell_ids': cell_ids,
+    'neural_source': neural_source,
+    'image_names_seen': sorted(set(image_names_seen)),
+    'trial_outcomes_seen': sorted(set(trial_outcomes_seen)),
+    'targeted_structure': targeted_structure,
+    'mouse_id': mouse_id,
+}
 ```
 
-iii. No explicit justification is documented. These look like remnants of intermediate debugging or bookkeeping rather than parts of the final converted representation.
+iii. There is no explicit written justification for these extra computations. The trajectory suggests they were mostly debugging or bookkeeping conveniences added while iterating on the conversion.

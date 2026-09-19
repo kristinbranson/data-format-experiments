@@ -2,147 +2,147 @@
     "1-a": {
         "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
         "decision_correctness": "OK",
-        "decision_correctness_justification": "The AI uses joblib files instead of .mat files with h5py. Both data sources contain the same underlying data (trace, position, blocked, envs). The joblib format provides pre-organized numpy arrays, making loading simpler. The AI also hard-codes the animal names list rather than discovering files via glob, but this produces the same result. The choice of data source is equally valid.",
+        "decision_correctness_justification": "The AI uses joblib.load on the extensionless data files, while the human reference uses h5py on the .mat files. Both approaches load the same underlying data (trace, position, blocked/envs) for the same 7 animals. The choice of file format is a valid alternative since both are available in the data directory and contain equivalent information. The AI's approach is arguably simpler since joblib returns native NumPy arrays directly.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly loads joblib files, extracts the animal's data dict, and accesses trace, position, and envs arrays with correct shapes and indexing."
+        "code_correctness_justification": "The code correctly uses joblib.load to load each animal file and accesses the data dictionary with the animal name as key. The data structure (trace, position, envs, blocked) is correctly accessed."
     },
     "1-b": {
         "question": "How are the data split into subjects (mice)?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference treat each file as one subject. The AI hard-codes the 7 animal names while the reference discovers them via glob, but the result is the same 7 subjects.",
+        "decision_correctness_justification": "Both the AI and reference treat each animal file as one subject. The AI hardcodes the 7 animal names while the reference uses glob to find .mat files, but both process the same 7 subjects in the same order (alphabetical).",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly iterates over the ANIMALS list, loads each file, and assigns sequential subject indices."
+        "code_correctness_justification": "The code correctly iterates over all 7 animals, assigns sequential subject indices, and builds the subjects list."
     },
     "1-c": {
         "question": "How are the data split into sessions?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference treat each recording day within a subject as a separate session. The AI iterates over the first dimension of the trace array (n_days), matching the reference which iterates over trace_refs.",
+        "decision_correctness_justification": "Both the AI and reference treat each recording day as a separate session. The AI iterates over the days dimension of the trace array, and the reference iterates over references in the .mat file. Both produce the same session structure.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly iterates over days (d['trace'].shape[0]) and creates a separate session for each day, producing 207 total sessions matching the reference."
+        "code_correctness_justification": "The code correctly iterates over n_days and extracts per-day trace, position, and environment data for each session."
     },
     "1-d": {
         "question": "How are the data split into trials?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference split sessions into 1-minute (1800 frame) non-overlapping trials and discard remainder frames. The trial length and splitting logic are identical.",
+        "decision_correctness_justification": "Both the AI and reference split each session into non-overlapping 60-second (1800 frame at 30 Hz) segments, discarding any remainder frames. The implementation is functionally identical.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly computes n_trials = n_timepoints // FRAMES_PER_TRIAL and creates trials with the correct frame ranges."
+        "code_correctness_justification": "The code correctly computes n_trials = n_timepoints // FRAMES_PER_TRIAL and slices both neural and position data using the same frame indices."
     },
     "1-e": {
         "question": "How are trials filtered based on quality controls?",
-        "decision_correctness": "OK",
-        "decision_correctness_justification": "The AI adds two quality filters (minimum 5 neurons, minimum 2 trials per session) that the reference does not have. However, neither filter triggers on the actual data since all sessions have hundreds of neurons and 39-40 trials. The reference applies no trial-level quality filtering either. Both produce the same 207 sessions.",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI adds two session-level filters not present in the reference: (1) skip sessions with <5 registered cells, and (2) skip sessions with <2 possible trials. The reference applies no such filtering. While the <2 trials filter is somewhat justified by the instructions ('at least two trials within each session'), the <5 cells filter is an arbitrary quality control threshold not specified in the instructions or the paper. In practice, neither filter removes any data because all sessions have hundreds of neurons and ~40 trials, but the addition of arbitrary thresholds is a concerning pattern.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The quality filter code is correctly implemented. It checks n_registered < 5 and n_trials < 2 before processing, and correctly skips sessions that fail these checks (though none do in practice)."
+        "code_correctness_justification": "The code correctly implements the described filtering logic with the continue statements."
     },
     "2-a": {
         "question": "What variables in the raw data is the `neural` data derived from?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference derive neural data from the 'trace' variable, which contains calcium transient event data.",
+        "decision_correctness_justification": "Both the AI and reference use the trace variable from the data files. The AI accesses it as d['trace'][day] from the joblib file, while the reference accesses it via h5py references, but both obtain the same binary calcium transient data.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly accesses d['trace'][day] to get per-day neural traces."
+        "code_correctness_justification": "The code correctly accesses trace_day = d['trace'][day] which gives the (n_cells, n_timepoints) array for each day."
     },
     "2-b": {
         "question": "How is the `neural` data processed?",
-        "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference filter out all-NaN neurons and cast to float32. The AI additionally replaces remaining NaN with 0 via np.nan_to_num, which is a minor difference. The trace data is already in (n_cells, n_timepoints) format in the joblib files, so the AI does not need to transpose (the reference transposes from the .mat format which stores as (timepoints, neurons)).",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI adds np.nan_to_num(traces, nan=0.0) to replace remaining NaN values with 0, which the reference does not do. While the AI describes this as a 'safety' measure, replacing NaN with 0 changes the semantics: a missing data point becomes 'no neural activity.' The reference leaves the data as-is after filtering all-NaN neurons. In practice, after filtering all-NaN neurons, remaining individual NaN values should be extremely rare, so the impact is likely minimal. However, silently replacing missing data with zeros rather than flagging or handling it explicitly is a concerning practice.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly filters NaN neurons, replaces remaining NaN, and produces float32 arrays of shape (n_registered, n_timepoints)."
+        "code_correctness_justification": "The code correctly implements what is described: filtering all-NaN neurons, replacing remaining NaN with 0, and casting to float32."
     },
     "2-c": {
         "question": "How is the `neural` data filtered based on quality controls?",
-        "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference filter neurons by removing those with all-NaN traces (unregistered neurons). The AI checks along axis=1 (time dimension when data is (n_cells, n_timepoints)), the reference checks along axis=0 (time dimension when data is (timepoints, neurons)). Both achieve the same result.",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI's filtering of all-NaN neurons matches the reference. However, the additional np.nan_to_num step goes beyond what the reference does. While practically harmless (few if any non-all-NaN neurons should have individual NaN values), this adds processing not present in the reference and not described in the paper or instructions.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly identifies registered neurons with ~np.all(np.isnan(trace_day), axis=1) and keeps only those neurons."
+        "code_correctness_justification": "The code correctly identifies registered cells using ~np.all(np.isnan(trace_day), axis=1) and filters them."
     },
     "2-d": {
         "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference agree there is no event-based alignment. Trials are sequential 1-minute segments from the start of each session.",
+        "decision_correctness_justification": "Both the AI and reference correctly identify that there is no event-based alignment. Trials are consecutive segments of a continuous recording with no stimulus onset or behavioral event to align to.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "No alignment code is needed or present; sequential trial slicing is correctly implemented."
+        "code_correctness_justification": "No alignment code is needed or implemented, which is correct for this dataset."
     },
     "2-e": {
         "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference keep the native 30 Hz frame rate (~33.33 ms time bins) with no rebinning.",
+        "decision_correctness_justification": "Both the AI and reference keep the native 30 Hz frame rate (~33.33 ms time bin) with no rebinning applied.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly sets time_bin_size = 1000.0 / 30 and does not apply any temporal rebinning."
+        "code_correctness_justification": "The code correctly sets FPS=30 and time_bin_size=1000.0/FPS in the metadata."
     },
     "3-a": {
         "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
-        "decision_correctness": "CONCERNING",
-        "decision_correctness_justification": "The AI derives environment geometry from the 'envs' variable (environment names mapped through a lookup table), while the reference derives it from the 'blocked' variable (numeric indices of blocked positions). Both variables are present in the data and encode related information, but the AI's approach introduces a spatial orientation error: the pre-defined env_mat matrices in get_env_mat() have vertically flipped row ordering compared to the blocked indices for 4 out of 10 asymmetric environments (t, l, bit donut, glenn). This creates a mismatch between the input geometry and the output position bins for those environments.",
-        "code_correctness": "INCORRECT",
-        "code_correctness_justification": "The get_env_mat() lookup table has vertically flipped row ordering for asymmetric environments (t, l, bit donut, glenn) compared to the actual spatial layout defined by the blocked indices. For example, for 't', blocked indices {3,5,6,8} indicate the open shape is top-heavy (top row all open), but get_env_mat('t') returns a bottom-heavy matrix [[0,1,0],[0,1,0],[1,1,1]]. This means the input geometry does not correctly correspond to the spatial position bins for ~40% of environments."
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI uses the envs variable (environment name strings like 'square', 'o', 't') and maps them to geometry matrices using get_env_mat(), which is taken directly from the paper's reference code (utils.py). The human reference uses the blocked variable (indices of blocked positions) with encode_blocked(). Both derive the same spatial information about which grid positions are open/blocked, but from different raw variables. The AI's approach follows the paper's own code convention.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads env_name from d['envs'][day, 0] and passes it to get_env_mat() which returns the correct 3x3 matrix for each environment."
     },
     "3-b": {
         "question": "What processing is involved in computing `input` *Environment geometry*?",
         "decision_correctness": "CONCERNING",
-        "decision_correctness_justification": "The AI uses 1=open, 0=blocked encoding while the reference uses 1=blocked, 0=elsewhere. Both are valid representations that carry equivalent information for a decoder. However, combined with the spatial orientation error in the env_mat definitions, the input encoding is problematic for asymmetric environments. The choice to represent open vs blocked differently is acceptable in principle, but the implementation has the orientation bug.",
-        "code_correctness": "INCORRECT",
-        "code_correctness_justification": "The env_mat lookup table produces spatially incorrect geometry for 4 out of 10 environments due to vertical row flipping, as verified by comparing get_env_mat() outputs against the actual blocked position indices from the data."
+        "decision_correctness_justification": "The AI's encoding uses 1=open, 0=blocked (from get_env_mat), while the reference uses 1=blocked, 0=open (from encode_blocked). These are inverted representations of the same information. The instructions say 'Environment geometry to represent which part of the arena is blocked,' which more directly aligns with the reference's 1=blocked encoding. The AI's 1=open encoding follows the paper's code convention but is semantically inverted relative to the instructions. While the decoder can learn either representation, this polarity difference means the input semantics differ from the reference. Additionally, the input_names in the AI's code are 'grid_r_c' (spatial position names) while the reference uses 'blocked_i' (blocked position indices), reflecting the different encoding conventions.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements the get_env_mat function with the 1=open, 0=blocked convention and flattens the 3x3 matrix to a 9-element vector."
     },
     "4-a": {
         "question": "What variables in the raw data is `output` *Mouse position* derived from?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference derive position from the 'position' variable containing 2D (x, y) coordinates.",
+        "decision_correctness_justification": "Both the AI and reference use the position variable containing 2D (x, y) coordinates of the mouse.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly accesses d['position'][day] to get 2D position data."
+        "code_correctness_justification": "The code correctly accesses pos_day = d['position'][day] which gives the (2, n_timepoints) array."
     },
     "4-b": {
         "question": "What processing is involved in computing `output` *Mouse position*?",
         "decision_correctness": "CONCERNING",
-        "decision_correctness_justification": "The AI uses x_bin * n_bins + y_bin for bin indexing while the reference uses y_bin * n_grid + x_bin. This produces a transposed spatial ordering of the 9 position bins. Both are valid 3x3 discretizations of the same positions, but they assign different bin indices to the same physical locations. On its own this would be fine (just a labeling convention), but combined with the env_mat orientation issue, it creates additional inconsistency between inputs and outputs.",
+        "decision_correctness_justification": "Both AI and reference discretize the 2D position into a 3x3 grid, but with different axis ordering. The AI uses x_bin * n_bins + y_bin (x as row index) while the reference uses y_bin * n_grid + x_bin (y as row index). This means bin assignments will differ between the two implementations for positions not on the diagonal. While the decoder can learn either convention (as long as it's internally consistent), this produces different bin labels for the same physical locations compared to the reference. The discretization method itself (floor-based vs digitize-based) is functionally equivalent.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The discretization code correctly clips positions to arena bounds, computes bins using floor division with 25 cm bin size, and produces valid bin indices 0-8. The code correctly implements its stated decision (x_bin * n_bins + y_bin), even though this differs from the reference convention."
+        "code_correctness_justification": "The code correctly implements the described x_bin * n_bins + y_bin formula with proper clipping and floor-based binning."
     },
     "4-c": {
         "question": "How is `output` *Mouse position* thresholded into categories?",
-        "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference divide the 75 cm arena into 3 equal 25 cm bins per axis, producing 9 categories. The AI uses np.floor(coord / bin_size) while the reference uses np.digitize with np.linspace edges. Both methods produce equivalent bin assignments.",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "Both approaches produce 9 categories (0-8) from the 3x3 grid. The AI clips positions to [0, arena_size - 1e-10] before flooring, while the reference uses np.digitize with linspace edges and clips the result. Both handle edge cases correctly and produce valid bin indices. The methods are functionally equivalent.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code correctly computes bin_size = 75/3 = 25 cm, clips coordinates, and uses np.floor for binning with proper boundary handling."
+        "code_correctness_justification": "The code correctly clips coordinates, computes floor-based bins, and produces valid categorical indices in the range 0-8."
     },
     "4-d": {
         "question": "How is `output` *Mouse position* aligned with the neural data?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference rely on the native 30 Hz synchronization of position and neural data, splitting both with the same frame indices.",
+        "decision_correctness_justification": "Both the AI and reference rely on the fact that neural and position data share the same 30 Hz timebase and are sliced into trials using identical frame indices.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The code uses the same start:end frame indices to slice both neural traces and position bins within the trial loop."
+        "code_correctness_justification": "The code uses the same start:end indices to slice both traces and position bins, ensuring alignment."
     },
     "5": {
         "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-        "decision_correctness": "OK",
-        "decision_correctness_justification": "The AI handles all-NaN neurons the same as the reference. Additionally, it replaces remaining NaN values with 0 (np.nan_to_num), which the reference does not do. This is a reasonable safety measure that should not affect results if no partial-NaN neurons exist. Both discard remainder frames at session end.",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI handles missing data more aggressively than the reference: it replaces remaining NaN with 0 (reference does not), adds session-level filters for <5 cells and <2 trials (reference does not). While the NaN-to-0 replacement and the <5 cells filter are not in the reference or instructions, the <2 trials filter is justified by the instructions. The remainder-frame discarding matches the reference. The additional processing is practically harmless but represents decisions not grounded in the paper or instructions.",
         "code_correctness": "CORRECT",
-        "code_correctness_justification": "The NaN handling code is correctly implemented: all-NaN neurons are filtered first, then remaining NaN values are replaced with 0."
+        "code_correctness_justification": "The code correctly implements all described missing data handling: NaN filtering, NaN-to-zero replacement, session filtering, and remainder discarding."
     },
     "6-a": {
         "question": "What are the most time-consuming steps of the code?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference identify data loading (I/O) as the most time-consuming step due to the large neural trace arrays.",
+        "decision_correctness_justification": "Both the AI and reference identify data loading (I/O) as the most time-consuming step. The AI uses joblib.load which loads large NumPy arrays, and the reference uses h5py which reads HDF5 files. Both correctly note that the subsequent processing is fast by comparison.",
         "code_correctness": "CORRECT",
         "code_correctness_justification": "N/A - this is an analysis question, not a code implementation question."
     },
     "6-b": {
         "question": "What loops in the code could have been vectorized to improve efficiency?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "The AI's trial splitting loop is similar to the reference's approach. Both use explicit loops over trials that could theoretically use array reshaping, but this is a minor optimization.",
+        "decision_correctness_justification": "The AI correctly identifies the trial-splitting loop as a candidate for vectorization (could use np.reshape or np.split). The reference also notes that the trial-splitting loop is the main candidate. Neither solution has significant performance issues.",
         "code_correctness": "CORRECT",
         "code_correctness_justification": "N/A - this is an analysis question."
     },
     "6-c": {
         "question": "What processing does the code repeat multiple times?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "The AI repeats the float32 cast of env_input for each trial within a session, though the environment geometry is constant per session. The reference also repeats the blocked encoding for each trial. Both are minor inefficiencies.",
+        "decision_correctness_justification": "The AI notes no significant repeated processing, which is accurate. The reference also indicates N/A for this question. The AI's code processes each session once without redundant computation.",
         "code_correctness": "CORRECT",
         "code_correctness_justification": "N/A - this is an analysis question."
     },
     "6-d": {
         "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
         "decision_correctness": "MATCH",
-        "decision_correctness_justification": "Both the AI and reference perform minimal unnecessary processing. The conversion is straightforward.",
+        "decision_correctness_justification": "The AI identifies the sanity_checks function and summary statistics printing as unnecessary for the final output, which is reasonable. The reference also indicates N/A for this question, as neither solution does significant unnecessary processing.",
         "code_correctness": "CORRECT",
         "code_correctness_justification": "N/A - this is an analysis question."
     }

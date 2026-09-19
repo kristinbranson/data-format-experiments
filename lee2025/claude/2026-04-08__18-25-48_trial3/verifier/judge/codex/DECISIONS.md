@@ -2,24 +2,27 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The AI does not load the `.mat` files. It hardcodes the 7 animal IDs, then loads each extensionless `joblib` file from `data/` with `joblib.load`. It processes one animal at a time and then iterates over all days in that animal as sessions, later splitting each day into trials.
+i. The AI hard-codes the seven animal IDs, then loads one extensionless `joblib` file per animal from `data/`. Inside each file it expects a top-level dict keyed by animal name, and then reads `trace`, `position`, and `envs`. Trials are not loaded directly; they are created later by splitting each day/session.
 
 ii.
 ```python
+data_dir = 'data'
 animals = ['QLAK-CA1-08', 'QLAK-CA1-30', 'QLAK-CA1-50', 'QLAK-CA1-51',
            'QLAK-CA1-56', 'QLAK-CA1-74', 'QLAK-CA1-75']
 ...
-def process_animal(animal_name, data_dir, trial_duration_frames=1800, show_processing=False):
-    ...
-    dat = joblib.load(os.path.join(data_dir, animal_name))
-    d = dat[animal_name]
+dat = joblib.load(os.path.join(data_dir, animal_name))
+d = dat[animal_name]
+...
+trace = d['trace']       # (n_days, n_cells, n_frames)
+position = d['position'] # (n_days, 2, n_frames)
+envs = d['envs'].flatten()  # (n_days,) string array
 ```
 
-iii. In `CONVERSION_NOTES.md` Step 2, the AI justified this by concluding that “Each animal is stored as a joblib file (extensionless) in `data/`.” In trajectory notes it also stated that the dataset contains “Python joblib files or MATLAB .mat files,” and chose the joblib path.
+iii. In `CONVERSION_NOTES.md`, the AI says the reference `load_dat()` supports joblib, and it explicitly claims its loading matches `load_dat(animal, p, format='joblib')`. It also documents the extensionless files as the main per-animal data store.
 
 ## 1-b. How are the data split into subjects?
 
-i. The AI treats each hardcoded animal ID as one subject. The output `subjects` field is the full hardcoded list of 7 animal names, and `subject_idx` is assigned from the position of each animal in that list.
+i. Subjects are the seven hard-coded animal IDs. The full `subjects` list is set from that hard-coded list, and each processed session gets a subject index from `animals.index(animal)`.
 
 ii.
 ```python
@@ -34,31 +37,31 @@ for animal in animals_to_process:
     subject_idx_list.append(subject_id)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 2 identifies the dataset as 7 animals with IDs `QLAK-CA1-{08,30,50,51,56,74,75}`, and Step 5 says “One session = one decoder session,” implying the animal IDs are the subject split.
+iii. The notes list those seven mice repeatedly as the complete subject set and describe each extensionless file as one animal.
 
 ## 1-c. How are the data split into sessions?
 
-i. Within each loaded animal, the AI treats each recording day as a separate session. It iterates over the first axis of `trace`, `position`, and `envs`, and each `day` becomes one session in the exported dataset.
+i. The AI treats each day within an animal file as one session. It iterates over the first dimension of `trace`, `position`, and `envs`, and each `day` becomes one output session.
 
 ii.
 ```python
-trace = d['trace']       # (n_days, n_cells, n_frames)
-position = d['position'] # (n_days, 2, n_frames)
-envs = d['envs'].flatten()  # (n_days,) string array
-
 n_days, n_cells_total, n_frames_total = trace.shape
 ...
 for day in range(n_days):
     trace_day = trace[day]       # (n_cells, n_frames)
     pos_day = position[day]      # (2, n_frames)
     env_name = str(envs[day])
+    ...
+    sessions_neural.append(trials_neural)
+    sessions_input.append(trials_input)
+    sessions_output.append(trials_output)
 ```
 
-iii. In Step 5 of `CONVERSION_NOTES.md`, the AI explicitly records the decision: “One session = one decoder session: Each recording day is a separate session in our output.”
+iii. `CONVERSION_NOTES.md` says “Each recording day is a separate session in our output” and documents the raw arrays as `(n_days, ...)`.
 
 ## 1-d. How are the data split into trials?
 
-i. Each session/day is split into non-overlapping 1-minute trials of 1800 frames at 30 Hz. The AI computes `n_trials` by integer division and discards any remainder at the end of the session.
+i. Each session/day is split into contiguous, non-overlapping 1-minute trials at 30 Hz, so each trial is 1800 frames. The number of trials is `n_frames_total // 1800`, and the trailing remainder is dropped.
 
 ii.
 ```python
@@ -76,27 +79,28 @@ for trial_idx in range(n_trials):
     trial_output = bin_ids[start:end].reshape(1, -1).astype(np.int64)
 ```
 
-iii. In Step 5 notes, the AI justified this from the task instructions: “Trial duration = 1 minute: Instructions say ‘1-minute trials within each session’.”
+iii. The notes say “Trial duration = 1 minute: Instructions say ‘1-minute trials within each session’” and “last partial trial discarded if < 1800 frames.”
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. The AI does not apply trial-level quality filtering. Trials are kept as long as they fit within the 1800-frame segmentation; only the incomplete tail is dropped.
+i. There is no explicit trial-level quality filtering. Once a day/session is split into 1-minute chunks, every chunk is kept.
 
 ii.
 ```python
-n_trials = n_frames_total // trial_duration_frames
-
 for trial_idx in range(n_trials):
     start = trial_idx * trial_duration_frames
     end = start + trial_duration_frames
     ...
+    trials_neural.append(trial_neural)
+    trials_input.append(trial_input)
+    trials_output.append(trial_output)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 3 says “No trial-level filtering in original study,” and Step 5 repeats that trial creation is only the imposed 1-minute splitting from the task.
+iii. The notes explicitly say “Trial curation: None in original (1 session = 1 day). We split into 1-min trials.”
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. The AI derives neural data from the `trace` variable in the joblib data structure. For each day/session it uses `trace[day]`.
+i. The AI derives `neural` from the raw `trace` array inside each joblib animal file.
 
 ii.
 ```python
@@ -105,14 +109,16 @@ trace = d['trace']       # (n_days, n_cells, n_frames)
 trace_day = trace[day]       # (n_cells, n_frames)
 ```
 
-iii. In Step 5 of `CONVERSION_NOTES.md`, the AI maps ``trace[day]`` directly to the target `neural` field and describes it as “raw binary trace (0/1 events) at native 30 Hz.”
+iii. The notes describe `trace` as the already-binarized calcium-event matrix and state that this is the neural source variable.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The AI assumes the traces are already binarized calcium-event data and does not do deconvolution, smoothing, or temporal rebinning. It filters to active cells, optionally fills any remaining NaNs with 0, and slices the result into per-trial `(n_neurons, 1800)` float32 arrays.
+i. The AI assumes the joblib `trace` is already arranged as `(cells, frames)` per day, so it does not transpose. It filters to active rows, replaces any remaining NaNs with zero, and casts each trial to `float32`. It does not do deconvolution, dF/F computation, smoothing, or temporal rebinning.
 
 ii.
 ```python
+trace_day = trace[day]       # (n_cells, n_frames)
+...
 active_mask = ~np.all(np.isnan(trace_day), axis=1)
 active_trace = trace_day[active_mask]  # (n_active, n_frames)
 ...
@@ -121,25 +127,24 @@ active_trace = np.nan_to_num(active_trace, nan=0.0)
 trial_neural = active_trace[:, start:end].astype(np.float32)
 ```
 
-iii. The AI’s written justification appears in Step 1 and Step 5 notes: it states the neural data is a “Binary trace vector” and “already preprocessed,” so “NO additional processing [is] needed.”
+iii. The notes say the traces are “raw binary trace (0/1 events) at native 30 Hz” and “already binarized by the original authors,” so no extra neural preprocessing was considered necessary.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Cells are retained if they are not all-NaN on that day. After that, the AI replaces any remaining NaNs in retained cells with zero as a safety step.
+i. The only explicit neural quality filter is removing cells whose entire day/session trace is NaN, treating those as unregistered for that day.
 
 ii.
 ```python
 active_mask = ~np.all(np.isnan(trace_day), axis=1)
 active_trace = trace_day[active_mask]  # (n_active, n_frames)
-...
-active_trace = np.nan_to_num(active_trace, nan=0.0)
+n_active = active_mask.sum()
 ```
 
-iii. `CONVERSION_NOTES.md` says “Include only cells registered on that specific day (non-NaN rows)” and “All registered cells included.” The code comment adds the zero-fill rationale: “shouldn’t happen for active cells, but safety.”
+iii. The notes justify this by saying cross-day registration uses NaNs for unregistered cells and that “all registered cells” should be included.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. The AI does not use a behavioral or stimulus event. It treats the start of each artificial 1-minute segment as the alignment event and slices neural and behavioral streams with the same `start:end` indices.
+i. The AI does not align neural data to any biological or task event. It effectively treats the start of each artificial 1-minute chunk as the alignment point and records that in metadata.
 
 ii.
 ```python
@@ -147,56 +152,59 @@ for trial_idx in range(n_trials):
     start = trial_idx * trial_duration_frames
     end = start + trial_duration_frames
     trial_neural = active_trace[:, start:end].astype(np.float32)
+...
+'metadata': {
     ...
+    'temporal_alignment_event': 'Start of 1-minute trial segment within recording session',
+    'off_start': 0.0,
+    'off_end': float(trial_duration_sec),
 ```
 
-and in metadata:
-```python
-'temporal_alignment_event': 'Start of 1-minute trial segment within recording session',
-'off_start': 0.0,
-'off_end': float(trial_duration_sec),
-```
-
-iii. The notes justify this implicitly rather than explicitly: Step 3 says “All streams synchronous at 30 Hz,” and Step 5 frames trials as artificial 1-minute chunks rather than event-centered trials.
+iii. The notes explain that the recordings are continuous and that the 1-minute trials are imposed for the decoder task rather than coming from the original experiment.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The AI keeps the native 30 Hz frame rate, so the time bin is about 33.33 ms. It does not apply temporal rebinning.
+i. The converted data stays at the native 30 Hz frame rate, corresponding to `1000/30 ≈ 33.33 ms` per bin. No temporal rebinning is applied.
 
 ii.
 ```python
 fps = 30  # recording frame rate
-trial_duration_sec = 60  # 1 minute trials
 trial_duration_frames = fps * trial_duration_sec  # 1800 frames
 ...
-'time_bin_size': 1000.0 / fps,  # ~33.33 ms
+'metadata': {
+    ...
+    'time_bin_size': 1000.0 / fps,  # ~33.33 ms
 ```
 
-iii. In Step 5 notes, the AI states “Time bin size = 1/30 s ≈ 33.33 ms (raw frame rate)” and “NO additional processing needed.”
+iii. The notes explicitly say “Use raw binary trace directly” and “No additional binning of neural data.”
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. The AI does not use the raw `blocked` variable. It derives the decoder input from the per-day environment name stored in `envs`, then maps that name to a 3x3 geometry matrix with `get_env_mat`.
+i. The AI derives environment geometry from the raw `envs` session labels, not from the raw `blocked` variable.
 
 ii.
 ```python
 envs = d['envs'].flatten()  # (n_days,) string array
 ...
 env_name = str(envs[day])
-...
 env_mat = get_env_mat(env_name).flatten()  # (9,)
 ```
 
-iii. Step 5 in `CONVERSION_NOTES.md` explicitly records this mapping as ``envs[day] -> get_env_mat(env)`` and says this will be the decoder input. The trajectory shows the AI chose this because `get_env_mat()` existed in the reference code and directly encoded the 3x3 environment shape.
+iii. The notes say the decoder input should be environment geometry and explicitly select `envs[day] -> get_env_mat(env)` as the mapping.
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. The AI converts each environment name into a 3x3 binary accessibility matrix, flattens it to length 9, and reuses the same vector for every trial in that session. The vector encodes accessible partitions (`1`) rather than blocked-partition indices.
+i. The AI maps each environment name to a hand-coded 3x3 binary accessibility matrix with `get_env_mat()`, flattens it to length 9, casts it to `float32`, and reuses the same static vector for every trial in that session.
 
 ii.
 ```python
 def get_env_mat(env):
-    ...
+    env_mats = {
+        'square':    np.array([[1,1,1],[1,1,1],[1,1,1]]),
+        'o':         np.array([[1,1,1],[1,0,1],[1,1,1]]),
+        't':         np.array([[0,1,0],[0,1,0],[1,1,1]]),
+        ...
+    }
     return env_mats.get(env, np.full((3,3), np.nan)).astype(float)
 ...
 env_mat = get_env_mat(env_name).flatten()  # (9,)
@@ -204,11 +212,11 @@ env_mat = get_env_mat(env_name).flatten()  # (9,)
 trial_input = env_mat.astype(np.float32)
 ```
 
-iii. In Step 5 notes, the AI justifies this as “Environment geometry as flattened 3x3 binary matrix (9 values)” because the task said the decoder input should be environment geometry. Step 1 also notes that `get_env_mat()` comes from the reference code and returns a 3x3 binary matrix.
+iii. The notes say this function was adapted from the reference code and that “Environment geometry as input” was chosen because the task asked for which partitions are blocked.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. The AI derives the decoded output from the raw `position` variable for each day/session.
+i. The AI derives the decoder output from the raw `position` array.
 
 ii.
 ```python
@@ -217,11 +225,11 @@ position = d['position'] # (n_days, 2, n_frames)
 pos_day = position[day]      # (2, n_frames)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 5 maps ``position[day]`` directly to the target `output` field and describes it as x-y position in `[0, 75]` cm.
+iii. The notes describe `position` as the DeepLabCut-tracked `(x, y)` mouse coordinates in centimeters.
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The AI clips x and y coordinates into `[0, 75)`, divides each axis into 25 cm bins, floors to integer bin indices, clamps those indices to `[0, 2]`, and then combines them into a single class label with `bin_ids = x_bin * 3 + y_bin`.
+i. The AI clips each coordinate to the 75 cm arena bounds, divides each axis into three 25 cm bins, floors to integer bin indices, clips to `[0, 2]`, and combines the two per-axis bins into a single class label.
 
 ii.
 ```python
@@ -237,77 +245,91 @@ def discretize_position_3x3(position, env_size=75.0):
     return bin_ids
 ```
 
-iii. Step 5 notes justify the 3x3 discretization from the task requirement “3 x 3 = 9 spatial bins,” and explicitly state the chosen label rule: ``bin_id = x_bin * 3 + y_bin``.
+iii. The notes justify this as matching the requested 3x3 spatial output and the 75x75 cm arena partition structure.
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. The AI thresholds continuous position into 9 discrete categories by splitting each axis at 25 cm and 50 cm, yielding a 3x3 grid. Category IDs are then assigned using the `x_bin * 3 + y_bin` numbering scheme.
+i. Thresholding is implicit from the 25 cm bin size: `0-25`, `25-50`, and `50-75` cm on each axis. The final categories are the 9 combinations of those x/y bins, encoded as integers `0-8`.
 
 ii.
 ```python
 bin_size = env_size / 3.0
-...
 x_bin = np.floor(x / bin_size).astype(int)
 y_bin = np.floor(y / bin_size).astype(int)
-...
+x_bin = np.clip(x_bin, 0, 2)
+y_bin = np.clip(y_bin, 0, 2)
 bin_ids = x_bin * 3 + y_bin
+...
+for i in range(3):
+    for j in range(3):
+        x_start = i * 25
+        x_end = (i + 1) * 25
+        y_start = j * 25
+        y_end = (j + 1) * 25
+        output_bin_names.append(f"x[{x_start}-{x_end}]_y[{y_start}-{y_end}]")
 ```
 
-iii. In Step 5 notes, the AI explains this as “Position (x,y) in [0, 75] cm → 3x3 grid of 25 cm bins” and says this “gives 9 spatial bins matching the 3x3 partition structure.”
+iii. The notes state “Position (x,y) in [0, 75] cm -> 3x3 grid of 25 cm bins” and “Combine x_bin and y_bin into single label.”
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. The AI assumes position and neural activity are frame-synchronous and aligns them by slicing both with the same `start:end` trial boundaries. The per-trial output keeps the same 1800 timepoints as the neural trial.
+i. Position is aligned to neural data by using the same per-day frame axis and the same `start:end` indices when constructing each trial.
 
 ii.
 ```python
-trial_neural = active_trace[:, start:end].astype(np.float32)
+trace_day = trace[day]       # (n_cells, n_frames)
+pos_day = position[day]      # (2, n_frames)
 ...
+bin_ids = discretize_position_3x3(pos_day)  # (n_frames,)
+...
+start = trial_idx * trial_duration_frames
+end = start + trial_duration_frames
+trial_neural = active_trace[:, start:end].astype(np.float32)
 trial_output = bin_ids[start:end].reshape(1, -1).astype(np.int64)
 ```
 
-iii. Step 3 notes state that “All streams synchronous at 30 Hz,” which is the AI’s justification for using identical frame indices for both outputs and neural data.
+iii. The notes say all streams are synchronous at 30 Hz and that trial boundaries were checked for correct alignment.
 
 ## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. The AI removes cells that are entirely NaN on a given day, fills any remaining NaNs in retained traces with zero, clips position values into the valid arena range, and drops any incomplete trial remainder at the end of a session.
+i. The AI removes neurons that are all-NaN for a session, fills any remaining NaNs in retained neural traces with zero, and drops trailing frames that do not make up a full 1-minute trial. It does not do additional correction for position samples.
 
 ii.
 ```python
 active_mask = ~np.all(np.isnan(trace_day), axis=1)
 active_trace = trace_day[active_mask]  # (n_active, n_frames)
-active_trace = np.nan_to_num(active_trace, nan=0.0)
 ...
-x = np.clip(position[0], 0, env_size - 1e-10)
-y = np.clip(position[1], 0, env_size - 1e-10)
+active_trace = np.nan_to_num(active_trace, nan=0.0)
 ...
 n_trials = n_frames_total // trial_duration_frames
 ```
 
-iii. The written rationale appears in Step 5 notes (“Include only cells registered on that specific day”) plus the in-code comment that zero-filling remaining NaNs is a safety measure. The notes also say the final short chunk is discarded when making 1-minute trials.
+iii. The notes justify all-NaN removal via cross-day registration and describe `nan_to_num(..., nan=0.0)` as a “safety” step that “shouldn't happen for active cells.”
 
 ## 6-a. What are the most time-consuming steps of the code?
 
-i. The AI’s code is dominated by per-animal data loading with `joblib.load`; optional plotting is also expensive when `--show-processing` is enabled. The code prints load and total runtimes, reflecting that I/O was treated as the main cost.
+i. The AI’s own notes identify loading each large per-animal joblib file as the main cost, followed by processing all sessions/trials and writing the very large pickle. Optional plotting is extra work when `--show-processing` is enabled.
 
 ii.
 ```python
 t0 = time.time()
 print(f"Loading {animal_name}...", flush=True)
 dat = joblib.load(os.path.join(data_dir, animal_name))
-d = dat[animal_name]
-t_load = time.time() - t0
-print(f"  Loaded in {t_load:.1f}s", flush=True)
+...
+t_total = time.time() - t_total_start
+...
+with open(args.outfile, 'wb') as f:
+    pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 ...
 if show_processing:
     plot_processing(...)
 ```
 
-iii. `CONVERSION_NOTES.md` Step 6 highlights loading one animal at a time and freeing memory after each animal, which implies the AI recognized data loading as the expensive step.
+iii. `CONVERSION_NOTES.md` includes runtime estimates such as “Load 1 animal ~13s,” “Process 31 sessions ~9s,” and “Total per animal ~22s.”
 
 ## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The code keeps an explicit Python loop over trials inside every session. Those trial slices could have been reshaped or split in a more vectorized way. The nested loops that build output bin names are also trivial overhead but unnecessary.
+i. The clearest vectorization opportunity is the inner `for trial_idx in range(n_trials)` loop, which slices and appends one trial at a time for neural, input, and output arrays. That could have been replaced by a reshape/split-based approach. The nested loop that builds `output_bin_names` is also minor avoidable scalar work.
 
 ii.
 ```python
@@ -324,47 +346,46 @@ for trial_idx in range(n_trials):
 for i in range(3):
     for j in range(3):
         ...
-        output_bin_names.append(f"x[{x_start}-{x_end}]_y[{y_start}-{y_end}]")
+        output_bin_names.append(...)
 ```
 
-iii. The AI did not explicitly justify keeping these loops. Step 6 only claims “Direct numpy array slicing for trial splitting (no loops over frames),” so the remaining trial loop seems to have been accepted as simple enough.
+iii. The notes do not explicitly discuss vectorization opportunities; this is inferred from the implementation.
 
 ## 6-c. What processing does the code repeat multiple times?
 
-i. Within the per-trial loop, the AI repeatedly casts the same static `env_mat` to float32 for every trial and repeatedly slices/casts neural and output arrays trial by trial. In sample mode it also processes all sessions for the first animal and only later truncates to 2 sessions.
+i. The code repeatedly casts the same session-level environment vector to `float32` for every trial, repeatedly appends the same static input once per trial, and repeatedly computes slice boundaries in the per-trial loop. It also does repeated per-animal bookkeeping such as `animals.index(animal)`.
 
 ii.
 ```python
-for trial_idx in range(n_trials):
-    ...
-    trial_neural = active_trace[:, start:end].astype(np.float32)
-    trial_input = env_mat.astype(np.float32)
-    trial_output = bin_ids[start:end].reshape(1, -1).astype(np.int64)
+env_mat = get_env_mat(env_name).flatten()  # (9,)
 ...
-result = process_animal(animal, data_dir, trial_duration_frames,
-                       show_processing=show)
-
-n_sessions = len(result['neural'])
-if max_sessions is not None:
-    n_sessions = min(n_sessions, max_sessions)
+for trial_idx in range(n_trials):
+    start = trial_idx * trial_duration_frames
+    end = start + trial_duration_frames
+    ...
+    trial_input = env_mat.astype(np.float32)
+    trials_input.append(trial_input)
+...
+for animal in animals_to_process:
+    subject_id = animals.index(animal)
 ```
 
-iii. The only explicit efficiency justification is Step 6’s note about using numpy slicing and `del` for memory. There is no explicit justification for the repeated per-trial casts or for processing all sessions before truncating sample mode output.
+iii. There is no explicit justification for these repeated operations in the notes or trajectory.
 
 ## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The AI includes optional plotting and plotting-only bookkeeping (`sessions_env`, `active_cells_per_session`) that are not part of the exported dataset. In sample mode it fully processes all sessions for one animal even though only the first 2 are kept. It also returns `envs` and `active_cells` from `process_animal` even though only `active_cells` is used later.
+i. The main extra work is optional visualization and plotting support. The code also collects `sessions_env` and returns it from `process_animal`, but the final saved dataset never uses it. Timing/summary reporting is also purely diagnostic.
 
 ii.
 ```python
 sessions_env = []
-active_cells_per_session = []
 ...
 sessions_env.append(env_name)
-active_cells_per_session.append(n_active)
 ...
 if show_processing:
-    plot_processing(...)
+    plot_processing(animal_name, d, sessions_neural, sessions_input,
+                   sessions_output, sessions_env, active_cells_per_session,
+                   trial_duration_frames)
 ...
 return {
     'neural': sessions_neural,
@@ -373,11 +394,6 @@ return {
     'envs': sessions_env,
     'active_cells': active_cells_per_session,
 }
-...
-if max_sessions is not None:
-    n_sessions = min(n_sessions, max_sessions)
-for s in range(n_sessions):
-    all_neural.append(result['neural'][s])
 ```
 
-iii. Step 6 justifies plotting as “show processing” visualization, but there is no downstream decoder need for it. There is also no written justification for processing extra sessions in sample mode and then discarding them.
+iii. The notes justify the plotting path as a sanity-check/visual inspection aid, not as part of the downstream decoder input pipeline.
