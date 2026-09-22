@@ -3,7 +3,7 @@
 ### Job data roots
 
 - `/groups/branson/home/bransonk/behavioranalysis/code/ScienceBenchmark/data-format/harbor-jobs`: Results of record, git repo, origin `github.com/kristinbranson/data-format-experiments`
-- `/groups/branson/home/bransonk/behavioranalysis/code/ScienceBenchmark/data-format/`: Staging for new results before putting them in git repo, collect_cluster_results.py`'s default destination, empty now
+- `/groups/branson/home/bransonk/behavioranalysis/code/ScienceBenchmark/data-format/`: Staging for new results before putting them in git repo, the default destination of `collect_cluster_results.py` (Columns, below), empty now
 - `/groups/branson/home/bransonk/harbor-cluster-jobs`: raw cluster output
 - `/groups/branson/home/bransonk/harbor-cluster-jobs-config_20260728-prompt_v5` raw cluster output for old agents v5 prompt, empty
 - `/groups/branson/home/bransonk/harbor-cluster-jobs-superseded`: trash
@@ -19,7 +19,9 @@ All data have been merged into `harbor-jobs`
   merge-back (`harbor-tasks/changes_since_preprint.md`).
 - **Judges**: old = claude-opus-4-6 + gpt-5.4; new = claude-opus-5 + gpt-5.6-sol.
 - **Prompt**: v4 = `prompt_v4/` and minimal v1; v5 = `prompt_v5/` and minimal v2.
-- **Collected**: moved by `harbor-scripts/collect_cluster_results.py` into an analysis tree.
+- **Collected**: moved by `harbor-scripts/collect_cluster_results.py` in the data-format repo
+  (`/groups/branson/home/bransonk/behavioranalysis/code/ScienceBenchmark/data-format`, which
+  contains this one) into an analysis tree.
 
 ### Table
 
@@ -79,9 +81,9 @@ both sweeps were collected; the stuck-terminal cases among them were moved to
    claude/codex prompts have the older wording "Do not directly load and parse the `hdf5`
    files."; the terminus ones have "… with `h5py`." (`8b689da`, 09-20).
 5. Committed in harbor-jobs on 2026-09-21, one commit per sweep: `56d42a9` holds the September sweep
-   (240 trials, rows 4–8) and `7accb45b` holds the v5 sweep (90 trials, rows 9–10). Both, with
-   `cc94999` (which dropped eight duplicate READMEs, below) and `2e1c8115` (the judge
-   variability replicates, below), are **local commits not yet pushed** to GitHub. As with every trial in harbor-jobs, only the allow-listed light files are tracked --
+   (240 trials, rows 4–8) and `7accb45b` holds the v5 sweep (90 trials, rows 9–10). Alongside them
+   are `cc94999`, which dropped eight duplicate READMEs, and `2e1c8115`, the judge variability
+   replicates (footnote 6). As with every trial in harbor-jobs, only the allow-listed light files are tracked --
    `metrics.json`, the judge output, `DECISIONS.md`, `trial.log`, `trajectory.json`, the agent's
    `convert_data.py` and the like -- never `converted_data.pkl` or the snapshots.
 6. Rows 11 and 12 are the judge variability experiment: judges-only reruns of the six allen2p
@@ -93,7 +95,8 @@ both sweeps were collected; the stuck-terminal cases among them were moved to
    both checkouts the replicates ran from hold the post-merge-back version, byte-identical
    between them, hence new Refs for both rows. These are not trials: each
    sits inside the trial it rejudges, and `trial_metrics.py` does not count it. Both rows are
-   committed together as `2e1c8115`; see "Judge variability replicates" below.
+   committed together as `2e1c8115`; `judge_variability.md` in the data-format repo describes
+   the experiment.
 
 ### Status and other contents
 
