@@ -1,0 +1,226 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The agent bypassed the AllenSDK `VisualBehaviorOphysProjectCache` and discovered sessions by globbing local NWB files directly. That can work for a local subset, but it does not match the reference loading path, does not use the canonical experiment table, and weakens guarantees that the same project/session semantics are preserved.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code consistently implements that choice through `list_nwb_files()`, `collect_previews()`, and direct `h5py.File(...)` reads in both passes."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The agent splits subjects by the NWB subject identifier and builds a unique subject list with a session-level index. That matches the reference at the conceptual level: one identifier per mouse, then `subject_idx` per session.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation reads `/general/subject/subject_id`, interns each unique value once, and appends the corresponding session index."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference groups experiments by `ophys_session_id`, because one behavioral session can contain multiple experiment files / imaging planes. The agent instead treats each NWB experiment file as a separate session, so multi-plane sessions are split incorrectly.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does exactly that: it iterates over eligible files one by one, reads `ophys_session_id` only as metadata, and never merges files with the same session id."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the agent uses the built-in trial table and the full `start_time` to `stop_time` trial window rather than inventing new trial boundaries. The later 100 ms rebinning changes temporal resolution, but not the basic trial definition.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation reads `/intervals/trials`, creates one `TrialSpec` per retained row, and builds each trial from `start_time` to `stop_time`."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The agent correctly excludes aborted and auto-rewarded trials, but unlike the reference it does not explicitly filter missing `change_time` trials and it shifts some QC to the session level by dropping entire sessions with missing eye tracking. Those choices are not obviously fatal, but they should be checked by a human.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements exactly those filters: trial-level exclusion for `aborted` and `auto_rewarded`, outcome consistency checks, and session-level exclusion for missing/insufficient pupil data or too few valid trials."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference solution uses dF/F traces, but the agent chose event-detection outputs plus ROI validity metadata, citing the paper's use of discrete calcium events. That differs from the human reference but is plausibly justified by the paper/code ambiguity.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation loads `/processing/ophys/event_detection/data`, `/processing/ophys/event_detection/rois`, and `valid_roi`, and uses ophys timestamps only for alignment."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference merges planes within a behavioral session and otherwise leaves neural data on the native ophys frame grid. The agent instead keeps each experiment file separate and rebins event magnitudes into 100 ms sums. That is a materially different processing pipeline, not a small implementation variation.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code filters to valid ROIs and sums event magnitudes inside each 100 ms bin exactly as described."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Although the mechanism differs, the effective QC logic is aligned with the reference: include only valid ROIs exposed by the Allen processing pipeline. The reference gets that implicitly through the SDK; the agent does it explicitly from raw NWB fields.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation applies the `valid_roi` mask before trial extraction."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the agent and the reference align each trial to trial start and keep the full trial window through trial end. The agent's rebinned representation differs in resolution, but the alignment event itself matches.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code builds bins from `spec.start_time` to `spec.stop_time` and records metadata with `temporal_alignment_event` equal to `trial start`."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference keeps the native ophys frame rate and does not rebin. The agent imposes a uniform 100 ms grid and sums within bins, which is a different temporal representation and not required by the reference solution.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code defines `BIN_SIZE_SEC = 0.1`, constructs 100 ms bins, and stores the corresponding metadata."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `output` *Image identity* derived from?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The agent derives image identity from the stimulus-presentation table itself rather than only the trial-table initial/change image names. For a time-varying output that should reflect non-gray display periods, that is a more faithful raw source.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation uses `image_name`, `start_time`, `stop_time`, and `omitted` from presentation tables to construct the series."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `output` *Image identity*?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The reference labels the whole pre/post portions of a trial with image identity, but the agent explicitly inserts a `gray` class outside image presentations and during omissions. That better matches the instruction's focus on the image presented during the non-gray screen.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code initializes bins to `gray`, overwrites non-omitted presentation intervals with image labels, and excludes `omitted` from the global vocabulary."
+  },
+  "3-c": {
+    "question": "How is `output` *Image identity* aligned with the neural data?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The alignment differs from the reference because it uses presentation intervals on the agent's rebinned time axis rather than trial-table change timing on native ophys frames. Given the agent's overall rebinned design, this is still a coherent alignment choice.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation projects overlapping stimulus presentations onto the same trial-bin centers used for neural data."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Image change* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference reconstructs change from trial metadata, while the agent uses the presentation-table `is_change` flag. That differs from the reference path but is a reasonable direct raw variable for identifying changed-image presentations.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code reads `is_change` and `omitted` from the presentation table and uses them to build `change_series`."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Image change*?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference marks change over a 750 ms post-change flash-plus-gray window on go trials. The agent instead marks only bins inside a presentation interval whose `is_change` flag is true. That is defensible, but it changes the decoded target semantics enough that it deserves review.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation directly matches that decision by setting `change_series[in_window] = 1` for `is_change` presentation rows."
+  },
+  "4-c": {
+    "question": "How is `output` *Image change* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the reference and the agent treat image change as a binary categorical output with `0/1` values and named categories.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code emits integer `0/1` values and stores `['no_change', 'change']` in `output_values`."
+  },
+  "4-d": {
+    "question": "How is `output` *Image change* aligned with the neural data?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The alignment is internally coherent but differs from the reference because it is defined on rebinned trial-bin centers and presentation intervals rather than native ophys frames and `change_time` windows.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code builds `change_series` on the same `centers` array used for the trial's neural matrix."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `output` *Running speed* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the reference and the agent derive running speed from the processed running-speed time series stored by Allen rather than recomputing wheel kinematics from scratch.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation reads `/processing/running/speed/timestamps` and `/processing/running/speed/data`."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `output` *Running speed*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The agent follows the same broad recipe as the reference: interpolate onto the neural time axis and apply global percentile discretization. The details differ because the agent first chose a 100 ms rebinned axis and uses boundary-value extrapolation instead of NaNs.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code performs linear interpolation with `np.interp`, computes global quantile edges from pooled samples, and digitizes each trial's interpolated values."
+  },
+  "5-c": {
+    "question": "How is `output` *Running speed* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both solutions use five percentile-based bins shared globally across sessions.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation computes four internal quantile edges and maps values to integer bins with labels `q1` through `q5`."
+  },
+  "5-d": {
+    "question": "How is `output` *Running speed* aligned with the neural data?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The agent aligns running speed to its own neural time base correctly, but that time base is the agent's rebinned 100 ms grid rather than the reference's native ophys frames. The alignment method is still coherent.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code interpolates running speed onto the trial-bin centers before building the per-trial output array."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `output` *Pupil diameter* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference uses `pupil_width`, while the agent uses raw pupil area plus the blink mask and converts area to an equivalent diameter. That is different, but it is not arbitrary and is defensible as a way to obtain a diameter-like quantity.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation reads eye timestamps, `area_raw`, and `likely_blink`, then derives pupil diameter from them."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `output` *Pupil diameter*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The overall strategy matches the reference closely: remove blink-contaminated samples, align the signal to the neural time base by interpolation, and discretize with global percentile bins. The main differences are area-to-diameter conversion and the rebinned time axis.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code applies the blink mask, converts area to diameter, interpolates to trial-bin centers, and digitizes with global edges."
+  },
+  "6-c": {
+    "question": "How is `output` *Pupil diameter* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both solutions use five global percentile bins for pupil output categories.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code computes five-bin quantile thresholds and stores `q1` through `q5` labels."
+  },
+  "6-d": {
+    "question": "How is `output` *Pupil diameter* aligned with the neural data?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "As with running speed, the alignment is sound within the agent's own design but occurs on the 100 ms rebinned grid rather than on native ophys frames.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code interpolates pupil diameter to the same trial-bin centers used for neural data."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Trial outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the reference and the agent derive trial outcome from the canonical Allen trial outcome booleans `hit`, `miss`, `false_alarm`, and `correct_reject`.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation reads those four columns, checks that exactly one is true, and converts the result into a class index."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Trial outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both solutions map outcome labels to fixed integer categories and repeat the per-trial outcome across all time bins in that trial.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code stores the outcome index in `TrialSpec` and later creates a constant `outcome_series` for the full trial."
+  },
+  "8": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The agent has some reasonable safeguards, especially around missing eye tracking and blink filtering, but the coverage is uneven. It does not explicitly filter missing `change_time`, and its fallback of forcing at least one bin in empty trial ranges could conceal malformed intervals. This should be reviewed by a human.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does implement the stated edge handling: defensive decoding, session exclusion for missing pupil, finite-only interpolation, and explicit errors when interpolated running/pupil remain non-finite."
+  },
+  "9-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The agent correctly identifies the expensive parts of its own pipeline: the first full file scan and the per-trial neural rebinning in the conversion pass.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Those costs are evident in the code structure: one preview pass over all files and a nested per-trial, per-bin summation loop during conversion."
+  },
+  "9-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The agent's main vectorization opportunity is indeed the inner neural rebinning loop, with smaller opportunities in the per-trial metadata loops. That assessment matches the actual code structure.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code contains exactly those loops, and the notes explicitly mention cumulative sums as a faster alternative to per-bin slice summation."
+  },
+  "9-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Relative to the reference, the agent repeats substantial work by opening files twice and rereading trial/presentation/running/pupil metadata in both preview and conversion passes. The reference avoids that extra repeated pass over session content.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation clearly performs one preview read and one conversion read for each eligible file."
+  },
+  "9-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Compared with the reference, the agent carries extra metadata and optional work that do not contribute to the final decoder dataset, including unused trial/session fields and optional processing-plot generation support. That is unnecessary overhead in the conversion path.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does read and retain several fields that are not consumed when forming the saved dataset, and it conditionally executes plot-generation code outside the final pickle payload."
+  }
+}

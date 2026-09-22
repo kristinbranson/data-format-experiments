@@ -1,0 +1,226 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI reads the local NWB/HDF5 files directly with h5py and uses project_metadata/ophys_experiment_table.csv as the index, whereas the human used the AllenSDK VisualBehaviorOphysProjectCache. The mechanism is equivalent and verifiably so: the AI's neuron total (29,444) exactly equals the number of rows in ophys_cells_table.csv for the same 202 experiments, i.e. the NWB dF/F table already contains only SDK-valid ROIs, and the same dff/running/eye/trials objects the SDK exposes are read from the same groups. The scope of what is loaded differs from the reference in two ways: (a) the AI drops passive sessions (OPHYS_2/5), which the human retained, and (b) the AI does not filter on project_code, so 34 VisualBehaviorMultiscope plane-experiments are included alongside the 168 single-plane VisualBehavior ones (human: all 239 VisualBehavior experiments). Excluding passive sessions is well justified for a task whose outputs include trial outcome (in passive sessions the mouse cannot lick, so every trial is a miss or correct-reject), and it is documented in Step 4/Step 5. The Multiscope inclusion is the more questionable half and is scored under 1-c/2-e. Net: a differently scoped but defensible loading strategy, documented and cross-checked against the cells table.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "load_experiment_table() does exactly what the notes describe: restricts to experiment IDs with an NWB file on disk, drops session_types containing 'passive', sorts by ophys_experiment_id. load_nwb_data() pulls dff data+timestamps, running speed+timestamps, eye tracking, trials and the Natural_Images presentations table, and the main loop iterates over every row of the filtered table. The dF/F array is correctly transposed from (n_frames, n_cells) to (n_cells, n_frames) (verified against file shapes, e.g. (48316, 12) for a 12-cell experiment). The run log confirms 202 experiments / 38 mice processed, matching the filter."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: subjects are the unique mouse_id values from the experiment table, stored as strings in `subjects` with `subject_idx` indexing them per session. The only difference in the resulting count (38 vs the reference's 37) is a downstream consequence of including the one Multiscope mouse, not of a different subject-splitting rule.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "subject_map assigns a new index the first time a mouse_id is seen and all_subject_idx appends that index once per emitted session, so subjects/subject_idx are consistent and ordered with `neural`. The verification output lists 38 subjects with per-subject session counts that sum to 202."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The AI defines one output session = one ophys *experiment* (one imaging plane); the human groups experiments by ophys_session_id and merges planes. For the 168 single-plane VisualBehavior experiments the two definitions coincide. The problem is the 34 retained Multiscope plane-experiments: they come from only 6 real recording sessions of a single mouse (457841), so that one mouse supplies 34 of 202 'sessions' (next highest: 9) and the identical behavioural output streams are duplicated across up to 7 sessions that share a real recording. Those sessions are also acquired at ~11 Hz rather than ~31 Hz, which breaks the format requirement that 'Time bins should be the same size for all trials and sessions' (see 2-e). It is not flatly wrong -- keeping planes separate is actually safer than the reference's merge for Multiscope, since Multiscope planes do not share an ophys timebase, and the AI documented the choice explicitly (Step 5 decision 9) -- but the combination of duplicated behaviour, one mouse dominating the session count, and mixed frame rates is exactly the kind of choice a human should review; simply excluding project_code != 'VisualBehavior', as the reference did, would have avoided all three.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements the stated decision: the main loop is over rows of the experiment table (one iteration per plane) and each iteration appends one entry to `neural`/`output`/`subject_idx`/`brain_region_idx`, with ophys_session_id retained only inside metadata['session_info']. The verification output shows the expected signature of this choice (groups of 7/5/3 identical trial counts and mean T ~91 for the Multiscope planes)."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: trials come from the NWB intervals/trials table, the trial window is the full start_time-to-stop_time interval (variable length, including the pre-change flashes and the post-change response window), and only Go and Catch trials are used. This follows the instruction 'Segment each recording session into individual trials based on how they are defined in the experiment' and gives the same ~8 s windows.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_valid_trials() returns indices where (go|catch) & ~aborted & ~auto_rewarded, and the trial loop slices frames with the half-open mask (ophys_ts >= start_time) & (ophys_ts < stop_time), which is equivalent to the reference's np.searchsorted(start)..np.searchsorted(stop) index range. Sample output confirms variable trial lengths (224-389 frames at 31 Hz) with 39 trials in a heavily-aborting session and ~250 typical."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI's filter ((go|catch) & ~aborted & ~auto_rewarded) and the reference's (~aborted & ~auto_rewarded & change_time.notna()) select the same trials in practice: on 25 active experiments (5,276 trials) the two masks agreed exactly, with zero NaN change_times among the selected trials. Both additionally require >=2 trials per session (a format requirement) and both drop degenerate/empty trial windows (AI: n_trial_frames < 2; reference: end_idx <= start_idx). Neither applies an engagement or d-prime filter, consistent with the AI's Step 3 finding that session-level QC is already applied upstream.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Every documented filter is present and in the right place: the trial-type mask in get_valid_trials, the <2-frame trial skip and the <2-trial session rejections before and after processing, and the 0-cell / no-stimulus-table rejections. No filter is claimed in the notes that is absent from the code."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: dF/F traces (processing/ophys/dff/traces/data, the same object the SDK exposes as dff_traces.dff) on the ophys timestamps. The AI explicitly considered and rejected the deconvolved event traces, matching the reference's choice and the standard analysis for this dataset.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "load_nwb_data reads exactly those two datasets, and nothing else feeds `neural`. The event_detection group is never touched."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, no additional processing is applied -- the Allen pipeline's dF/F (median-filter baseline + detrending) is taken as-is, with only a transpose, a float32 cast and trial slicing. The reference additionally vstacks planes within a session; the AI does not need to because each plane is its own session, which is a consequence of the 1-c decision rather than a separate processing difference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The only operations on dff between load and output are `.T`, `[:, frame_mask]` and `.astype(np.float32)`. No smoothing, normalisation or baseline correction appears anywhere in the script."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the AI and the reference apply no neuron-level filtering, relying on the Allen pipeline's ROI curation. The AI went further than the reference in justifying it, and the justification checks out independently: the 29,444 emitted neurons exactly equal the ophys_cells_table.csv row count for those 202 experiments, so the NWB dF/F table contains only valid ROIs and an explicit valid_roi filter would be a no-op. (The trajectory shows the AI intended at step 60 to 'add the valid_roi filter for safety' and then did not; harmless here, but the note left in the plan was not reconciled with the code.)",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The decision is 'no neuron filtering' and the code contains none -- only the whole-experiment rejection when n_cells == 0. cell_roi_ids is read but never used to subset anything, so it cannot silently filter."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same alignment as the reference: trial start on the native ophys clock, with every stream (neural, running, pupil, image identity, change) expressed on ophys_timestamps and indexed by the identical per-trial frame mask, so alignment is correct by construction. The instruction's 'Temporally align based on ophys timestamp' is satisfied. The AI's half-open mask vs the reference's searchsorted index range are equivalent to within at most one frame at the boundary.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "frame_mask is computed once from ophys_ts and reused for dff, running and pupil; the image-identity and change helpers recompute the identical mask from the same timestamps and trial bounds, so all five output rows have the same length T as the neural matrix. Verified in the sample pickle: neural (89, 225) and output (5, 225) for the same trial. The AI's own raw-NWB spot-check of dF/F (trial 5, session 803736273) reported max_diff 0.0."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The core decision -- keep the native ophys frame grid and apply no rebinning -- matches the reference exactly. What makes it concerning is the interaction with 1-c: by keeping the 34 Multiscope plane-experiments, the dataset mixes ~32.3 ms bins (168 sessions) with ~90 ms bins (34 sessions), while metadata['time_bin_size'] reports a single median of 32.32 ms. That directly contradicts the explicit format requirement 'Time bins should be the same size for all trials and sessions', and any downstream analysis that trusts time_bin_size will mis-time 17% of the sessions by a factor of ~2.8. The AI noticed the heterogeneity (trajectory step 52, Step 10 Check 5) and logged it as an accepted edge case instead of resolving it, e.g. by dropping the Multiscope planes (as the reference's project_code filter does) or rebinning them to a common grid. Per-session dt is preserved in metadata['session_info'], which limits the damage.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does what the notes say: dt = median(diff(ophys_ts)) per session, no resampling of any stream, and metadata['time_bin_size'] = median of the per-session dts with per-session dt_ms stored in session_info. The 32.31 ms value in the sample pickle and the mixed mean-T values in the verification output are consistent with this implementation."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `output` *Image identity* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI derives image identity from the stimulus-presentations table (image_name with per-flash start_time/stop_time, plus omitted), whereas the reference derives it from the trials table's initial_image_name/change_image_name switched at change_time. The AI's source is the more literal description of what was on the screen: it resolves each 250 ms flash and labels the intervening 500 ms grey periods with a dedicated 'gray' class, and it was validated against the protocol (grey fraction 66.9% vs the expected 66.7%). The cost is that 2/3 of all timepoints become a single 'gray' class, so the variable partly becomes flash-detection, and grey frames immediately after a flash are labelled 'gray' even though the calcium signal there is still dominated by the preceding image. The instruction ('Image identity (of the image presented during the non-grey screen)') is genuinely ambiguous between the two readings, and the AI's reading is well justified and empirically checked, so this is a different but equally defensible choice rather than a better or worse one.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The stimulus table is located by the 'Natural_Images' key with sensible fallbacks, image_name/start_time/stop_time/omitted are read, and the global category list is ['gray'] + 16 sorted image names collected by scanning every experiment. The run log confirms the 17-class list, and the verification output shows the expected marginals (gray 0.669, each image ~0.020)."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `output` *Image identity*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Processing is a direct mapping of flash intervals onto ophys frames with a global integer code, which matches the reference's use of a global sorted name->code mapping stored in metadata. The differences all follow from 3-a: a gray default, omitted flashes folded into gray rather than given their own class, and a 17- rather than 16-class alphabet. Folding omissions (5% of flashes) into gray is defensible since the screen is grey during an omission. Equally justified as the reference's approach.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "build_image_identity_trace initialises to the gray code and overwrites frames in [stim_start, stim_stop) with the image code; byte strings are decoded; 'omitted' and unknown names are skipped so they remain gray. output_values[0] is the same image_names_list used to generate the codes, so the labels are self-consistent. The AI's independent raw-NWB reload reproduced the trace with np.array_equal."
+  },
+  "3-c": {
+    "question": "How is `output` *Image identity* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Frame-level alignment on the ophys clock using the same trial window as the neural data, exactly as the reference does. The label at each frame is decided by comparing that frame's ophys timestamp against the stimulus on/off times, so the maximum alignment error is one frame (~32 ms), the same bound the reference accepts.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The helper recomputes the identical mask (ophys_ts >= trial_start) & (ophys_ts < trial_stop) used for the neural slice, guaranteeing equal length and frame correspondence; the returned trace is written straight into output_full[0]. Confirmed in the sample pickle (image code 9 for the first 250 ms block, then 0/gray)."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Image change* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI uses the stimulus table's is_change flag and the change flash's start_time; the reference uses the trials table's change_time gated on the `go` column. These are the same event: is_change is only set when the image genuinely differs from the previous flash, so catch (sham-change) trials produce no positives under either scheme. Confirmed in the converted sample: 34 trials contain a change out of 39, matching the 34 go / 5 catch split.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "build_image_change_trace iterates only over presentations with is_change true and only those whose start_time falls inside the trial window, so exactly the trial's own change flash is marked. No catch-trial positives appear in the converted data."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Image change*?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The AI marks a single ophys frame (~32 ms) as 'change', whereas the reference marks the full 750 ms flash-plus-grey cycle (~23 frames at 31 Hz). 'Have value of 1 right after a change in image identity' does admit the one-frame reading, so this is not flatly wrong, but it is a poor choice on two counts a human should check. First, GCaMP6 dF/F has a rise/decay of hundreds of milliseconds, so a single 32 ms bin is far shorter than the neural response it is supposed to label -- the positive class is systematically mis-timed relative to the signal that carries it. Second, it drives the positive rate down to 0.37% of timepoints; the AI observed the resulting 1.27x-chance balanced accuracy (0.636), attributed it to imbalance, and explicitly declined to change the representation, even though Step 12 of the instructions asks for accuracy below 1.5x chance to be investigated and fixed. Widening the pulse to the flash or flash+grey period was the obvious fix and is what the reference did.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements exactly the documented decision: a zero vector with trace[np.searchsorted(trial_ts, s_start)] = 1, i.e. the first frame at or after change onset, bounds-checked against n_frames. The converted data shows exactly one positive frame per go trial, consistent with the stated intent."
+  },
+  "4-c": {
+    "question": "How is `output` *Image change* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The variable is natively binary and both the AI and the reference emit {0,1} with labels ['no_change','change']; no thresholding is required or applied by either.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "output_values[1] = ['no_change','change'] matches the int values written to output_full[1], and the verification output reports the range as [0.0, 1.0] for every session."
+  },
+  "4-d": {
+    "question": "How is `output` *Image change* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same frame grid and same searchsorted-at-change-onset convention as the reference; the change marker coincides with the frame at which the image-identity row switches, which the AI verified visually in the --show-processing plots and listed as a planned sanity check.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The helper builds the same trial mask as the neural slice and indexes the change frame within trial_ts, so output_full[1] is length T and frame-synchronous. No off-by-one is present: searchsorted returns the first frame >= onset, which is the intended 'right after' semantics."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `output` *Running speed* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "processing/running/speed data+timestamps, which is precisely the filtered stream the SDK exposes as dataset.running_speed and that the reference used. The AI correctly used the filtered rather than the unfiltered variant, matching the whitepaper's 10 Hz low-pass description it recorded in Step 3.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Only those two datasets are read and they feed the interpolation directly; the speed_unfiltered stream is never touched."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `output` *Running speed*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: scipy interp1d linear interpolation of the 60 Hz stream onto the session's ophys timestamps with bounds_error=False and NaN fill outside coverage, done once per session and then sliced per trial. No extra filtering is applied to a stream that is already band-limited.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "interpolate_to_ophys is called once with the whole-session ophys_ts before the trial loop, and the per-trial value is running_at_ophys[frame_mask]. The AI's independent raw-NWB recomputation of the binned running trace matched with np.array_equal."
+  },
+  "5-c": {
+    "question": "How is `output` *Running speed* thresholded into categories?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Five equal-count percentile bins, as instructed, but computed per session rather than globally across all sessions as the reference does. Per-session edges make each session's marginal exactly uniform (globally 0.190/0.199/0.204/0.208/0.200) and remove between-session/between-mouse differences in locomotion; the cost is that a given bin index means a different cm/s in different sessions, which is a genuine semantic inconsistency for a decoder with a shared output head. Both choices are defensible and the AI documented and verified its one (Step 5 decision 8, Step 12 balance check), so this is an equally justified alternative rather than an error. Note the whole-session (not whole-trial) scope also matches the spirit of the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "compute_session_percentile_edges uses np.linspace(0,100,6) percentiles over non-NaN session values with +/-inf outer edges, and apply_percentile_bins digitizes against edges[1:-1] with a clip to [0,4] and NaN->0 -- exactly the documented scheme, and functionally the same digitize convention the reference uses. The resulting near-uniform marginals confirm it."
+  },
+  "5-d": {
+    "question": "How is `output` *Running speed* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Interpolated onto the ophys timebase before trial segmentation and sliced with the same frame mask as the neural data -- the same guarantee-by-construction approach the reference uses, justified by the hardware synchronisation of the streams that the AI documented in Step 3.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "running_at_ophys is defined on ophys_ts and indexed by the identical frame_mask used for dff, so row 2 of output has length T and is frame-aligned. Verified by the AI's np.array_equal spot check against raw NWB and by the overlay panels in the processing plots."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `output` *Pupil diameter* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI uses the ellipse-fit pupil *area* plus the likely_blink flag; the reference uses pupil_width plus likely_blink. Both are standard proxies for pupil diameter from the same DeepLabCut ellipse fit, and deriving a diameter from area (see 6-b) is if anything a slightly more principled scalar than a single ellipse axis, since it is invariant to the ellipse's orientation. Equally justified.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "acquisition/EyeTracking/pupil_tracking/area, its timestamps, and likely_blink/data are read, with None fallbacks when the groups are absent. The 'data' in pt['area'] guard resolves to False on this data so the plain area dataset is read, which is the intended array."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `output` *Pupil diameter*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "area -> equivalent-circle diameter (2*sqrt(area/pi)) is a sound, documented transform, and linear interpolation onto the ophys clock matches the reference. The one substantive difference is blink handling: the reference deletes blink rows and interpolates *across* them, producing a gap-free trace, whereas the AI leaves the blink samples as NaN inside the interpolation so blink periods emerge as NaN and are later assigned bin 0. Measured on experiment 775614751 that is ~5% of frames labelled as 'smallest pupil' when they are really missing. Conflating missing with the lowest bin is a real but bounded cost, the AI made the choice deliberately and documented it (trajectory step 62: adding a 6th blink class would deviate from the specified 5 bins), and the reference makes the same NaN->0 conflation for its own out-of-range samples. Defensible alternative rather than an error; the whole-session-missing case is scored under question 8.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code matches the behaviour documented in Steps 10 and 12 (blinks -> NaN -> bin 0). The Step 5 wording 'Set blink frames to NaN, then interpolate' could be misread as interpolating across blinks, but the later notes state the realised behaviour explicitly, and the AI's own spot check confirmed 'blinks=NaN confirmed'. The pupil_area[likely_blink] = np.nan line is redundant (the stored area is already NaN at blink frames) but harmless."
+  },
+  "6-c": {
+    "question": "How is `output` *Pupil diameter* thresholded into categories?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Same five-equal-percentile-bin scheme as running speed, with per-session edges instead of the reference's global edges. For pupil this is arguably the stronger of the two choices, since pupil area is measured in camera pixels and its absolute scale depends on the animal's position and the camera geometry, so a global edge set mixes incomparable units across sessions. The resulting marginals (0.200/0.199/0.214/0.221/0.166) are close to uniform, with the deviation attributable to NaN->bin 0 and to ties. Equally justified.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The same compute_session_percentile_edges/apply_percentile_bins pair is applied to pupil_at_ophys, with the all-NaN fallback returning linspace edges so that a session without eye tracking yields all zeros. Output range [0,4] in the verification report, with the 3 all-NaN sessions correctly showing [0,0]."
+  },
+  "6-d": {
+    "question": "How is `output` *Pupil diameter* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same approach as running speed and as the reference: interpolate onto ophys timestamps for the whole session, then slice with the neural frame mask, relying on the hardware sync between the eye camera and the 2P clock.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "pupil_at_ophys is defined on ophys_ts and indexed by the identical frame_mask, so row 3 has length T and is frame-aligned. The AI's np.array_equal spot check on experiment 775614751 reproduced the binned trace from raw NWB."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Trial outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Exactly the reference's four boolean trials-table columns hit / miss / false_alarm / correct_reject, checked in the same priority order. These are mutually exclusive and exhaustive over the retained go/catch trials -- independently verified across 5,276 trials in 25 active experiments with zero unlabelled and zero doubly-labelled trials.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_trial_outcome reads those four columns for the trial's own index and returns the first that is true, mirroring the reference's loop over TRIAL_OUTCOMES."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Trial outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: map to a fixed 0-3 code in the order hit/miss/false_alarm/correct_reject and broadcast the constant across every timepoint of the trial so the static variable fits the uniform (5, T) output matrix. The resulting distribution (hit 31.0%, miss 56.5%, FA 1.8%, CR 10.7%) was checked against expected behavioural rates in Step 9.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "outcome_names.index(outcome) produces the code and output_full[4] = outcome_idx broadcasts it over T, matching the stated decision; output_values[4] lists the categories in the same order. One latent weakness worth flagging (it does not contradict the stated decision and is never triggered on this data): the `else 0` fallback would silently relabel an unmatched trial as 'hit', where the reference uses an out-of-range -1 that would surface as an error."
+  },
+  "8": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "Most of the handling is sound and matches the reference in spirit: skip experiments with a missing file, zero cells, no stimulus table, or fewer than two usable trials; drop empty trial windows; the half-open trial mask cannot run past the end of the recording; NaN behavioural samples go to bin 0 (the reference does the same). Two choices are concerning. (1) Sessions whose eye tracking is entirely absent are kept rather than skipped, so 3 of 202 sessions carry a constant fabricated pupil label of bin_0 at every timepoint -- a degenerate, undecodable target that silently biases the pupil class distribution; the reference's try/except around session extraction would have dropped such sessions. (2) There is no exception guard at all around per-experiment loading, so unlike the reference a single corrupt or unexpected file aborts the entire 9-minute run rather than being skipped with a warning. Neither is technically wrong on the data as it stands -- the run completed and the AI documented the NaN->bin 0 choice deliberately -- but the fabricated constant-label sessions in particular should be reviewed by a human.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Every handling rule described in CONVERSION_NOTES is present in the code (the None returns for missing file / no cells / no stimulus table / <2 trials, the NaN->0 path in apply_percentile_bins, the all-NaN pupil fallback, the bytes decode and 'omitted' skip). The code does not claim try/except handling that it lacks, so implementation and stated decision agree."
+  },
+  "9-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same conclusion as the reference: data loading dominates and is I/O bound. The AI instrumented it rather than asserting it -- per-experiment load/process timings are printed, and summing the full run gives 380.8 s loading (70%), 138.0 s processing (25%), 14.4 s for the image-name prescan, ~10 s to assemble and pickle 8.5 GB, total 544.7 s. It also produced an up-front estimate from the sample run (~12.5 min) as the instructions required, and beat it.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The timing instrumentation (t_load, t_process, per-experiment and total elapsed) exists in the code and its printed values are what the log shows, so the claimed bottleneck is measured rather than assumed."
+  },
+  "9-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Like the reference, the AI left the per-trial loop unvectorised and justified it on the grounds that the total runtime met the instructions' 15-minute budget (9.1 min actual). The AI's loops are nonetheless meaningfully heavier than the reference's: build_image_identity_trace and build_image_change_trace each rescan the whole ~4,800-row stimulus table from index 0 for every one of ~250 trials, using a linear list.index() lookup per presentation and constructing a fresh boolean mask each time -- roughly 10^6 Python iterations per session where two np.searchsorted calls (or one whole-session vectorised label fill, then slicing) would do. The full-length boolean trial mask is also rebuilt three times per trial over ~140k timestamps, and the outer experiment loop is embarrassingly parallel. This costs 138 s of the 545 s run, so the decision to leave it is defensible even though the reference's structure is cleaner.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops described above are in fact what the code contains, and they produce correct results -- the inefficiency does not change any output value. The early `break` when s_start >= trial_stop is present and correct; only the missing skip-ahead at the start of each scan is left on the table."
+  },
+  "9-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference repeats nothing; the AI repeats three things. Every NWB file is opened twice -- once by get_all_image_names purely to harvest the 16 image labels, once for the real read -- which is exactly the 'unnecessary file I/O' the instructions ask to avoid, though it costs only 14.4 s (2.6%). The trial frame mask is recomputed three times per trial, and the stimulus table is rescanned from scratch per trial. The prescan does serve a correctness purpose (a globally consistent image code alphabet across sessions with different image sets, which the reference achieves by collecting names after extraction), and the total cost is small, so this is a reasonable if suboptimal trade rather than a bad decision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The repeated work is genuinely present (get_all_image_names loops over the same exp_table the main loop then re-reads; both output helpers recompute the mask that process_experiment already holds) and it is benign -- the repeated computations produce identical results, so no output is affected."
+  },
+  "9-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference reports none; the AI's script carries a handful of harmless leftovers -- a fully implemented discretize_percentile() that is never called, cell_roi_ids read from every file and never used, trials-table columns change_time / initial_image_name / change_image_name / is_change and the stimulus 'omitted' column read but unused (the AI took identity and change from the stimulus table instead), an output_static array built and then discarded in favour of broadcasting, and per-session dt values of which only the median reaches metadata. The measurable cost is negligible and none of it affects the output, but it is more dead weight than the reference carries and the dead helper in particular invites confusion about which discretisation path is live. Broadcasting the static trial outcome over T timepoints also multiplies that row's storage, though that is a deliberate format choice rather than waste.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The unused function, unused reads and orphaned output_static are all really in the file and are all genuinely unreferenced, so the description matches the code; none of them alters any converted value."
+  }
+}
