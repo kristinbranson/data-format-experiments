@@ -1,0 +1,268 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI used the same three raw sources as the reference: behavior files, session spike files, and retinotopy files, and it still anchored subject/session identity in Imaging_Exp_info.npy. It differed in implementation by scanning nearly all behavior files up front and merging views by raw session key instead of iterating behavior files via the master index records.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements that plan: build_session_specs reads Imaging_Exp_info.npy, scans Beh_*.npy files, groups by raw_key, then process_session loads spikes and retinotopy per session."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the AI uses the mouse name from the experiment metadata as the subject identifier and builds subjects/subject_idx from the unique subject names.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "raw_to_subject is populated from rec['mname'], SessionSpec stores subject, and the final dataset builds sorted subjects plus subject_idx from spec.subject."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI and the reference both treat one mouse-date-block recording as one session and both deduplicate repeated analysis views of the same recording. The AI's merge-by-raw-key implementation differs, but the session unit matches the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "parse_raw_session_key keeps the first five key components and build_session_specs produces one SessionSpec per raw_key."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference keeps all corridor frames in each trial using ft_trInd and ft_CorrSpc. The AI redefined each trial as only the running subset of corridor frames by adding ft_move > 0, which changes the within-trial sequence and drops pauses from the middle of trials.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_trial_frame_indices explicitly uses (ft_trInd == trial) & ft_CorrSpc & ft_move, and all later trial slicing uses those indices."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference drops empty trials and trials longer than the global 99th-percentile traversal length. The AI only drops trials with zero selected frames and sessions with fewer than two surviving trials; it does not implement the long-trial outlier filter.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code skips frame_idx.size == 0 trials and raises an error for sessions with fewer than 2 valid trials, but there is no percentile-based trial-length cutoff anywhere in the script."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "As in the reference, the neural activity comes from spks in the session spike file and the neuron area labels come from iarea in the retinotopy file.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "load_spike_planes returns obj['spks'] and load_retinotopy returns iarea."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI does not recompute dF/F or deconvolution and stores per-trial slices as float16 without padding, which matches the reference at a high level. The important difference is the frame mask, but that is the alignment/trial-definition choice rather than separate neural preprocessing.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each neural trial is built by concatenating plane[:, frame_idx] across planes and casting to float16."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference keeps only neurons assigned to V1, mHV, lHV, or aHV and drops other area codes. The AI retained all neurons by creating an 'other' bucket. That is defensible given the public code, but it diverges from the human reference's curation choice and changes the neural population substantially.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "build_brain_region_idx assigns V1/mHV/lHV/aHV/other codes and the final dataset stores those indices without filtering any neurons out."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference aligns trials to corridor entry and keeps contiguous corridor frames through the traversal. The AI claims corridor-entry alignment but actually starts at the first running corridor frame and removes stationary frames within the trial, so the converted neural series are not contiguous trial-start-aligned trajectories.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The actual neural alignment is entirely determined by frame_idx from get_trial_frame_indices, which enforces corridor-and-running frames only."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI, like the reference, uses the imaging frame as the time bin at 3.17 Hz and does not add temporal rebinning.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "TIME_BIN_MS is set to 1000 / 3.17 and stored in metadata; the neural arrays are frame slices rather than temporally resampled data."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time to sound cue* derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference derives time to cue from SoundFr and frame timestamps ft. The AI instead derives it from SoundPos and ft_Pos, converting spatial distance to time with a nominal VR speed.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "process_session reads SoundPos and ft_Pos and computes cue_sec from those variables; SoundFr and ft are not used for this input."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time to sound cue*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference interpolates cue time onto the frame-time axis and subtracts actual frame timestamps. The AI computes motion-time-to-cue as (cue_position - current_position) / 60 cm/s, which is a different quantity when mice pause or when stationary frames are dropped.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "cue_sec is implemented exactly as a position difference divided by CORRIDOR_SPEED_DM_PER_S."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time to sound cue* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Despite using a different underlying time definition, the AI still aligns this input to the same per-trial samples as the neural data, which matches the reference alignment principle.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "cue_sec is computed from ft_Pos[frame_idx], and neural_trial is sliced using the same frame_idx."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `input` *Day of training* derived from?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference effectively derives training day from within-mouse session order. The AI derives it from calendar date and block parsed from the raw session key. That is a plausible interpretation of 'day of training', but it is not the reference decision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "build_session_specs parses date/block from raw_key and computes each subject's first date before assigning training_day."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `input` *Day of training*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference uses session count order per mouse, with first session 0 and later sessions incrementing by one. The AI instead uses elapsed calendar days since first imaging plus a small same-day block offset, which is materially different.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "training_day is explicitly computed as float((date - subject_first_date[subject]).days) + 0.01 * (block - 1) and then broadcast into each trial."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `input` *Time since trial start* derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference derives this from StartFr and ft. The AI derives it from ft_Pos only, after frame selection, and does not use StartFr for the actual time value.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "t_sec is computed from trial_pos_dm = ft_Pos[frame_idx] and CORRIDOR_SPEED_DM_PER_S; StartFr is never used in the final calculation."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `input` *Time since trial start*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference interpolates StartFr onto actual frame times and subtracts that start time from each frame's timestamp. The AI instead converts position to nominal motion time by dividing by 60 cm/s, which is not the same as time since trial start in the reference implementation.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code directly sets t_sec = trial_pos_dm / CORRIDOR_SPEED_DM_PER_S."
+  },
+  "5-c": {
+    "question": "How is the `input` *Time since trial start* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "As in the reference, the input is aligned by evaluating it on the same kept per-trial samples as the neural data.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "t_sec is computed from ft_Pos[frame_idx] and stored in the same trial for which neural_trial uses frame_idx."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `input` *Reward availability* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the AI and the reference derive reward availability from the trial-level isRew flag.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "process_session reads beh['isRew'] and uses is_rew[trial] for this input."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `input` *Reward availability*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI simply broadcasts the trial-level reward flag across each trial, which matches the reference approach.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "reward_trial is created by np.full(frame_idx.size, float(is_rew[trial]), ...)."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Visual stimulus category* derived from?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference derives stimulus category directly from WallName with a fixed texture-collapsing map. The AI uses WallName plus a session-specific mapping built from UniqWalls and stim_id across merged behavior views. That may recover more paper-specific label structure, but it departs from the reference's simpler definition.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "build_wall_to_stimulus_map uses UniqWalls and stim_id, and process_session applies that mapping to each trial's WallName."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Visual stimulus category*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The reference collapses wall names into four broad texture categories: circle, leaf, rock, wood. The AI instead emits 8 finer-grained canonical labels such as circle1, leaf2, and leaf1_swap1. That does not match the human reference and is less aligned with the task wording's coarse example categories.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "OUTPUT_STIMULI contains 8 classes, stimulus_idx is looked up from that list, and the chosen class is broadcast across the trial."
+  },
+  "8-a": {
+    "question": "What variables in the raw data is `output` *Licking* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference uses LickFr; the AI uses LickFr plus LickTrind. Adding LickTrind is a reasonable refinement for per-trial assignment and does not conflict with the raw lick timing.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code reads both arrays and uses lick_trials == trial together with lick_frames to generate the per-trial signal."
+  },
+  "8-b": {
+    "question": "What processing is involved in computing `output` *Licking*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the AI creates a binary per-frame lick vector where frames with one or more licks are labeled 1.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "binarize_licks constructs a zero vector and sets the entries corresponding to kept lick frames to 1."
+  },
+  "8-c": {
+    "question": "How is `output` *Licking* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI aligns licking to the same per-trial sample indices used for neural data, matching the reference alignment logic.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "binarize_licks is called with frame_idx, the same index array used to slice the neural trial."
+  },
+  "9-a": {
+    "question": "What variables in the raw data is `output` *Position in corridor* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both implementations derive the position output directly from ft_Pos.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "process_session reads beh['ft_Pos'] and passes ft_pos[frame_idx] into position_to_bins."
+  },
+  "9-b": {
+    "question": "What processing is involved in computing `output` *Position in corridor*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI uses the same basic processing as the reference: divide decimeter positions into four 1 m bins by flooring ft_Pos / 10 and clipping to 0-3.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "position_to_bins performs floor(pos_dm / 10) followed by clipping to 0..3."
+  },
+  "9-c": {
+    "question": "How is `output` *Position in corridor* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The thresholds correspond to the four requested 1 m bins over the textured corridor, matching the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The implementation yields bins for [0,1), [1,2), [2,3), and [3,4+] meters."
+  },
+  "9-d": {
+    "question": "How is `output` *Position in corridor* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI samples position on the same retained per-trial frames as neural activity, which matches the reference alignment principle.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "pos_bins is computed from ft_pos[frame_idx], where frame_idx is also used for the neural trial slice."
+  },
+  "10-a": {
+    "question": "What variables in the raw data is `output` *Running speed* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the AI derives running speed from ft_RunSpeed.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "ft_speed is read from beh['ft_RunSpeed'] and trial values are taken as ft_speed[frame_idx]."
+  },
+  "10-b": {
+    "question": "What processing is involved in computing `output` *Running speed*?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference computes per-session rank-based quartiles over the kept frames, specifically to handle many tied speeds. The AI instead uses dataset-wide numeric quantile thresholds. That is defensible for cross-session consistency, but it is a substantive departure from the reference and less robust to ties.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "apply_speed_bins concatenates all speed_trials, computes np.quantile edges, and bins each trial by those thresholds."
+  },
+  "10-c": {
+    "question": "How is `output` *Running speed* thresholded into categories?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The AI thresholds by three global quantile values and np.digitize, whereas the reference uses a rank-based quartile assignment within session. The AI's thresholds are plausible but not the reference method.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The thresholding logic is exactly quantiles[1:-1] passed to np.digitize."
+  },
+  "10-d": {
+    "question": "How is `output` *Running speed* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI aligns running speed to the same retained samples as the neural data, which is the same alignment pattern used by the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "speed_trial is sampled from ft_speed[frame_idx], and only its categorical encoding is changed later."
+  },
+  "11": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The reference mainly trims behavior arrays to the imaged frame count and drops licks beyond that range. The AI does that kind of trimming implicitly, but also adds explicit integrity checks for duplicate behavior consistency, spike-plane frame-count mismatches, retinotopy count mismatches, missing stimulus mappings, empty trials, and sessions with too few valid trials. That is more robust than the reference solution.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Those checks are all present in validate_duplicate_behavior_views, process_session, build_wall_to_stimulus_map, and the empty-trial/session guards."
+  },
+  "12-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The reference correctly highlights spike-file I/O as the dominant cost. The AI recognized that same cost and additionally identified serialization and dense per-trial slicing/concatenation as major bottlenecks in its own implementation, which is a more complete assessment of the final script.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does heavy spike loading, per-trial concatenation, and a large final pickle dump, so the claimed bottlenecks are consistent with the implementation."
+  },
+  "12-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "As in the reference, the AI still has a trial loop that rescans frame labels to find frames for each trial. It also adds more Python-level loops later, but the same core vectorization opportunity remains.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_trial_frame_indices, the main trial-construction loop, and the later speed-binning loop are all explicit Python loops over trials."
+  },
+  "12-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference solution avoids most repeated work. The AI repeats some processing: trial-frame extraction is done during sample selection and again during conversion, retinotopy is loaded in sample selection and then again for real processing, and speed values are stored first and discretized in a second pass.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The repeated calls are visible in count_trials_with_corridor_licks vs process_session, get_session_neuron_count vs process_session, and the speed_trials plus apply_speed_bins design."
+  },
+  "12-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The reference does little obviously unnecessary work. The AI includes plotting infrastructure, stores continuous speed_trials only to later replace the final categorical speed output, and computes extra metadata such as session label maps that the downstream decoder does not need.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Those extra computations and temporary structures are explicitly present in the final script and are not part of the required decoder-facing dataset structure."
+  }
+}
