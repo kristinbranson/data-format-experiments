@@ -2,26 +2,38 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent uses `VisualBehaviorOphysProjectCache.from_local_cache('/app/data')`, gets the ophys experiment table, intersects it with locally present experiment files, excludes passive sessions, groups experiments by `ophys_session_id`, and loads every experiment/plane in each selected group through `get_behavior_ophys_experiment`. Session jobs are normally processed by a 16-process pool.
+i. The agent loads data through the AllenSDK `VisualBehaviorOphysProjectCache` local cache at `/app/data`, not from S3. It starts from the experiment table, restricts to experiment IDs that actually have local NWB files, excludes passive sessions, groups experiments by `ophys_session_id`, and then loads each experiment with `get_behavior_ophys_experiment()`.
 
 ii.
 ```python
-bc = VisualBehaviorOphysProjectCache.from_local_cache(cache_dir=CACHE_DIR)
-et = bc.get_ophys_experiment_table()
-local_ids = set(int(f.split('_')[-1].split('.')[0]) for f in os.listdir(
-    os.path.join(CACHE_DIR, 'visual-behavior-ophys-1.1.0',
-                 'behavior_ophys_experiments')))
-et = et.loc[sorted(set(et.index).intersection(local_ids))]
-et = et[~et.passive]
-...
-ds = bc.get_behavior_ophys_experiment(int(eid))
+def get_cache():
+    from allensdk.brain_observatory.behavior.behavior_project_cache import (
+        VisualBehaviorOphysProjectCache)
+    return VisualBehaviorOphysProjectCache.from_local_cache(cache_dir=CACHE_DIR)
+
+def select_sessions(sample=False):
+    bc = get_cache()
+    et = bc.get_ophys_experiment_table()
+    local_ids = set(int(f.split('_')[-1].split('.')[0]) for f in os.listdir(
+        os.path.join(CACHE_DIR, 'visual-behavior-ophys-1.1.0',
+                     'behavior_ophys_experiments')))
+    et = et.loc[sorted(set(et.index).intersection(local_ids))]
+    et = et[~et.passive]
+    groups = []
+    for sid, sub in et.groupby('ophys_session_id'):
+        groups.append((int(sid), sorted(int(i) for i in sub.index)))
 ```
 
-iii. The notes say SDK-only loading obeys the requirement and avoids direct NWB access. Restricting to local IDs avoids network fetches; passive sessions are excluded because the requested task is active Visual Behavior. Multiprocessing addresses the dominant file-loading cost.
+```python
+for k, eid in enumerate(experiment_ids):
+    ds = bc.get_behavior_ophys_experiment(int(eid))
+```
+
+iii. In `CONVERSION_NOTES.md` the agent says it used `from_local_cache('/app/data')` because the provided dataset is already a local AllenSDK cache, and that it intentionally restricted processing to active, locally present sessions.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are the sorted unique string-valued `mouse_id`s among successfully processed sessions; each session gets the index of its mouse in that list.
+i. Subjects are split by `mouse_id`. The final `subjects` list is the sorted set of mouse IDs among kept sessions.
 
 ii.
 ```python
@@ -30,59 +42,75 @@ subjects = sorted(set(r['mouse_id'] for r in results))
 data['subject_idx'].append(subjects.index(r['mouse_id']))
 ```
 
-iii. The notes treat the SDK `mouse_id` as the animal identifier and report 38 locally represented mice.
+iii. `CONVERSION_NOTES.md` treats `metadata['mouse_id']` as the canonical animal identifier and reports subject counts from that field.
 
 ## 1-c. How are the data split into sessions?
 
-i. A session is one `ophys_session_id`. All locally available active experiments (imaging planes) sharing that ID are combined; neural rows are concatenated across planes. Sessions with no usable eye tracking, or fewer than two go/catch trials, are skipped.
+i. Sessions are split by unique `ophys_session_id`. All experiments/imaging planes with the same session ID are grouped into one session.
 
 ii.
 ```python
 for sid, sub in et.groupby('ophys_session_id'):
     groups.append((int(sid), sorted(int(i) for i in sub.index)))
-...
-neural = np.concatenate(neural_planes, axis=0)
 ```
 
-iii. The agent correctly recognized that an ophys experiment is a plane and an `ophys_session_id` is the simultaneous behavioral recording. It excluded passive sessions and three eye-tracking-free sessions so every retained session supports all requested outputs.
+```python
+session_definition='one ophys_session_id; all active imaging planes concatenated as neurons'
+```
+
+iii. In `CONVERSION_NOTES.md` Step 5, the agent states that one session should be one `ophys_session_id`, with all active planes concatenated.
 
 ## 1-d. How are the data split into trials?
 
-i. Trials come from `dataset.trials`; rows where `go` or `catch` is true are retained. Rather than retaining the SDK trial from `start_time` to `stop_time`, every trial becomes a fixed window from 2 seconds before to 3 seconds after `change_time`, divided into 20 bins.
+i. Trials are not taken as the full AllenSDK trial windows. Instead, the agent keeps `go` and `catch` rows from `dataset.trials`, aligns each one to `change_time`, and creates a fixed `[-2.0 s, +3.0 s]` window around the change, binned into twenty 250 ms bins.
 
 ii.
 ```python
-trials = ds.trials
+BIN_SIZE = 0.25
+OFF_START = -2.0
+OFF_END = 3.0
+NBINS = int(round((OFF_END - OFF_START) / BIN_SIZE))
+
 keep = trials[(trials.go | trials.catch)]
 change_times = keep.change_time.values.astype(float)
 edges = bin_edges_for_trials(change_times)
 ```
 
-iii. The agent chose `change_time` because it exists for both real go changes and sham catch changes, gives equal-length examples, and supports a common alignment. It states that the window supplies a pre-change baseline and remains inside every trial.
+```python
+def bin_edges_for_trials(change_times):
+    offsets = OFF_START + BIN_SIZE * np.arange(NBINS + 1)
+    return change_times[:, None] + offsets[None, :]
+```
+
+iii. The notes say the agent chose fixed windows around `change_time` because `change_time` exactly matches a stimulus flash onset, 250 ms bins match the flash structure, and the measured trial timing guaranteed the `[-2, +3]` window stayed inside each trial.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Keeping only `go | catch` implicitly removes aborted and auto-rewarded trials. A session is rejected if it has fewer than two retained trials; sessions without usable pupil data are also rejected wholesale.
+i. The code keeps only `go` or `catch` trials, drops sessions with fewer than two such trials, and drops whole sessions with no usable eye-tracking data. It does not separately clip each trial to `start_time`/`stop_time` because it assumes the fixed `change_time` window is always covered.
 
 ii.
 ```python
 keep = trials[(trials.go | trials.catch)]
 if len(keep) < 2:
     return None
-...
+```
+
+```python
 if pupil_binned is None:
     return dict(skip=True, ophys_session_id=int(ophys_session_id),
                 reason='no eye tracking')
 ```
 
-iii. This directly follows the requested trial classes. The notes justify dropping no-eye-tracking sessions because the pupil output otherwise cannot be defined.
+iii. `CONVERSION_NOTES.md` says the agent followed the task’s “keep go+catch” instruction, excluded passive sessions, and dropped the three sessions with no eye-tracking because the pupil output could not be defined.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. By default neural data comes from each experiment’s SDK `dff_traces['dff']`. Command-line alternatives can use `events['events']` or `events['filtered_events']`.
+i. By default the final `neural` data come from `dataset.dff_traces['dff']`. The script also exposes `events` and `filtered_events` as options, but the shipped conversion uses the default `dff`.
 
 ii.
 ```python
+ap.add_argument('--neural-signal', choices=['events', 'filtered_events', 'dff'], default='dff')
+...
 if signal == 'dff':
     ev = ds.dff_traces
     E = np.vstack(ev['dff'].values).astype(np.float32)
@@ -91,11 +119,11 @@ else:
     E = np.vstack(ev[signal].values).astype(np.float32)
 ```
 
-iii. The agent acknowledges that the paper used detected calcium events, but selected dF/F after decoder comparisons showed better performance on four of five outputs and eliminated all-zero sparse trials.
+iii. The notes explain that the paper used events, but the agent switched to dF/F after a decoder comparison and kept the events-based variants as command-line options.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Each plane is binned using timestamp-based cumulative sums. Default dF/F is averaged per 250-ms bin; event alternatives are summed. Binned planes are concatenated along the neuron axis and stored as float32.
+i. Neural traces are loaded plane by plane, binned into 250 ms windows around each trial’s `change_time`, and then concatenated across planes along the neuron axis. For dF/F, the code computes the mean within each bin; for events, it uses bin sums.
 
 ii.
 ```python
@@ -108,65 +136,75 @@ neural_planes.append(binned)
 neural = np.concatenate(neural_planes, axis=0)
 ```
 
-iii. Averaging dF/F avoids artificial scaling when 250-ms bins contain different frame counts on 11-Hz versus 31-Hz rigs. Cumulative-sum binning was chosen for speed and well-defined empty-bin behavior.
+iii. In the notes, the agent justifies 250 ms bins as flash-locked and says dF/F should be averaged, not summed, because the number of ophys frames per bin differs across rigs.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No additional cell-level filtering is performed. The code relies on SDK-delivered traces, which already exclude invalid ROIs. It excludes passive sessions and sessions lacking eye tracking.
+i. There is no additional neuron-level filtering beyond what the AllenSDK already returns. The code uses all cells in `dff_traces`/`events` for the kept sessions.
 
 ii.
 ```python
-E = np.vstack(ev['dff'].values).astype(np.float32)
-...
-et = et[~et.passive]
+if signal == 'dff':
+    ev = ds.dff_traces
+    E = np.vstack(ev['dff'].values).astype(np.float32)
+else:
+    ev = ds.events
+    E = np.vstack(ev[signal].values).astype(np.float32)
 ```
 
-iii. The notes state that AllenSDK’s default `exclude_invalid_rois=True` embodies pipeline ROI QC and that the paper adds no further cell filter.
+iii. `CONVERSION_NOTES.md` says ROI validity filtering is already applied by the SDK (`exclude_invalid_rois=True`), so the agent did not add extra per-cell QC.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural samples are aligned to `trials.change_time`, including sham change time for catch trials, using bin edges spanning [-2, +3] seconds.
+i. Each trial is aligned to `trials.change_time`, not to `start_time`. The neural window spans `[-2.0, +3.0]` seconds around that event.
 
 ii.
 ```python
-def bin_edges_for_trials(change_times):
-    offsets = OFF_START + BIN_SIZE * np.arange(NBINS + 1)
-    return change_times[:, None] + offsets[None, :]
+change_times = keep.change_time.values.astype(float)
+edges = bin_edges_for_trials(change_times)
+...
+temporal_alignment_event=('stimulus change time (trials.change_time): the onset of the '
+                          'changed image on go trials, of the sham change on catch trials')
 ```
 
-iii. The notes call `change_time` the natural shared event for go and catch trials and verify it coincides with a flash onset.
+iii. The notes repeatedly state that `change_time` exactly matches the onset of the real or sham change flash, so the agent treated it as the natural alignment event.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The resolution is 250 ms. Native ophys frames are explicitly rebinned into 20 bins per fixed 5-second window.
+i. The converted neural data are rebinned to 250 ms bins. The original frame-rate resolution is not preserved in the final dataset.
 
 ii.
 ```python
 BIN_SIZE = 0.25
-OFF_START = -2.0
-OFF_END = 3.0
 NBINS = int(round((OFF_END - OFF_START) / BIN_SIZE))
+...
+data['metadata'] = dict(
+    ...
+    time_bin_size=BIN_SIZE * 1000.0,
 ```
 
-iii. The agent chose 250 ms to equal the image-on duration and one third of the 750-ms flash cycle, making bins phase-locked to the stimulus.
+iii. The notes justify 250 ms because it equals the image-on duration and divides the 750 ms flash cycle into three stimulus-locked bins.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. It is derived from `dataset.stimulus_presentations`: `start_time`, `image_name`, and `stimulus_block_name`. Omitted image names are replaced by neighboring image identity.
+i. Image identity is derived from `dataset.stimulus_presentations.image_name`, restricted to the change-detection block. Omitted flashes are forward/back-filled so every flash interval has an image label.
 
 ii.
 ```python
-sp = dataset.stimulus_presentations
-sp = sp[sp.stimulus_block_name.str.contains('change_detection')]
-sp = sp.sort_values('start_time')
-names = sp.image_name.astype(str).replace('omitted', np.nan).ffill().bfill().values
+def flash_table(dataset):
+    sp = dataset.stimulus_presentations
+    sp = sp[sp.stimulus_block_name.str.contains('change_detection')]
+    sp = sp.sort_values('start_time')
+    names = sp.image_name.astype(str).replace('omitted', np.nan).ffill().bfill().values
+    return (sp.start_time.values.astype(float), names,
+            sp.is_change.values.astype(bool), sp)
 ```
 
-iii. The notes prefer the flash table because it represents the actual stimulus stream, including omissions, over reconstructing identity solely from trial columns.
+iii. The notes say image identity should be attached to the 750 ms image-presentation interval, and omitted flashes should inherit the previous image identity.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. For every output-bin center, the most recent change-detection flash is found. Its forward/back-filled image name is assigned, then all dataset-wide names are sorted and encoded as integers.
+i. The code looks up the flash containing each 250 ms bin centre, assigns that flash’s image name, then maps global image names to integer codes shared across sessions.
 
 ii.
 ```python
@@ -174,77 +212,103 @@ centres = edges[:, :-1] + BIN_SIZE / 2.0
 fidx = np.searchsorted(starts, centres.ravel(), side='right') - 1
 fidx = np.clip(fidx, 0, len(starts) - 1)
 image_name = names[fidx].reshape(ntrials, NBINS)
+```
+
+```python
+images = sorted(set(np.concatenate([r['image_name'].ravel() for r in results])))
+img_index = {n: i for i, n in enumerate(images)}
 ...
 img_idx = np.vectorize(img_index.get)(r['image_name']).astype(np.int64)
 ```
 
-iii. The agent defines identity across the full 750-ms presentation interval, including gray periods; omitted flashes inherit the prior identity.
+iii. `CONVERSION_NOTES.md` says the agent wanted a global 16-image vocabulary and a time-varying image label defined by the flash interval containing each bin centre.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Identity is sampled at the centers of the exact same change-aligned 250-ms bins used for neural aggregation, producing an `(ntrials, 20)` array.
+i. It is aligned to the same 250 ms trial bins as the neural data. Each bin’s image identity is read out at that bin’s centre time.
+
+ii.
+```python
+centres = edges[:, :-1] + BIN_SIZE / 2.0
+fidx = np.searchsorted(starts, centres.ravel(), side='right') - 1
+image_name = names[fidx].reshape(ntrials, NBINS)
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
+```
+
+iii. The notes describe all outputs as being built on the same fixed-bin time base as the binned neural data.
+
+## 4-a. What variables in the raw data is `output` *Image change* derived from?
+
+i. The code derives image change from `dataset.stimulus_presentations.is_change` in the change-detection stimulus table, using the flash associated with each bin centre.
+
+ii.
+```python
+starts, names, is_change, sp = flash_table(ds)
+...
+if change_window == 'interval':
+    change_flag = is_change[fidx].reshape(ntrials, NBINS).astype(np.int64)
+else:
+    change_flag = np.zeros((ntrials, NBINS), dtype=np.int64)
+    flash_start = starts[fidx].reshape(ntrials, NBINS)
+    first_bin = (centres - flash_start) < BIN_SIZE
+    change_flag[is_change[fidx].reshape(ntrials, NBINS) & first_bin] = 1
+```
+
+iii. The notes say the agent moved away from a trial-table-only definition and instead used the stimulus table so the change output would refer to the actual change flash.
+
+## 4-b. What processing is involved in computing `output` *Image change*?
+
+i. The processing finds which stimulus flash each 250 ms bin centre falls into, checks whether that flash is marked `is_change`, and then emits either a single-bin or full-interval indicator depending on `--change-window`. The default is the single-bin version.
+
+ii.
+```python
+ap.add_argument('--change-window', choices=['interval', 'bin'], default='bin')
+...
+fidx = np.searchsorted(starts, centres.ravel(), side='right') - 1
+...
+first_bin = (centres - flash_start) < BIN_SIZE
+change_flag[is_change[fidx].reshape(ntrials, NBINS) & first_bin] = 1
+```
+
+iii. The notes say the default was changed to a single 250 ms bin because that matched the agent’s reading of “right after a change” and slightly improved decoding.
+
+## 4-c. How is `output` *Image change* thresholded into categories?
+
+i. It is represented as a binary categorical variable: `0` for no change and `1` for change.
+
+ii.
+```python
+output_values=[images, ['no_change', 'change'],
+               [f'q{i+1}' for i in range(NQUANTILES)],
+               [f'q{i+1}' for i in range(NQUANTILES)],
+               OUTCOMES]
+```
+
+iii. The notes describe this output as a binary event label with `no_change` and `change` categories.
+
+## 4-d. How is `output` *Image change* aligned with the neural data?
+
+i. It is aligned to the same 250 ms bins as neural activity, using the change status of the flash containing each bin centre.
 
 ii.
 ```python
 centres = edges[:, :-1] + BIN_SIZE / 2.0
 ...
-image_name = names[fidx].reshape(ntrials, NBINS)
-```
-
-iii. The agent reports plots and independent checks showing the image switches in the change bin without a temporal shift.
-
-## 4-a. What variables in the raw data is `output` *Image change* derived from?
-
-i. It is derived from `stimulus_presentations.start_time` and `is_change` within the change-detection block.
-
-ii.
-```python
-return (sp.start_time.values.astype(float), names,
-        sp.is_change.values.astype(bool), sp)
-```
-
-iii. The notes identify `is_change` as the SDK’s canonical indicator for an actual new image and distinguish it from a catch trial’s sham change time.
-
-## 4-b. What processing is involved in computing `output` *Image change*?
-
-i. In the default `bin` mode, the code locates the flash containing each bin center and sets 1 only if it is a true change flash and the bin center is within its first 250 ms. An optional mode marks all three bins of the 750-ms interval.
-
-ii.
-```python
 change_flag = np.zeros((ntrials, NBINS), dtype=np.int64)
-flash_start = starts[fidx].reshape(ntrials, NBINS)
-first_bin = (centres - flash_start) < BIN_SIZE
-change_flag[is_change[fidx].reshape(ntrials, NBINS) & first_bin] = 1
+...
+neural_trials.append(np.ascontiguousarray(r['neural'][:, t, :], dtype=np.float32))
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
 ```
 
-iii. A controlled decoder comparison favored the single change bin, and the agent viewed it as the literal meaning of “right after a change.”
-
-## 4-c. How is `output` *Image change* thresholded into categories?
-
-i. It is directly binary: 0 (`no_change`) or 1 (`change`); there is no numeric threshold beyond the boolean SDK `is_change` and first-bin timing test.
-
-ii.
-```python
-output_values=[images, ['no_change', 'change'], ...]
-```
-
-iii. The agent treats `is_change` as already categorical and verifies go trials have one positive bin while catch trials have none.
-
-## 4-d. How is `output` *Image change* aligned with the neural data?
-
-i. It has one value at each shared bin center. With the default window, the positive value is expected at bin 8 (0 to 0.25 seconds) for every go trial.
-
-ii.
-```python
-expect[int((0 - OFF_START) / BIN_SIZE):
-       int((0 - OFF_START) / BIN_SIZE) + nchange_bins] = 1
-```
-
-iii. The notes validate the expected pattern against raw SDK presentations and require catch trials to remain zero.
+iii. The notes treat all outputs as living on the same fixed bin grid as the neural data.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. It comes from `dataset.running_speed['speed']` and its `timestamps`.
+i. Running speed is derived from `dataset.running_speed`, specifically its `speed` and `timestamps` columns.
 
 ii.
 ```python
@@ -253,188 +317,302 @@ speed = np.asarray(rs['speed'].values, dtype=float)
 speed_t = np.asarray(rs['timestamps'].values, dtype=float)
 ```
 
-iii. The notes use the SDK’s processed wheel speed in cm/s, already low-pass filtered and cleaned by the release pipeline.
+iii. The notes identify `dataset.running_speed` as the AllenSDK locomotion stream and describe it as the correct source for this output.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. NaNs are linearly interpolated, speed samples are averaged within each 250-ms trial bin, and those means are discretized into quintiles.
+i. The code linearly interpolates NaNs in the raw running signal if any exist, averages running speed within each 250 ms trial bin, and then discretizes each session’s binned values into five equal-percentile bins.
 
 ii.
 ```python
 speed = interpolate_nans(speed)
 running_binned = bin_mean_1d(speed, speed_t, edges)
-...
-qs = np.percentile(v.ravel(), np.linspace(0, 100, nq + 1))
-out.append(np.digitize(v, qs[1:-1], right=False).astype(np.int64))
 ```
 
-iii. Bin means respect the higher-rate behavior clock. Interpolation is a fallback for missing samples; quintiles create the requested categorical output.
+```python
+run_q, run_edges = discretize([r['running'] for r in results], scope=args.quantile_scope)
+...
+def discretize(values_list, nq=NQUANTILES, scope='session'):
+    allv = np.concatenate([v.ravel() for v in values_list])
+    global_qs = np.percentile(allv, np.linspace(0, 100, nq + 1))
+    if scope == 'global':
+        ...
+    else:
+        out = []
+        for v in values_list:
+            qs = np.percentile(v.ravel(), np.linspace(0, 100, nq + 1))
+            out.append(np.digitize(v, qs[1:-1], right=False).astype(np.int64))
+```
+
+iii. The notes say the agent explicitly changed from global to per-session quintiles because global thresholds partly encoded session identity and performed slightly worse.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Default thresholds are the 0/20/40/60/80/100 percentiles computed separately within each session over all retained trial-bin means. A global option exists.
+i. Running speed is thresholded into five quantile bins, with the default thresholds computed separately within each session.
 
 ii.
 ```python
-run_q, run_edges = discretize([r['running'] for r in results],
-                              scope=args.quantile_scope)
+ap.add_argument('--quantile-scope', choices=['session', 'global'], default='session')
+...
+out.append(np.digitize(v, qs[1:-1], right=False).astype(np.int64))
 ```
 
-iii. The agent argues per-session bins avoid encoding session-specific running baselines and gave slightly better decoder results, while guaranteeing approximately balanced classes per session.
+iii. In the notes, the agent justifies per-session quintiles by saying running baselines differ across animals and sessions, so session-wise bins are more interpretable than one global threshold set.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Running samples are averaged directly within the same absolute timestamp edges used for each neural bin. Empty behavior bins fall back to linear interpolation at the bin center.
+i. Running speed is aligned by averaging the running samples that fall inside each neural trial bin. The final running output has the same twenty 250 ms bins as the neural matrix.
 
 ii.
 ```python
-running_binned = bin_mean_1d(speed, speed_t, edges)
+def bin_mean_1d(values, sample_times, edges):
+    v = values[None, :]
+    ones = np.ones_like(v)
+    s = bin_sum(v, sample_times, edges)[0]
+    n = bin_sum(ones, sample_times, edges)[0]
+    ...
+    return m
 ```
 
-iii. Shared hardware-clock timestamps and identical edges provide alignment without first resampling the complete stream.
+```python
+running_binned = bin_mean_1d(speed, speed_t, edges)
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
+```
+
+iii. The notes say all streams were intentionally projected into the same flash-locked 250 ms bins.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. It comes from `dataset.eye_tracking['pupil_width']`, `['pupil_height']`, and `['timestamps']`. The diameter proxy is twice the larger ellipse radius/axis value.
+i. Pupil diameter is derived from `dataset.eye_tracking`, using both `pupil_width` and `pupil_height`. The code defines diameter as `2 * max(width, height)` at each sample.
 
 ii.
 ```python
 et = ds.eye_tracking
+...
 diam = 2.0 * np.nanmax(
     np.vstack([et['pupil_width'].values, et['pupil_height'].values]), axis=0)
 ```
 
-iii. The agent says `2 * max(width, height)` follows the SDK circular-area convention and is a more diameter-like measure than width alone.
+iii. The notes say the agent chose this definition from the whitepaper’s “major axis reflects the pupil diameter” description.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. NaNs, including blink-related NaNs, are linearly interpolated with nearest-value edge filling. The result is averaged in 250-ms bins and converted to quintiles. A session with no usable finite pupil series is skipped.
+i. The code computes `2 * max(width, height)`, linearly interpolates missing values, averages within each 250 ms trial bin, and discretizes the binned values into quintiles, by default separately for each session.
 
 ii.
 ```python
+diam = 2.0 * np.nanmax(
+    np.vstack([et['pupil_width'].values, et['pupil_height'].values]), axis=0)
 diam = interpolate_nans(diam)
 if diam is not None:
-    pupil_binned = bin_mean_1d(diam, np.asarray(et['timestamps'].values, float), edges)
+    pupil_binned = bin_mean_1d(diam, np.asarray(et['timestamps'].values, float),
+                               edges)
 ```
 
-iii. Interpolation avoids blink artifacts becoming missing outputs. The notes report a median 2.9% blink-frame rate and exclude only three sessions with no eye tracking.
+```python
+pup_q, pup_edges = discretize([r['pupil'] for r in results], scope=args.quantile_scope)
+```
+
+iii. The notes justify interpolation as blink handling and session-wise quintiles as protection against rig/session differences in camera-pixel scale.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Default thresholds are session-specific quintiles of all pupil bin means; the code can instead use global thresholds.
+i. Pupil diameter is thresholded into five quantile bins, with session-wise quantiles by default.
 
 ii.
 ```python
-pup_q, pup_edges = discretize([r['pupil'] for r in results],
-                              scope=args.quantile_scope)
+ap.add_argument('--quantile-scope', choices=['session', 'global'], default='session')
+...
+out.append(np.digitize(v, qs[1:-1], right=False).astype(np.int64))
 ```
 
-iii. The agent argues pupil values are camera pixels and therefore not comparable across rig geometry/session; per-session quintiles balance categories and reduce session-identity leakage.
+iii. The notes argue that per-session percentile bins are better justified because raw pupil values are in pixels and are not directly comparable across sessions.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Pupil values are averaged over the exact same timestamp edges as neural bins, with center interpolation only if a bin has no eye samples.
+i. Pupil diameter is aligned by averaging the eye-tracking samples inside each of the same twenty 250 ms neural bins.
 
 ii.
 ```python
 pupil_binned = bin_mean_1d(diam, np.asarray(et['timestamps'].values, float),
                            edges)
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
 ```
 
-iii. The notes cite synchronized clocks and raw-versus-binned plots as alignment checks.
+iii. The notes explicitly frame pupil as another continuous stream resampled onto the common trial-bin time base.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. It is derived from the retained trial table’s mutually exclusive `hit`, `miss`, `false_alarm`, and `correct_reject` boolean columns.
+i. Trial outcome is derived from the AllenSDK trial-table booleans `hit`, `miss`, `false_alarm`, and `correct_reject`.
 
 ii.
 ```python
 OUTCOMES = ['hit', 'miss', 'false_alarm', 'correct_reject']
 ...
+outcome = np.full(ntrials, -1, dtype=np.int64)
 for i, name in enumerate(OUTCOMES):
     outcome[keep[name].values.astype(bool)] = i
 ```
 
-iii. These are the four canonical outcomes for go and catch trials; an assertion ensures every retained trial receives one.
+iii. The notes say these are the four valid go/catch outcomes after excluding aborted and auto-rewarded trials.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. Booleans are mapped to fixed integer codes 0–3, then each scalar code is broadcast across all 20 time bins of its trial.
+i. The code maps the four outcome booleans to integer codes `0..3` and then broadcasts each trial’s code across all twenty time bins of that trial.
 
 ii.
 ```python
-np.full(T, r['outcome'][t], dtype=np.int64)
+outcome = np.full(ntrials, -1, dtype=np.int64)
+for i, name in enumerate(OUTCOMES):
+    outcome[keep[name].values.astype(bool)] = i
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
 ```
 
-iii. Broadcasting makes the static label compatible with the common time-varying output matrix while retaining its per-trial meaning.
+iii. The notes describe trial outcome as static per trial and broadcast over bins to fit the decoder format.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. NaNs in running and pupil streams are linearly interpolated, with nearest finite values at edges; empty temporal bins use center interpolation. Sessions with no finite pupil data or too few trials are skipped. Local IDs prevent attempts to load absent experiments. Assertions and sanity checks detect invalid outcomes and temporal patterns.
+i. The code fills internal NaNs in continuous behavioral traces by linear interpolation, fills empty behavior bins by interpolation at the bin centre, skips sessions with no usable eye-tracking, skips sessions with fewer than two go/catch trials, and silently filters out `None`/`skip` results after multiprocessing.
 
 ii.
 ```python
-good = np.isfinite(v)
-if not np.any(good):
-    return None
-v[~good] = np.interp(x[~good], x[good], v[good])
-...
-m = np.where(n == 0, fill, m)
+def interpolate_nans(values):
+    v = np.asarray(values, dtype=float).copy()
+    good = np.isfinite(v)
+    if not np.any(good):
+        return None
+    if not np.all(good):
+        x = np.arange(len(v))
+        v[~good] = np.interp(x[~good], x[good], v[good])
+    return v
 ```
 
-iii. The agent favors interpolation for short blink/missing stretches and exclusion when a required output is wholly unavailable. It reports independent raw-data checks and clean format verification.
+```python
+if np.any(n == 0):
+    centres = edges[:, :-1] + BIN_SIZE / 2.0
+    fill = np.interp(centres, sample_times, values)
+    m = np.where(n == 0, fill, m)
+```
+
+```python
+if len(keep) < 2:
+    return None
+...
+if pupil_binned is None:
+    return dict(skip=True, ophys_session_id=int(ophys_session_id),
+                reason='no eye tracking')
+...
+results = [r for r in results if r is not None and not r.get('skip')]
+```
+
+iii. The notes say blink NaNs were interpolated, completely missing eye-tracking caused session exclusion, and the fixed trial window was only adopted after checking that it always had ophys coverage.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. Loading the large SDK experiment/NWB-backed objects is dominant (about 3–4 seconds per plane); binning and behavior processing are reported below 0.2 seconds per session.
+i. The agent treats AllenSDK session loading as the dominant runtime cost, not the binning logic. It added multiprocessing across sessions because NWB loading was the bottleneck.
 
 ii.
 ```python
-ds = bc.get_behavior_ophys_experiment(int(eid))
-timings['load'] = timings.get('load', 0) + time.time() - t0
+for k, eid in enumerate(experiment_ids):
+    t0 = time.time()
+    ds = bc.get_behavior_ophys_experiment(int(eid))
+    timings['load'] = timings.get('load', 0) + time.time() - t0
 ```
 
-iii. The notes measured an approximately 83–87 second full run with 16 workers and identify I/O as the bottleneck.
+```python
+if args.workers > 1 and len(jobs) > 1:
+    with Pool(min(args.workers, len(jobs))) as p:
+        results = p.map(process_session, jobs)
+```
+
+iii. `CONVERSION_NOTES.md` Step 6 says NWB loading takes roughly 3-4 s per plane and dominates the runtime; it explicitly describes binning as relatively cheap.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. Most costly trial/bin work is already vectorized. Remaining small loops include per-plane loading, chunking neuron rows, assigning four outcome classes, converting each session into trial lists, and repeated list-based index lookup for subjects/regions.
+i. The agent already vectorized the expensive temporal binning with cumulative sums and `searchsorted`. The remaining obvious Python loops are mostly over sessions, experiments, and trials when assembling outputs and metadata; those could be reduced further, but the agent treats them as secondary because I/O dominates.
 
 ii.
 ```python
-for a in range(0, nrows, chunk):
-    ...
-for t in range(ntrials):
-    neural_trials.append(...)
+def bin_sum(values_2d, sample_times, edges, chunk=256):
+    idx = np.searchsorted(sample_times, edges.ravel(), side='left')
+    out = np.empty((nrows, edges.shape[0], NBINS), dtype=np.float64)
+    for a in range(0, nrows, chunk):
+        ...
+        out[a:b] = np.diff(v, axis=2)
 ```
 
-iii. The agent explicitly replaced per-trial neural binning with cumulative sums and parallelized sessions. It considers loading, not these residual loops, the limiting cost.
+```python
+for i, r in enumerate(results):
+    ...
+    for t in range(ntrials):
+        neural_trials.append(np.ascontiguousarray(r['neural'][:, t, :], dtype=np.float32))
+        input_trials.append(np.zeros((0, T), dtype=np.float32))
+        out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                        np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
+```
+
+iii. In the notes, the agent emphasizes that it already replaced per-trial temporal slicing with vectorized binning and that extra vectorization would have limited effect relative to file loading.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. `bin_sum` is invoked twice for each one-dimensional bin mean (once for values and once for counts), and dF/F binning invokes it again for frame counts. Each worker independently constructs an SDK cache. Assembly repeatedly performs `subjects.index` and `regions.index`. Optional plotting reloads a dataset and recomputes signals.
+i. The code repeats some binning-related work: `bin_mean_1d()` calls `bin_sum()` twice for every 1-D signal, and dF/F processing computes one `bin_sum()` for the data and another for frame counts. It also does repeated list-index lookups when building `subject_idx` and `brain_region_idx`.
 
 ii.
 ```python
-s = bin_sum(v, sample_times, edges)[0]
-n = bin_sum(ones, sample_times, edges)[0]
-...
-counts = bin_sum(np.ones((1, E.shape[1]), dtype=np.float32), ots, edges)
+def bin_mean_1d(values, sample_times, edges):
+    v = values[None, :]
+    ones = np.ones_like(v)
+    s = bin_sum(v, sample_times, edges)[0]
+    n = bin_sum(ones, sample_times, edges)[0]
 ```
 
-iii. The notes emphasize a single main processing pass per plane; repeated count calculations are used to obtain correct bin means, and plotting recomputation is optional validation work.
+```python
+if signal == 'dff':
+    counts = bin_sum(np.ones((1, E.shape[1]), dtype=np.float32), ots, edges)
+    binned = binned / np.maximum(counts, 1.0)
+```
+
+```python
+data['subject_idx'].append(subjects.index(r['mouse_id']))
+...
+np.array([regions.index(x) for x in r['regions']], dtype=np.int64)
+```
+
+iii. The agent’s notes do not foreground these as problems, but the code itself shows repeated binning and repeated linear lookups as part of the implementation.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. It retains diagnostic fields such as continuous binned running/pupil, change times, go/catch flags, detailed timing information, equipment metadata, and experiment IDs until assembly, though only categorized outputs and selected metadata are saved. It also calculates global quantile edges even in per-session mode, solely for reporting/metadata. Optional plotting loads event traces even when the delivered neural signal is dF/F.
+i. The code keeps and processes continuous running and pupil arrays only long enough to bin and discretize them, then discards the continuous values from the final pickle. It also builds diagnostic timing/sanity information and optional plotting support that the downstream decoder does not use.
 
 ii.
 ```python
-allv = np.concatenate([v.ravel() for v in values_list])
-global_qs = np.percentile(allv, np.linspace(0, 100, nq + 1))
-...
-ev = ds.events
-E = np.vstack(ev['events'].values).astype(np.float32)
+result = dict(
+    ...
+    running=running_binned.astype(np.float64),
+    pupil=pupil_binned.astype(np.float64),
+    ...
+    timings=timings,
+)
 ```
 
-iii. These discarded intermediates support sanity checks, plots, provenance, and quantile reporting rather than decoder input. The agent prioritizes auditability, while noting loading dominates runtime.
+```python
+run_q, run_edges = discretize([r['running'] for r in results], scope=args.quantile_scope)
+pup_q, pup_edges = discretize([r['pupil'] for r in results], scope=args.quantile_scope)
+...
+out = np.stack([img_idx[t], r['image_change'][t], run_q[i][t], pup_q[i][t],
+                np.full(T, r['outcome'][t], dtype=np.int64)], axis=0)
+```
+
+```python
+if args.show_processing:
+    ...
+    make_plots(r, images, run_q[i], pup_q[i], out)
+```
+
+iii. The notes frame this extra work as validation and interpretability support rather than part of the final decoder payload.

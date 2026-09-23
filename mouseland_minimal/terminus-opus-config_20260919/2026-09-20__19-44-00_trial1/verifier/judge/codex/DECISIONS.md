@@ -2,491 +2,655 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent glob-loads every `Beh_*.npy`, merges duplicate behavioral views into one recording, then loads the corresponding spike and retinotopy file per recording. It does not use `Imaging_Exp_info.npy` as the master index.
+i. The AI loads all behavior data by globbing every `Beh_*.npy` file under `/app/data/beh`, merges them into a deduplicated recording table keyed by `mouse_year_month_day_block`, and stores one representative behavior dict plus a wall-to-stimulus map per recording. It then loads retinotopy and spike data per recording from `/app/data/retinotopy` and `/app/data/spk`.
 
-ii.
+ii. 
 ```python
-for f in sorted(glob.glob(os.path.join(ROOT, 'beh', 'Beh_*.npy'))):
-    B = np.load(f, allow_pickle=True).item()
-blocks = np.load(spkfile, allow_pickle=True).item()['spks']
-ret = np.load(os.path.join(ROOT, 'retinotopy', '%s_%s_trans.npz' % (mouse, date)))
+def collect_recordings():
+    recs = {}
+    for f in sorted(glob.glob(os.path.join(ROOT, 'beh', 'Beh_*.npy'))):
+        exp = os.path.basename(f)[4:-4]
+        B = np.load(f, allow_pickle=True).item()
+        for key, beh in B.items():
+            parts = key.split('_')
+            base = '_'.join(parts[:5]) if parts[-1].startswith('swap') else key
+            d = recs.setdefault(base, {'beh': None, 'walls': {}, 'exps': []})
+            ...
+            if d['beh'] is None:
+                d['beh'] = beh
 ```
 
-iii. The trajectory says this survey found 99 behavioral keys which collapse to exactly 89 unique recordings, matching the 89 spike files one-to-one. The agent chose this route to recover and merge swap views.
+```python
+ret = np.load(os.path.join(ROOT, 'retinotopy', '%s_%s_trans.npz' % (mouse, date)),
+              allow_pickle=True)
+...
+blocks = np.load(spkfile, allow_pickle=True).item()['spks']
+```
+
+iii. In the trajectory, the AI said the behavior files contain multiple "views" of the same recording and decided to enumerate recordings from the `Beh_*.npy` files, deduplicate them, and make them match the 89 spike files 1:1.
 
 ## 1-b. How are the data split into subjects?
 
-i. The mouse is parsed as the first underscore-separated component of each recording name. Subjects are accumulated in first-session order, and each session gets the corresponding index.
+i. Subjects are defined by the mouse name prefix of each deduplicated recording key. The code appends each mouse once to `subjects` in first-seen session order and records each session's `subject_idx` as the index of that mouse in the list.
 
-ii.
+ii. 
 ```python
 mouse = name.split('_')[0]
+...
 if mouse not in subjects:
     subjects.append(mouse)
+...
 data['subject_idx'].append(subjects.index(mouse))
 ```
 
-iii. The agent observed that recording names encode mouse, date, and block, and reported 19 mice across 89 recordings.
+iii. In the trajectory, the AI reported that the 89 recordings correspond to 19 mice and treated mouse identity as the first field of the recording name.
 
 ## 1-c. How are the data split into sessions?
 
-i. A session is the base `mouse_year_month_day_block` recording. `_swap1` and `_swap2` suffixes and appearances in multiple behavior files are deduplicated into that base key.
+i. A session is one deduplicated recording named `mouse_year_month_day_block`. Swap-view suffixes such as `_swap1` and `_swap2` are collapsed into the same base recording, and repeated listings across experiment-type behavior files are merged into one session entry.
 
-ii.
+ii. 
 ```python
 parts = key.split('_')
 base = '_'.join(parts[:5]) if parts[-1].startswith('swap') else key
 d = recs.setdefault(base, {'beh': None, 'walls': {}, 'exps': []})
+d['exps'].append(exp)
 ```
 
-iii. The trajectory established that swap entries are different behavioral views of the same imaging recording and that deduplication gives the exact 89 spike-file sessions.
+iii. The AI justified this in the trajectory by noting that the behavior files re-list the same recording under multiple experiment types and swap views, and that deduplication yields exactly 89 unique recordings matching the 89 spike files.
 
 ## 1-d. How are the data split into trials?
 
-i. Frames are grouped by integer `ft_trInd`, but only frames both in `ft_CorrSpc` and moving (`ft_move > 0`) are retained. Thus a trial is a variable-length, potentially noncontiguous sequence of running frames in the textured corridor.
+i. Trials are defined as the running frames inside the textured corridor. The code uses `ft_trInd` to label frames by trial, intersects that with `ft_CorrSpc` and `ft_move > 0`, then groups retained frame indices by trial id. This means a trial is not all corridor frames; it is only the moving subset of them.
 
-ii.
+ii. 
 ```python
-tr = beh['ft_trInd'][:nfr]
-corr = beh['ft_CorrSpc'][:nfr].astype(bool)
-moving = beh['ft_move'][:nfr] > 0
-ok = corr & moving & ~np.isnan(tr)
-for i in idx:
-    groups[int(tr[i])].append(i)
+def trial_frames(beh, nfr):
+    tr = beh['ft_trInd'][:nfr]
+    corr = beh['ft_CorrSpc'][:nfr].astype(bool)
+    moving = beh['ft_move'][:nfr] > 0
+    ok = corr & moving & ~np.isnan(tr)
+    ...
+    for i in idx:
+        groups[int(tr[i])].append(i)
+    return {t: np.sort(np.array(v)) for t, v in groups.items()}
 ```
 
-iii. The agent cited the paper's statement that analyses considered only running timepoints and connected `ft_CorrSpc` to the requested 4 m corridor.
+```python
+frames = trial_frames(beh, nfr)
+for t in sorted(frames):
+    fr = frames[t]
+```
+
+iii. The AI justified this in the trajectory by citing the paper's statement that only timepoints during running were analyzed, and by arguing that the decoder should see the running-only neural sequence.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are dropped if they have fewer than five retained running frames or if their `WallName` lacks a merged canonical stimulus mapping (notably `circle3`). There is no long-trial percentile filter.
+i. Trials are dropped if they have fewer than `MIN_FRAMES_PER_TRIAL` retained running frames or if their wall texture has no canonical mapping in the merged `walls` table. In practice this excludes very short running trials and unassigned `circle3` trials. The code does not implement the reference solution's 99th-percentile long-trial filter.
 
-ii.
+ii. 
 ```python
+MIN_FRAMES_PER_TRIAL = 5
+...
 if len(fr) < MIN_FRAMES_PER_TRIAL or wall not in walls:
-    continue
+    continue    # unassigned stimulus (circle3) or too little running
 ```
 
-iii. The agent reported excluding 309 `circle3` trials because the authors assigned them no canonical role, and used five running frames as a minimum usable sequence length.
+iii. In the trajectory, the AI said it found 309 `circle3` trials with no canonical role and chose to exclude them, and it reported a typical kept trial length of about 21.6 running frames.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural values come from the per-plane arrays in `['spks']` of each session's neural file. `iarea` from the retinotopy file supplies neuron area assignments and determines eligible neurons.
+i. Neural data comes from the per-plane `spks` arrays in each `*_neural_data.npy` spike file, and neuron area labels come from `iarea` in the corresponding retinotopy `.npz` file.
 
-ii.
+ii. 
 ```python
-blocks = np.load(spkfile, allow_pickle=True).item()['spks']
+ret = np.load(os.path.join(ROOT, 'retinotopy', '%s_%s_trans.npz' % (mouse, date)),
+              allow_pickle=True)
 iarea = ret['iarea']
-area = np.array([IAREA_TO_AREA.get(int(a), -1) for a in iarea])
+...
+blocks = np.load(spkfile, allow_pickle=True).item()['spks']
 ```
 
-iii. The agent identified `spks` as Suite2p deconvolved traces and verified that plane neuron counts equal the length of `iarea`.
+iii. The trajectory states that the spike files contain Suite2p deconvolved traces and the retinotopy file provides the area assignments used for filtering neurons.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Eligible neurons are copied from the plane arrays, randomly limited to 2,000 per session, z-scored per neuron over the whole recording, sliced to each trial's retained frames, and stored as float32.
+i. The code maps neurons to four coarse visual areas, keeps only valid-area neurons, randomly subsamples to at most 2,000 neurons per session, reconstructs the selected neurons plane by plane, z-scores each neuron across the full recording, and then slices each trial's retained frames. Per-trial neural arrays are stored as `float32`.
 
-ii.
-```python
-sel = np.sort(rng.choice(valid, MAX_NEURONS, replace=False))
-mu = spk.mean(axis=1, keepdims=True)
-sd = spk.std(axis=1, keepdims=True)
-spk = (spk - mu) / sd
-neural_s.append(spk[:, fr].astype(np.float32))
-```
-
-iii. The agent linked z-scoring to `utils.get_kfold_reward_response` and capped neurons because the raw spike files total about 405 GB and the decoder's SVD also caps at 2,000.
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. Neurons without one of four mapped retinotopic areas are excluded; if more than 2,000 remain, a deterministic random subset is retained.
-
-ii.
+ii. 
 ```python
 valid = np.where(area >= 0)[0]
 rng = np.random.default_rng(SEED + si)
 if len(valid) > MAX_NEURONS:
     sel = np.sort(rng.choice(valid, MAX_NEURONS, replace=False))
+else:
+    sel = valid
+...
+spk = np.empty((len(sel), nfr), dtype=np.float32)
+for bi, blk_arr in enumerate(blocks):
+    m = (sel >= offs[bi]) & (sel < offs[bi + 1])
+    if m.any():
+        spk[m] = blk_arr[sel[m] - offs[bi]]
+...
+mu = spk.mean(axis=1, keepdims=True)
+sd = spk.std(axis=1, keepdims=True)
+sd[sd == 0] = 1.0
+spk = (spk - mu) / sd
+...
+neural_s.append(spk[:, fr].astype(np.float32))
 ```
 
-iii. The agent interpreted `iarea` values -1 and 7 as unassigned and described the 2,000-neuron cap as a storage/decoder practicality.
+iii. In the trajectory, the AI said the raw neural dataset is 405 GB, so it would subsample to 2,000 neurons per session to keep the conversion feasible, and z-score per neuron because the decoder does not normalize inputs and the paper's utilities do.
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. Neurons are filtered by retinotopic area assignment: only neurons whose `iarea` maps to `V1`, `mHV`, `lHV`, or `aHV` are kept. After that, the code imposes an additional random cap of 2,000 neurons per session.
+
+ii. 
+```python
+IAREA_TO_AREA = {8: 0, 0: 1, 1: 1, 2: 1, 9: 1, 5: 2, 6: 2, 3: 3, 4: 3}
+...
+area = np.array([IAREA_TO_AREA.get(int(a), -1) for a in iarea])
+valid = np.where(area >= 0)[0]
+...
+if len(valid) > MAX_NEURONS:
+    sel = np.sort(rng.choice(valid, MAX_NEURONS, replace=False))
+```
+
+iii. The trajectory explicitly justifies both steps: valid retinotopic assignment is taken from the paper's `neu_area_ID` logic, and the 2,000-neuron cap is a practical concession to the 405 GB raw dataset and decoder cost.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Alignment is described as corridor entry, but the stored sequence begins at the first retained moving frame in `ft_CorrSpc`; stopped frames are removed throughout. Trials remain variable length and are not padded.
+i. The code aligns trials to corridor entry conceptually, but the saved neural sequence for each trial contains only the retained running frames within the 4 m textured corridor. Gray-space frames and stopped frames are omitted, so alignment is to trial start with a compressed within-trial time axis.
 
-ii.
+ii. 
 ```python
+"""Frames of each trial: running, inside the textured corridor."""
+...
+corr = beh['ft_CorrSpc'][:nfr].astype(bool)
+moving = beh['ft_move'][:nfr] > 0
 ok = corr & moving & ~np.isnan(tr)
-neural_s.append(spk[:, fr].astype(np.float32))
-'temporal_alignment_event': 'trial start = entry into the virtual corridor'
 ```
 
-iii. The agent reasoned that the textured-corridor window matches the four position bins and that a running-only sequence should use a running-frame clock.
+```python
+neural_s.append(spk[:, fr].astype(np.float32))
+```
+
+iii. In the trajectory, the AI said trial start should be corridor entry, but argued that only running frames should be retained because those are the timepoints the paper analyzed and the decoder actually sees.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. Each imaging frame is one bin; no rebinning or resampling is applied. The metadata uses the median observed frame interval across sessions, approximately 314.7 ms.
+i. The time bin is the native imaging frame interval, estimated per session as the median of `np.diff(ft)` and summarized in metadata as the median across sessions. No explicit temporal rebinning is applied, but the code drops stopped frames entirely.
 
-ii.
+ii. 
 ```python
+ft = beh['ft'][:nfr] * 86400.0
+bin_s = float(np.median(np.diff(ft)))
+...
 bin_ms.append(np.median(np.diff(ft)) * 1000.0)
-'time_bin_size': float(np.median(bin_ms))
+...
+'time_bin_size': float(np.median(bin_ms)),
 ```
 
-iii. The trajectory measured a nearly uniform acquisition rate of about 3.177 Hz and retained that native grid.
+iii. The trajectory says the sampling rate is about 3.177 Hz and that the AI wanted to preserve that native resolution while representing time on the retained-frame clock.
 
 ## 3-a. What variables in the raw data is `input` *Time to sound cue* derived from?
 
-i. It is derived from the trial's `SoundFr`, the retained frame indices, and the session median frame interval inferred from `ft`.
+i. It is derived from `SoundFr` for the trial's cue frame, plus the session's imaging frame period estimated from `ft`.
 
-ii.
+ii. 
 ```python
+ft = beh['ft'][:nfr] * 86400.0
 bin_s = float(np.median(np.diff(ft)))
+...
 rank_cue = float(np.searchsorted(fr, beh['SoundFr'][t])) * bin_s
 ```
 
-iii. The agent initially tried absolute timestamps, investigated extreme values caused by long stopped intervals, then chose a retained-running-frame clock.
+iii. In the trajectory, the AI said it originally used absolute timestamps, saw implausible values caused by long pauses, and switched to cue timing derived from the retained frame sequence.
 
 ## 3-b. What processing is involved in computing `input` *Time to sound cue*?
 
-i. Retained frames are assigned accumulated running times `k`; cue time is the insertion rank of `SoundFr` in those frames times the bin duration. The stored value is `k - rank_cue`, i.e. time since cue (negative before cue), despite the name “time to sound cue.”
+i. The code builds a running-frame time axis `k = 0, bin_s, 2*bin_s, ...` for the kept frames of the trial, finds where `SoundFr` would fall within that retained frame list, converts that rank to seconds, and computes `k - rank_cue`. This yields a negative value before the cue and positive after the cue.
 
-ii.
+ii. 
 ```python
 k = np.arange(len(fr), dtype=np.float32) * bin_s
 rank_cue = float(np.searchsorted(fr, beh['SoundFr'][t])) * bin_s
+inp = np.empty((4, len(fr)), dtype=np.float32)
 inp[0] = k - rank_cue
 ```
 
-iii. The agent wanted the time variable to exclude invisible stopped intervals and reported that it then crossed zero within trials with bounded values.
+iii. The AI justified this in the trajectory by saying that wall-clock time contains long gaps when the mouse stopped, while the saved neural data contains only the retained running frames, so the input should use the running-frame clock instead.
 
 ## 3-c. How is the `input` *Time to sound cue* aligned with the neural data?
 
-i. It has one value for every retained neural column and uses the cue's rank among the exact same retained frame indices.
+i. It is defined on the same retained running-frame grid as the neural data for that trial, with exactly one value per kept neural time bin.
 
-ii.
+ii. 
 ```python
-k = np.arange(len(fr), dtype=np.float32) * bin_s
+fr = frames[t]
+...
 neural_s.append(spk[:, fr].astype(np.float32))
-inp = np.empty((4, len(fr)), dtype=np.float32)
+...
+k = np.arange(len(fr), dtype=np.float32) * bin_s
+inp[0] = k - rank_cue
 ```
 
-iii. The agent explicitly chose the clock of the sequence actually passed to the decoder.
+iii. The trajectory repeatedly states that all time-varying inputs were moved onto the retained-frame clock so they match the running-only neural sequence.
 
 ## 4-a. What variables in the raw data is `input` *Day of training* derived from?
 
-i. It is derived from the date encoded in each recording name and the earliest recording date for that mouse.
+i. It is derived from the date embedded in each deduplicated session name and the mouse id prefix.
 
-ii.
+ii. 
 ```python
 def date_of(name):
     p = name.split('_')
     return datetime.date(int(p[1]), int(p[2]), int(p[3]))
-first[m] = min(first.get(m, date_of(name)), date_of(name))
+...
+mouse = name.split('_')[0]
+day = float((date_of(name) - first[mouse]).days)
 ```
 
-iii. The agent interpreted “day” literally as elapsed calendar days from a mouse's first recording.
+iii. The AI said in the trajectory that it would treat training day as days elapsed since the first recording for each mouse.
 
 ## 4-b. What processing is involved in computing `input` *Day of training*?
 
-i. Calendar-day difference from the mouse's first recording is computed as a float and broadcast to every bin of every trial in the session.
+i. For each mouse, the code finds the earliest recording date and then computes each session's day value as the calendar-day difference from that first date. The result is a constant per trial and per time bin within the trial.
 
-ii.
+ii. 
 ```python
+first = {}
+for name in names:
+    m = name.split('_')[0]
+    first[m] = min(first.get(m, date_of(name)), date_of(name))
+...
 day = float((date_of(name) - first[mouse]).days)
+...
 inp[1] = day
 ```
 
-iii. The trajectory did not give further justification beyond calling this “days elapsed since each mouse's first recording.”
+iii. The trajectory justifies this as a measure of how far the animal is into training, using elapsed days rather than session count.
 
 ## 5-a. What variables in the raw data is `input` *Time since trial start* derived from?
 
-i. It uses only the count of retained frames and the median frame interval from `ft`; `StartFr` is not used directly.
+i. In the final code it is derived from the retained-frame count within the trial and the session's frame period estimated from `ft`. It is not derived from `StartFr` anymore.
 
-ii.
+ii. 
 ```python
+ft = beh['ft'][:nfr] * 86400.0
 bin_s = float(np.median(np.diff(ft)))
+...
 k = np.arange(len(fr), dtype=np.float32) * bin_s
+...
+inp[2] = k
 ```
 
-iii. Because the first retained frame was treated as corridor entry on the running-only clock, the agent made it time zero.
+iii. The trajectory says the AI initially used absolute timestamps tied to trial start, then intentionally switched to retained running-frame time because stopped periods are absent from the neural data.
 
 ## 5-b. What processing is involved in computing `input` *Time since trial start*?
 
-i. It is a regularly spaced sequence starting at zero, counting only retained running frames.
+i. The code simply counts retained frames from the start of the kept sequence and multiplies by the frame period, so the signal starts at zero and increases by one imaging frame duration per retained bin.
 
-ii.
+ii. 
 ```python
+k = np.arange(len(fr), dtype=np.float32) * bin_s
+...
+inp[2] = k
+```
+
+iii. The trajectory justifies this as the "actual clock of the neural sequence the decoder sees" after stopped periods are removed.
+
+## 5-c. How is the `input` *Time since trial start* aligned with the neural data?
+
+i. It is defined on the exact same retained running-frame sequence `fr` used to slice the neural data, so it has the same number of time bins as the neural array for that trial.
+
+ii. 
+```python
+fr = frames[t]
+neural_s.append(spk[:, fr].astype(np.float32))
+...
 k = np.arange(len(fr), dtype=np.float32) * bin_s
 inp[2] = k
 ```
 
-iii. The agent sought to avoid wall-clock jumps during removed pauses and make the input clock match the stored sequence.
-
-## 5-c. How is the `input` *Time since trial start* aligned with the neural data?
-
-i. Its length equals the number of retained neural columns and element `j` corresponds to neural column `j`.
-
-ii.
-```python
-neural_s.append(spk[:, fr].astype(np.float32))
-inp = np.empty((4, len(fr)), dtype=np.float32)
-inp[2] = k
-```
-
-iii. The agent described this as accumulated running time on the neural sequence's clock.
+iii. The trajectory repeatedly frames this as aligning the time inputs to the running-only neural sequence.
 
 ## 6-a. What variables in the raw data is `input` *Reward availability* derived from?
 
-i. It comes directly from trial-level `isRew`.
+i. It is derived directly from `isRew`, the per-trial rewarded-corridor flag.
 
-ii.
+ii. 
 ```python
 inp[3] = float(beh['isRew'][t])
 ```
 
-iii. The agent treated `isRew` as the rewarded-corridor flag and did not derive it from behavior.
+iii. The trajectory treated zero-lick unrewarded sessions as a genuine property of the data, which implicitly relies on `isRew` being the reward-availability signal.
 
 ## 6-b. What processing is involved in computing `input` *Reward availability*?
 
-i. The scalar is cast to float and broadcast over all retained frames in the trial.
+i. No substantive processing is applied beyond converting the value to float and broadcasting it across all time bins of the trial.
 
-ii.
+ii. 
 ```python
 inp = np.empty((4, len(fr)), dtype=np.float32)
+...
 inp[3] = float(beh['isRew'][t])
 ```
 
-iii. No additional processing was considered necessary.
+iii. The trajectory does not describe any extra transformation; it treats this as a direct per-trial flag.
 
 ## 7-a. What variables in the raw data is `output` *Visual stimulus category* derived from?
 
-i. It is derived from each trial's `WallName` and a recording-specific mapping made by merging `UniqWalls` with `stim_id` across all duplicate views.
+i. It is derived from `WallName` on each trial together with a canonical wall-to-stimulus-role mapping built from `UniqWalls` and `stim_id` pooled across the recording's behavior-file views.
 
-ii.
+ii. 
 ```python
 for wall, sid in zip(beh['UniqWalls'], beh['stim_id']):
     if not np.isnan(sid):
         d['walls'][str(wall)] = int(sid)
+...
 wall = str(beh['WallName'][t])
-```
-
-iii. The agent discovered that `TrialStim` contains a placeholder in swap views and that physical wall names differ across mice, so it used the canonical author-provided role mapping.
-
-## 7-b. What processing is involved in computing `output` *Visual stimulus category*?
-
-i. The merged `stim_id` is used as one of seven categories (`circle1`, `circle2`, `leaf1`, `leaf2`, `leaf3`, `leaf1_swap1`, `leaf1_swap2`) and is broadcast across the trial. Unmapped walls are excluded.
-
-ii.
-```python
-STIM_NAMES = ['circle1', 'circle2', 'leaf1', 'leaf2', 'leaf3',
-              'leaf1_swap1', 'leaf1_swap2']
+...
 out[0] = walls[wall]
 ```
 
-iii. The agent argued these canonical roles provide consistent cross-mouse labels and avoid inventing a placeholder category.
+iii. The trajectory says the AI intentionally avoided `TrialStim` because some views use the placeholder string `stimulus_of_trial`, and instead used the canonical role from `UniqWalls + stim_id`.
+
+## 7-b. What processing is involved in computing `output` *Visual stimulus category*?
+
+i. The code assigns each wall texture to one of seven canonical stimulus-role ids (`circle1`, `circle2`, `leaf1`, `leaf2`, `leaf3`, `leaf1_swap1`, `leaf1_swap2`) rather than collapsing them into four broad texture families. The per-trial class is then broadcast across all time bins of the trial. Trials whose wall name is not in the canonical map are dropped.
+
+ii. 
+```python
+STIM_NAMES = ['circle1', 'circle2', 'leaf1', 'leaf2', 'leaf3',
+              'leaf1_swap1', 'leaf1_swap2']
+...
+if len(fr) < MIN_FRAMES_PER_TRIAL or wall not in walls:
+    continue
+...
+out[0] = walls[wall]
+```
+
+iii. In the trajectory, the AI argues that physical texture names can swap roles across mice, so the canonical stimulus role is the right cross-mouse label, and that `circle3` trials should be excluded because they have no canonical role in most recordings.
 
 ## 8-a. What variables in the raw data is `output` *Licking* derived from?
 
-i. It is derived from session-level lick frame numbers in `LickFr`.
+i. It is derived from `LickFr`, the per-session lick frame indices.
 
-ii.
+ii. 
 ```python
+lick = np.zeros(nfr, dtype=bool)
 lf = np.floor(beh['LickFr']).astype(int)
+lf = lf[(lf >= 0) & (lf < nfr)]
+lick[lf] = True
 ```
 
-iii. The agent verified that the many all-zero sessions were genuine unrewarded recordings rather than a mapping bug.
+iii. The trajectory treats the many zero-lick sessions as real unrewarded recordings, implying that the `LickFr` mapping itself was accepted as correct.
 
 ## 8-b. What processing is involved in computing `output` *Licking*?
 
-i. Fractional lick frames are floored to integer frames, out-of-range entries are removed, and the corresponding frame flags are set true. Multiple licks in a frame remain one binary event.
+i. The code floors each lick frame index to an integer imaging frame, drops out-of-range indices, and marks those frames as `True`; per trial it exports the binary flag on the retained frames.
 
-ii.
+ii. 
 ```python
-lick = np.zeros(nfr, dtype=bool)
+lf = np.floor(beh['LickFr']).astype(int)
 lf = lf[(lf >= 0) & (lf < nfr)]
 lick[lf] = True
+...
 out[1] = lick[fr].astype(np.int64)
 ```
 
-iii. The requested output is binary, so the agent converted lick events to a per-frame indicator.
+iii. In the trajectory, the AI explicitly audited whether the many all-zero licking sessions were a bug and concluded they were genuine properties of the unrewarded mice, so it kept this direct mapping.
 
 ## 8-c. How is `output` *Licking* aligned with the neural data?
 
-i. The lick indicator is indexed by the exact same retained frame array as the neural columns.
+i. Licking is converted to a per-frame session vector and then indexed with the same retained frame list `fr` used for the neural data, so it is one binary value per saved neural time bin.
 
-ii.
+ii. 
 ```python
 neural_s.append(spk[:, fr].astype(np.float32))
+...
 out[1] = lick[fr].astype(np.int64)
 ```
 
-iii. Both data streams use imaging-frame indices.
+iii. The trajectory treats the retained running-frame grid as the common alignment grid for time-varying signals.
 
 ## 9-a. What variables in the raw data is `output` *Position in corridor* derived from?
 
-i. It comes from per-frame `ft_Pos`.
+i. It is derived from `ft_Pos`, the per-frame corridor position.
 
-ii.
+ii. 
 ```python
 pos = beh['ft_Pos'][:nfr]
+...
+out[2] = np.clip((pos[fr] / 10.0).astype(int), 0, CORRIDOR_BINS - 1)
 ```
 
-iii. The agent measured the textured corridor as 0–40 decimeters, matching four 1 m bins.
+iii. The trajectory says the textured corridor spans 0-40 dm and should therefore map directly to the requested four 1 m bins.
 
 ## 9-b. What processing is involved in computing `output` *Position in corridor*?
 
-i. Position is divided by 10 decimeters, converted to integer, and clipped to category 0–3.
+i. The position values are divided by 10 to convert decimeters into 1 m bins, cast to integers, and clipped to `0..3`.
 
-ii.
+ii. 
+```python
+CORRIDOR_BINS = 4
+...
+out[2] = np.clip((pos[fr] / 10.0).astype(int), 0, CORRIDOR_BINS - 1)
+```
+
+iii. In the trajectory, the AI explicitly justified restricting trials to the 4 m textured corridor because that makes the requested four 1 m bins line up exactly with the retained trial window.
+
+## 9-c. How is `output` *Position in corridor* thresholded into categories?
+
+i. The thresholds are fixed spatial cutoffs at 10, 20, and 30 decimeters, implemented by integer division by 10 and clipping to four categories.
+
+ii. 
 ```python
 out[2] = np.clip((pos[fr] / 10.0).astype(int), 0, CORRIDOR_BINS - 1)
 ```
 
-iii. This implements the requested four equal 1 m spatial bins.
-
-## 9-c. How is `output` *Position in corridor* thresholded into categories?
-
-i. Thresholds are 0, 10, 20, 30, and 40 dm, yielding `[0,1)`, `[1,2)`, `[2,3)`, and `[3,4]` m categories; clipping catches boundaries/outliers.
-
-ii.
-```python
-CORRIDOR_BINS = 4
-np.clip((pos[fr] / 10.0).astype(int), 0, CORRIDOR_BINS - 1)
-```
-
-iii. The agent tied these fixed thresholds directly to the task's four equal-length bins.
+iii. The trajectory's position argument is that the retained frames span exactly the 0-40 dm textured corridor, so the 1 m categories follow directly from geometry rather than data-driven thresholds.
 
 ## 9-d. How is `output` *Position in corridor* aligned with the neural data?
 
-i. `ft_Pos` is selected using the same retained frame indices as the neural data.
+i. Position is sampled from `pos[fr]`, where `fr` is the same retained running-frame list used for the neural data.
 
-ii.
+ii. 
 ```python
+fr = frames[t]
 neural_s.append(spk[:, fr].astype(np.float32))
-out[2] = np.clip((pos[fr] / 10.0).astype(int), 0, 3)
+...
+out[2] = np.clip((pos[fr] / 10.0).astype(int), 0, CORRIDOR_BINS - 1)
 ```
 
-iii. Position and neural activity already share the imaging-frame grid.
+iii. The trajectory repeatedly says the retained running frames define the alignment grid for neural and behavioral variables.
 
 ## 10-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. It is derived from per-frame `ft_RunSpeed` across eligible retained frames from all recordings.
+i. It is derived from `ft_RunSpeed`, the per-frame running speed.
 
-ii.
+ii. 
 ```python
 spd = beh['ft_RunSpeed'][:nfr]
+...
 speeds.append(spd[fr])
+...
+out[3] = np.searchsorted(speed_edges, spd[fr], side='right')
 ```
 
-iii. The agent used the behavior's directly supplied running speed.
+iii. The trajectory includes a behavior-only pass whose purpose was to summarize running speeds and choose quartile cutoffs.
 
 ## 10-b. What processing is involved in computing `output` *Running speed*?
 
-i. All eligible running-frame speeds are concatenated in a behavior-only first pass; global 25th, 50th, and 75th percentiles are calculated and then used for all sessions.
+i. The code performs a first pass over all sessions, gathers `ft_RunSpeed` values from kept running frames of kept trials, computes global 25th/50th/75th percentile cutoffs, and then bins each retained trial frame by comparing its speed to those global edges.
 
-ii.
+ii. 
 ```python
+speeds = []
+for name in names:
+    beh = recs[name]['beh']
+    ...
+    for t, fr in frames.items():
+        if len(fr) >= MIN_FRAMES_PER_TRIAL and str(beh['WallName'][t]) in recs[name]['walls']:
+            speeds.append(spd[fr])
 speeds = np.concatenate(speeds)
 speed_edges = np.percentile(speeds, [25, 50, 75])
+```
+
+```python
 out[3] = np.searchsorted(speed_edges, spd[fr], side='right')
 ```
 
-iii. The agent read “four bins, each corresponding to 25% of the data” as global dataset quartiles.
+iii. In the trajectory, the AI said it wanted global speed quartiles after a behavior-only dry run, and reported the resulting dataset-wide edges.
 
 ## 10-c. How is `output` *Running speed* thresholded into categories?
 
-i. `np.searchsorted(..., side='right')` assigns category 0 below the 25th percentile, 1 between the 25th and 50th, 2 between the 50th and 75th, and 3 at or above the 75th percentile.
+i. The thresholds are the global percentile edges `speed_edges`, and the bin index is `np.searchsorted(speed_edges, speed, side='right')`, yielding four ordinal bins.
 
-ii.
+ii. 
 ```python
 speed_edges = np.percentile(speeds, [25, 50, 75])
+...
 out[3] = np.searchsorted(speed_edges, spd[fr], side='right')
 ```
 
-iii. This was intended to make each global category contain approximately a quarter of retained frames.
+iii. The trajectory explicitly reports those global quartile edges and uses them as the discretization rule.
 
 ## 10-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Speed is indexed with the exact retained frame array used for neural columns.
+i. Running speed is sampled on the same retained running frames `fr` used to slice the neural data.
 
-ii.
+ii. 
 ```python
 neural_s.append(spk[:, fr].astype(np.float32))
+...
 out[3] = np.searchsorted(speed_edges, spd[fr], side='right')
 ```
 
-iii. Both streams are frame-indexed.
+iii. The trajectory treats the retained running-frame sequence as the common time axis for the neural and output streams.
 
 ## 11. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Neural frame count limits behavior arrays; NaN trial indices are ignored; out-of-range lick frames are dropped; zero-standard-deviation neurons use a divisor of one; absent stimulus mappings and very short retained trials are excluded; neuron/retinotopy counts are asserted equal.
+i. The code truncates every frame-based behavior stream to the number of neural frames, ignores NaN trial labels when grouping frames, drops lick indices outside the imaged frame range, and skips trials with unmapped wall labels or too few retained frames. It also replaces wall-clock time calculations with retained-frame timing after the AI diagnosed pathological values caused by long pauses.
 
-ii.
+ii. 
 ```python
+tr = beh['ft_trInd'][:nfr]
+corr = beh['ft_CorrSpc'][:nfr].astype(bool)
+moving = beh['ft_move'][:nfr] > 0
 ok = corr & moving & ~np.isnan(tr)
-assert sum(counts) == len(iarea)
-sd[sd == 0] = 1.0
-lf = lf[(lf >= 0) & (lf < nfr)]
 ```
 
-iii. The trajectory describes targeted audits of stimulus mappings, event times, and frame/trial alignment, and treats exclusions as safeguards for unusable or unassigned data.
+```python
+lf = np.floor(beh['LickFr']).astype(int)
+lf = lf[(lf >= 0) & (lf < nfr)]
+lick[lf] = True
+```
+
+```python
+if len(fr) < MIN_FRAMES_PER_TRIAL or wall not in walls:
+    continue
+```
+
+iii. The trajectory says the AI audited the apparent timing pathology, concluded it came from genuine mid-trial pauses, and therefore changed the time inputs to use the retained-frame clock. It also says `circle3` trials lacked canonical labels and should be excluded.
 
 ## 12-a. What are the most time-consuming steps of the code?
 
-i. Loading 405 GB of spike files, selecting/copying neuron traces, z-scoring them, writing the roughly 6.6 GB pickle, and the subsequent decoder validation dominate runtime.
+i. The most time-consuming steps are reading the 405 GB spike files, extracting selected neurons plane by plane, and z-scoring them per session. There is also a full-dataset behavior pass to compute speed quartiles, but the trajectory emphasizes neural I/O as the main cost.
 
-ii.
+ii. 
 ```python
 blocks = np.load(spkfile, allow_pickle=True).item()['spks']
-spk = np.empty((len(sel), nfr), dtype=np.float32)
+...
+for bi, blk_arr in enumerate(blocks):
+    m = (sel >= offs[bi]) & (sel < offs[bi + 1])
+    if m.any():
+        spk[m] = blk_arr[sel[m] - offs[bi]]
+...
 spk = (spk - mu) / sd
-pickle.dump(data, f, protocol=4)
 ```
 
-iii. The trajectory repeatedly identifies neural I/O as the main cost; full conversion required long background runs and produced 89 sessions and 37,801 trials.
+iii. In the trajectory, the AI repeatedly cites the 405 GB size of the neural data as the main runtime and memory constraint.
 
 ## 12-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The loop that appends every retained frame to a trial list, the per-area Python mapping of `iarea`, the plane-copy loop, the per-trial output construction, and repeated linear subject lookup could be vectorized or indexed more directly.
+i. The remaining obvious Python loops are the frame-grouping loop in `trial_frames`, the plane-by-plane neuron extraction loop over `blocks`, and the per-trial assembly loop that builds each session's `neural`, `input`, and `output` arrays. Unlike the human reference, the AI already avoids scanning the full frame axis once per trial.
 
-ii.
+ii. 
 ```python
 for i in idx:
     groups[int(tr[i])].append(i)
-area = np.array([IAREA_TO_AREA.get(int(a), -1) for a in iarea])
-for bi, blk_arr in enumerate(blocks):
-    ...
 ```
 
-iii. The agent did not explicitly discuss these optimization opportunities; it focused on correctness audits and the much larger I/O cost.
+```python
+for bi, blk_arr in enumerate(blocks):
+    m = (sel >= offs[bi]) & (sel < offs[bi + 1])
+    if m.any():
+        spk[m] = blk_arr[sel[m] - offs[bi]]
+```
+
+```python
+for t in sorted(frames):
+    fr = frames[t]
+    ...
+    neural_s.append(spk[:, fr].astype(np.float32))
+    ...
+    input_s.append(inp)
+    ...
+    output_s.append(out)
+```
+
+iii. The trajectory does not give a detailed vectorization discussion, but it does show the AI was primarily optimizing around the large neural I/O cost and decoder scaling.
 
 ## 12-c. What processing does the code repeat multiple times?
 
-i. `trial_frames` and eligibility checks are run once in the global speed pass and again during conversion. Every behavior file is loaded in full, and duplicated views are traversed to merge mappings.
+i. The code computes trial frame groupings twice per session conceptually: once during the first behavior-only pass used to gather speeds and again during the main conversion pass. It also performs a full preliminary behavior pass across all sessions solely to determine speed quartiles before doing the neural pass.
 
-ii.
+ii. 
 ```python
-frames = trial_frames(beh, nfr)  # first pass
-...
-frames = trial_frames(beh, nfr)  # session conversion
+for name in names:
+    beh = recs[name]['beh']
+    nfr = len(beh['ft'])
+    frames = trial_frames(beh, nfr)
+    ...
+    speeds.append(spd[fr])
 ```
 
-iii. The first pass is justified by the agent's choice of global speed quartiles, though it repeats grouping/filter work.
+```python
+for si, name in enumerate(names):
+    ...
+    frames = trial_frames(beh, nfr)
+    ...
+    for t in sorted(frames):
+        ...
+```
+
+iii. In the trajectory, the AI explicitly described a behavior-only dry run to compute global speed quartiles before starting the expensive neural pass.
 
 ## 12-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. It reads all behavioral duplicate views even though only the first behavior object is retained; it records experiment-type provenance and several metadata fields that do not feed decoder training; it z-scores all selected frames before retaining only running-corridor frames; and it computes global speed thresholds before any optional `--limit` truncation.
+i. The code keeps extra bookkeeping that the decoder does not use, such as `experiment_types`, `day_of_training`, and `n_neurons_recorded` inside `session_info`, and it records `bin_ms` across sessions only to summarize a median time bin in metadata. It also carries `exps` in `recs` only for later metadata.
 
-ii.
+ii. 
 ```python
-if d['beh'] is None:
-    d['beh'] = beh
+d = recs.setdefault(base, {'beh': None, 'walls': {}, 'exps': []})
 d['exps'].append(exp)
-spk = (spk - mu) / sd
-if args.limit:
-    names = names[:args.limit]
 ```
 
-iii. The agent used duplicate views to recover complete stimulus mappings and metadata for traceability. It did not identify these operations as discarded work.
+```python
+session_info.append({'session': name, 'mouse': mouse, 'date': date, 'block': blk,
+                     'experiment_types': sorted(set(recs[name]['exps'])),
+                     'day_of_training': day, 'n_trials': len(neural_s),
+                     'n_neurons': len(sel),
+                     'n_neurons_recorded': int(len(iarea))})
+```
+
+```python
+bin_ms.append(np.median(np.diff(ft)) * 1000.0)
+...
+'time_bin_size': float(np.median(bin_ms)),
+```
+
+iii. The trajectory does not offer a separate justification for these extra metadata-oriented computations; they appear to be convenience bookkeeping rather than decoder-critical processing.

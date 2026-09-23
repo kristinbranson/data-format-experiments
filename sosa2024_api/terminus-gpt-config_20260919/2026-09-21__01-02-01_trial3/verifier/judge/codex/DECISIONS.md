@@ -2,312 +2,615 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent recursively discovers every NWB file under `/app/data`, sorts the paths, and processes one file as one session with `pynwb.NWBHDF5IO`. In full/default mode it uses all 152 files; `--sample` restricts this to two.
+i. The AI loads every NWB file under `/app/data` by recursively globbing `*.nwb`. Each file is opened with `pynwb.NWBHDF5IO`, then the converter pulls behavior from `processing['behavior']['BehavioralTimeSeries']` and neural data from `processing['ophys']['Deconvolved']`.
 
-ii. `files=sorted(Path('/app/data').rglob('*.nwb')); files=files[:2] if a.sample else files` and `with NWBHDF5IO(str(fn),'r',load_namespaces=True) as io: nwb=io.read()`.
+ii.
+```python
+with NWBHDF5IO(str(fn),'r',load_namespaces=True) as io:
+    nwb=io.read(); beh=nwb.processing['behavior']['BehavioralTimeSeries'].time_series
+...
+files=sorted(Path('/app/data').rglob('*.nwb')); files=files[:2] if a.sample else files
+for i,fn in enumerate(files):
+    N,I,O,sub,info=process_file(fn,a.show_processing)
+```
 
-iii. The notes justify this as retaining every released, nonduplicate NWB session and satisfying the pynwb-only requirement. They report 11 subjects and 152 sessions.
+iii. `CONVERSION_NOTES.md` says the released dataset contains 152 `*_behavior+ophys.nwb` files, one per recording session, and that all files were opened with `pynwb.NWBHDF5IO(..., load_namespaces=True)`. It frames this as retaining every nonduplicate NWB session.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subject identity comes from `nwb.subject.subject_id`; a first-seen unique subject list is built, and each session receives the corresponding index.
+i. Subjects are not taken from directory names; instead, the AI uses `nwb.subject.subject_id` from each NWB file and builds a unique subject list in first-seen order.
 
-ii. `return neural_trials,inputs,outputs,nwb.subject.subject_id,info` and `if sub not in subjects: subjects.append(sub); sidx.append(subjects.index(sub))`.
+ii.
+```python
+N,I,O,sub,info=process_file(fn,a.show_processing)
+...
+return neural_trials,inputs,outputs,nwb.subject.subject_id,info
+...
+if sub not in subjects: subjects.append(sub)
+sidx.append(subjects.index(sub))
+```
 
-iii. The notes treat NWB subject metadata as the authoritative mouse identifier and validate 11 unique subjects.
+iii. The notes say subject/session metadata are available in the NWB files and emphasize using native session identity rather than relying on the reference code’s pickle layout.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each NWB file becomes one session in the outer lists. Session metadata combines subject and NWB session/file identity.
+i. Each NWB file is treated as one session. Session ordering is the sorted file order from the recursive glob.
 
-ii. `for i,fn in enumerate(files): N,I,O,sub,info=process_file(fn,...); neural.append(N); inputs.append(I); outputs.append(O)`.
+ii.
+```python
+files=sorted(Path('/app/data').rglob('*.nwb')); files=files[:2] if a.sample else files
+...
+for i,fn in enumerate(files):
+    N,I,O,sub,info=process_file(fn,a.show_processing); neural.append(N);inputs.append(I);outputs.append(O);infos.append(info)
+```
 
-iii. The agent states that each released NWB has a native session identity and should be retained rather than applying analysis utilities that sometimes select one session per day.
+iii. The notes repeatedly describe the dataset as “one file per recording session” and state that all 152 NWB files are retained as sessions.
 
 ## 1-d. How are the data split into trials?
 
-i. Frame indices with positive `trial_start` are paired with the first positive `teleport` at or after the start and before the next start. Bin centers span the paired start/teleport timestamps.
+i. Trials are reconstructed from the frame-sampled behavior stream. The AI takes all indices where `trial_start > 0`, all indices where `teleport > 0`, then pairs each start with the first teleport index after that start and before the next start. Trial timing comes from the `trial_start` timestamps array.
 
-ii. `starts=np.flatnonzero(B['trial_start']>0); tele=np.flatnonzero(B['teleport']>0)`; `e0=tele[tele>=s]`; `pairs.append((int(s),int(e0[0])))`.
+ii.
+```python
+bt=np.asarray(beh['trial_start'].timestamps[:],float)
+B={k:np.asarray(v.data[:]) for k,v in beh.items() if v.data.shape[0]==len(bt)}
+starts=np.flatnonzero(B['trial_start']>0); tele=np.flatnonzero(B['teleport']>0)
+pairs=[]
+for j,s in enumerate(starts):
+    e0=tele[tele>=s]
+    if len(e0) and (j+1==len(starts) or e0[0]<starts[j+1]): pairs.append((int(s),int(e0[0])))
+```
 
-iii. The notes say the NWBs lack a trials table, explicit start/teleport pulses define complete traversals, and inter-trial sentinel periods must be excluded.
+iii. The notes justify this as using the explicit timestamped `trial_start` and `teleport` pulse streams because the NWB `trials` table is absent and trial alignment should be to trial start.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Sessions with fewer than two complete trials fail. Trials are retained only if their start and teleport timestamps are fully covered by every neural plane. There is no minimum-duration filter; one terminal trial was removed.
+i. The AI does not apply a minimum-trial-length filter. Instead, it excludes any trial whose start or end falls outside the time range covered by every neural plane, and it raises an error if fewer than two such trials remain.
 
-ii. `pairs=[(s,e) for s,e in pairs if bt[s]>=neural_start and bt[e]<=neural_end]` and `if len(pairs)<2: raise ValueError(...)`.
+ii.
+```python
+neural_start=max(x[1][0] for x in plane_data)
+neural_end=min(x[1][-1] for x in plane_data)
+n_pairs_raw=len(pairs)
+pairs=[(s,e) for s,e in pairs if bt[s]>=neural_start and bt[e]<=neural_end]
+excluded_no_neural=n_pairs_raw-len(pairs)
+if len(pairs)<2: raise ValueError(f'{fn}: fewer than 2 fully imaging-covered trials')
+```
 
-iii. A validator warning exposed an all-zero extrapolated trial, so the agent added complete neural-coverage filtering. It explicitly retained an unusually long but valid trial rather than imposing an unsupported duration rule.
+iii. `CONVERSION_NOTES.md` says this filter was added after validator warnings showed some behavioral trials continued after imaging ended, producing all-zero neural data if retained.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data comes from each plane of `processing['ophys']['Deconvolved']`, restricted using its ROI table region and Suite2p `iscell` flag.
+i. The AI derives neural data from the NWB `processing['ophys']['Deconvolved']` `RoiResponseSeries`, plus the `iscell` column in the referenced segmentation table for curation. It does not use raw `Fluorescence` or `Neuropil`.
 
-ii. `dec=nwb.processing['ophys']['Deconvolved'].roi_response_series`; `neural_all=np.asarray(rr.data[:, :],np.float32)[:,valid]`.
+ii.
+```python
+dec=nwb.processing['ophys']['Deconvolved'].roi_response_series
+...
+region=np.asarray(rr.rois.data[:],dtype=int)
+table=rr.rois.table
+iscell=np.asarray(table['iscell'].data[:])[:,0]>0
+valid=iscell[region]
+...
+neural_all=np.asarray(rr.data[:, :],np.float32)[:,valid]
+```
 
-iii. The agent reasoned that the stored Deconvolved series is equivalent to the paper session object's `timeseries['events']`, so recomputing dF/F from Fluorescence and Neuropil was unnecessary.
+iii. The notes explicitly say the released NWBs already contain the author-processed deconvolved event signal and therefore “no new delta-F/F calculation is indicated”; the converter should use `Deconvolved` directly.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Curated deconvolved samples are averaged into common 100-ms temporal bins independently per plane, then planes are concatenated neuron-wise. No dF/F, neuropil correction, smoothing, or new deconvolution is performed.
+i. For each imaging plane, the AI applies `iscell` curation, determines timestamps or reconstructs them from `starting_time` and an effective sampling rate, and bins the native deconvolved signal into 100 ms bins by averaging samples whose timestamps fall inside each bin. If a bin has no samples, it copies the nearest sample. It then concatenates planes into one neuron-by-time matrix per trial.
 
-ii. `xp[:,k]=neural_all[a:b].mean(0)` and `X=np.concatenate(binned_planes,axis=0)`.
+ii.
+```python
+if rr.timestamps is not None:
+    neural_t=np.asarray(rr.timestamps[:],float)
+    effective_rate=1.0/np.median(np.diff(neural_t))
+else:
+    effective_rate=nominal_rate/n_planes
+    neural_t=float(rr.starting_time)+np.arange(nt)/effective_rate
+...
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+...
+ni=np.searchsorted(neural_t,centers-DT/2); nj=np.searchsorted(neural_t,centers+DT/2)
+xp=np.empty((neural_all.shape[1],len(centers)),np.float32)
+for k,(a,b) in enumerate(zip(ni,nj)):
+    if b>a: xp[:,k]=neural_all[a:b].mean(0)
+    else: xp[:,k]=neural_all[nearest_idx(neural_t,np.array([centers[k]]))[0]]
+...
+X=np.concatenate(binned_planes,axis=0)
+```
 
-iii. The notes claim the NWB already contains author-processed deconvolved events and choose mean binning to put unequal native sampling grids on a common decoder grid.
+iii. The notes justify this by saying the decoder requires a common time bin across sessions, so the AI chose 100 ms bins and mean-binned the deconvolved events instead of reproducing the paper’s original raw-to-dF/F-to-deconvolution pipeline.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Only ROIs with `iscell[:,0] > 0` are retained. All planes are included. No speed-correlated putative-interneuron filter, place-cell filter, or running-time filter is applied.
+i. Neural filtering consists of keeping only ROIs marked as `iscell` in the segmentation table. The AI does not apply any putative interneuron filter. Trial-level neural filtering is handled separately by excluding trials lacking complete neural coverage.
 
-ii. `iscell=np.asarray(table['iscell'].data[:])[:,0]>0`; `valid=iscell[region]`.
+ii.
+```python
+iscell=np.asarray(table['iscell'].data[:])[:,0]>0
+valid=iscell[region]
+...
+neural_all=np.asarray(rr.data[:, :],np.float32)[:,valid]
+...
+pairs=[(s,e) for s,e in pairs if bt[s]>=neural_start and bt[e]<=neural_end]
+```
 
-iii. The agent identifies `iscell` as Suite2p curation and argues that place/reward-cell and speed filters are analysis-specific and could remove useful decoder information.
+iii. The notes argue that `iscell` is the only general curation that should be applied for the decoder and that place/reward-cell selection or speed-related filtering would be analysis-specific leakage.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Each trial grid is defined relative to the explicit `trial_start` timestamp; neural plane timestamps are assigned to 100-ms bins centered at 0.05, 0.15 seconds, and so on after that event.
+i. Neural data are aligned to the explicit `trial_start` pulse. For each trial, the bin centers are defined relative to `t_start`, and neural bins are constructed on those trial-centered timestamps.
 
-ii. `centers=t_start+DT/2+np.arange(...)*DT`; `ni=np.searchsorted(neural_t,centers-DT/2)`.
+ii.
+```python
+t_start,t_end=bt[s],bt[e]
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+centers=centers[centers<=t_end]
+...
+inp=np.vstack([centers-t_start, ...]).astype(np.float32)
+```
 
-iii. The agent emphasizes timestamp alignment because neural and behavior streams can have different lengths and sampling grids.
+iii. The notes say trial alignment should be to the explicit `trial_start` timestamp, and that inter-trial periods after teleport are excluded.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The output resolution is 100 ms. Native approximately 15.5-Hz neural events are temporally rebinned by taking the mean of samples in each bin; empty bins use the nearest sample.
+i. The converted data use a fixed 100 ms bin size (`DT = 0.1`). Yes: the AI rebins both neural and behavioral variables onto these 100 ms bins.
 
-ii. `DT=0.1`; `metadata['time_bin_size']=DT*1000`; `if b>a: ...mean(0) else: ...nearest_idx(...)`.
+ii.
+```python
+DT=0.1
+...
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+...
+'metadata':{...,'time_bin_size':DT*1000,...}
+```
 
-iii. The notes justify 100 ms as a common, fine temporal grid across sessions with differing acquisition configurations.
+iii. The notes explicitly call out “100 ms for every session” as a key decision so all sessions share one common temporal resolution.
 
 ## 3-a. What variables in the raw data is `input` *Time from start of trial in seconds* derived from?
 
-i. It is derived from the behavior `trial_start` timestamp and the generated 100-ms bin centers.
+i. This input is derived from the `trial_start` timestamps array, not from a per-sample behavior timestamps stream. The AI uses each trial’s start time `t_start` and synthetic 100 ms bin centers built from that start and end time.
 
-ii. `t_start,t_end=bt[s],bt[e]` and `centers-t_start`.
+ii.
+```python
+bt=np.asarray(beh['trial_start'].timestamps[:],float)
+...
+t_start,t_end=bt[s],bt[e]
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+...
+inp=np.vstack([centers-t_start, ...]).astype(np.float32)
+```
 
-iii. The notes describe it as continuous time relative to the explicit trial-start pulse.
+iii. The notes justify this as part of the global 100 ms rebinned representation aligned to trial start.
 
 ## 3-b. What processing is involved in computing `input` *Time from start of trial in seconds*?
 
-i. The trial-start time is subtracted from each generated bin center, producing values beginning at 0.05 s in 0.1-s increments.
+i. The AI constructs evenly spaced 100 ms bin centers spanning the retained part of the trial, then subtracts the trial start time so the first row is seconds from trial start.
 
-ii. `inp=np.vstack([centers-t_start, ...]).astype(np.float32)`.
+ii.
+```python
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+centers=centers[centers<=t_end]
+...
+inp=np.vstack([centers-t_start, ...]).astype(np.float32)
+```
 
-iii. This follows from using bin centers rather than native behavior samples.
+iii. The notes say the decoder needs a common temporal grid, so trial-relative time is represented on those rebinned centers rather than raw behavior timestamps.
 
 ## 3-c. How is the `input` *Time from start of trial in seconds* aligned with the neural data?
 
-i. It uses exactly the same `centers` array that defines the neural bins, so its columns correspond one-to-one with neural columns.
+i. It is aligned by construction: the time-from-start row uses the same 100 ms bin centers that are used to bin neural activity for that trial.
 
-ii. `assert X.shape[1]==inp.shape[1]==out.shape[1]`.
+ii.
+```python
+ni=np.searchsorted(neural_t,centers-DT/2); nj=np.searchsorted(neural_t,centers+DT/2)
+...
+inp=np.vstack([centers-t_start, ...]).astype(np.float32)
+assert X.shape[1]==inp.shape[1]==out.shape[1] and np.isfinite(X).all()
+```
 
-iii. The agent reports independent raw-to-converted alignment checks and strictly increasing 100-ms time vectors.
+iii. The notes describe the converted representation as one common timestamp grid per trial shared across neural, input, and output arrays.
 
 ## 4-a. What variables in the raw data is `input` *Environment type* derived from?
 
-i. It comes from the frame-sampled behavior `environment` value at the trial-start index.
+i. Environment type comes from the `environment` behavior time series.
 
-ii. `env=int(round(float(B['environment'][s])))`.
+ii.
+```python
+env=int(round(float(B['environment'][s]))); env=max(0,min(1,env))
+...
+inp=np.vstack([centers-t_start,np.full(len(centers),env), ...]).astype(np.float32)
+```
 
-iii. The agent observed the native variable is the required binary ENV1/ENV2 context.
+iii. The notes list `environment` as the source variable and describe it as a native 0/1 field mapped to ENV1/ENV2.
 
 ## 4-b. What processing is involved in computing `input` *Environment type*?
 
-i. The value is rounded, converted to integer, clipped to 0/1, and repeated at all trial time points.
+i. The AI reads the environment value at the trial start index, rounds it to an integer, clamps it into `[0, 1]`, and repeats it across all time bins in the trial.
 
-ii. `env=max(0,min(1,env))`; `np.full(len(centers),env)`.
+ii.
+```python
+env=int(round(float(B['environment'][s]))); env=max(0,min(1,env))
+...
+inp=np.vstack([centers-t_start,np.full(len(centers),env), ...]).astype(np.float32)
+```
 
-iii. Repetition makes all inputs consistently shaped `(variables, time)` while preserving a per-trial label.
+iii. The notes say environment is a per-trial binary context variable that should be constant across time within a trial.
 
 ## 5-a. What variables in the raw data is `input` *Trial number* derived from?
 
-i. It is taken from behavior `trial number` at the trial-start frame.
+i. Trial number is taken directly from the `trial number` behavior time series at the trial start index.
 
-ii. `trialnum=float(B['trial number'][s])`.
+ii.
+```python
+trialnum=float(B['trial number'][s])
+...
+inp=np.vstack([centers-t_start,np.full(len(centers),env),np.full(len(centers),trialnum), ...]).astype(np.float32)
+```
 
-iii. The mapping plan calls the native value the continuous, session-local trial number.
+iii. The notes say `trial number` is a native session behavior variable and map it directly to the decoder input.
 
 ## 5-b. What processing is involved in computing `input` *Trial number*?
 
-i. No numerical transformation is applied; the start-frame value is repeated across the trial and cast as float32 with the input matrix.
+i. The AI converts the trial-start sample to `float` and repeats that constant value across all time bins in the trial.
 
-ii. `np.full(len(centers),trialnum)`.
+ii.
+```python
+trialnum=float(B['trial number'][s])
+...
+inp=np.vstack([centers-t_start,np.full(len(centers),env),np.full(len(centers),trialnum),np.full(len(centers),prev)]).astype(np.float32)
+```
 
-iii. The agent says repeating per-trial variables avoids ambiguous mixed input shapes.
+iii. The notes treat trial number as a per-trial input that should be repeated over time for the validator format.
 
 ## 6-a. What variables in the raw data is `input` *Previous trial outcome* derived from?
 
-i. It is derived from sparse `Reward` timestamps by first determining whether each retained trial contains a reward event.
+i. Previous trial outcome is derived from the sparse `Reward` event timestamps. For each retained trial, the AI first computes whether the current trial was rewarded based on whether any reward timestamp falls within the trial window, then uses the previous retained trial’s outcome as the next trial’s `previous trial outcome`.
 
-ii. `rew_t=np.asarray(beh['Reward'].timestamps[:],float)` and `rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))`.
+ii.
+```python
+rew_t=np.asarray(beh['Reward'].timestamps[:],float)
+...
+trialnum=float(B['trial number'][s]); rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))
+prev=outcomes[-1] if outcomes else 0; outcomes.append(rewarded)
+...
+inp=np.vstack([centers-t_start, ..., np.full(len(centers),prev)]).astype(np.float32)
+```
 
-iii. The agent notes Reward is event-based and must be matched directly by time rather than treated as a frame-sampled stream.
+iii. The notes say previous outcome should come from sparse Reward events and be represented as rewarded=1 versus omitted=0.
 
 ## 6-b. What processing is involved in computing `input` *Previous trial outcome*?
 
-i. The first retained trial gets 0. Later trials receive the immediately preceding retained trial's binary outcome, repeated across time.
+i. Reward outcome for each retained trial is computed as `any(Reward timestamp in [t_start, t_end])`. The first retained trial gets `0` for previous outcome; later retained trials inherit the previous retained trial’s `rewarded` label and repeat it across all bins.
 
-ii. `prev=outcomes[-1] if outcomes else 0; outcomes.append(rewarded)`.
+ii.
+```python
+rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))
+prev=outcomes[-1] if outcomes else 0; outcomes.append(rewarded)
+...
+inp=np.vstack([centers-t_start,np.full(len(centers),env),np.full(len(centers),trialnum),np.full(len(centers),prev)]).astype(np.float32)
+```
 
-iii. This implements omitted=0/rewarded=1 and the agent validated trial-level constancy.
+iii. The notes frame this as a per-trial context variable and explicitly say the first trial is set to 0.
 
 ## 7-a. What variables in the raw data is `output` *Distance to reward zone* derived from?
 
-i. It is derived from interpolated behavior `position` and an inferred active A/B/C zone. Zone evidence is the position where behavior `reward_zone` is positive; omission labels are filled from the nearest labeled trial. The hard-coded zones are A 80–100, B 200–220, C 320–340 cm.
+i. Distance to reward zone is derived from interpolated position and an inferred reward-zone identity for the trial. The zone identity itself is inferred from the `reward_zone` time series together with the animal’s position when `reward_zone > 0`.
 
-ii. `ZONES=np.array([[80.,100.],[200.,220.],[320.,340.]])`; `hit=np.flatnonzero(B['reward_zone'][s:e+1]>0)`.
+ii.
+```python
+hit=np.flatnonzero(B['reward_zone'][s:e+1]>0)
+if len(hit): raw_zone.append(zone_for_trial(float(np.median(B['position'][s+hit]))))
+else: raw_zone.append(-1)
+...
+pos=np.interp(centers,bt,B['position']).astype(np.float32)
+...
+z=int(zones[ti]); lo,hi=ZONES[z]
+dist=np.where(pos<lo,pos-lo,np.where(pos>hi,pos-hi,0.)).astype(np.float32)
+```
 
-iii. The agent says `reward_zone` is a transient signal rather than an A/B/C code and assumes contiguous task blocks permit nearest-trial filling.
+iii. The notes say the native `reward_zone` stream is not itself an A/B/C label, so the active fixed zone must be inferred from where that stream activates in position space.
 
 ## 7-b. What processing is involved in computing `output` *Distance to reward zone*?
 
-i. Position is linearly interpolated to bin centers. Signed distance is negative before the zone, zero within it, and positive after its far edge.
+i. The AI first infers a zone per trial using the median position of samples where `reward_zone > 0`, mapped to the nearest fixed zone center among `[80,100]`, `[200,220]`, and `[320,340]`. Trials with no `reward_zone` activation are filled from the nearest labeled trial. It then computes signed distance to the nearest edge of that zone, with zero inside the zone.
 
-ii. `pos=np.interp(centers,bt,B['position'])`; `dist=np.where(pos<lo,pos-lo,np.where(pos>hi,pos-hi,0.))`.
+ii.
+```python
+ZONES=np.array([[80.,100.],[200.,220.],[320.,340.]])
+...
+def zone_for_trial(pos):
+    return int(np.argmin(np.abs(ZONES.mean(1)-pos)))
+...
+good=np.flatnonzero(np.asarray(raw_zone)>=0)
+...
+zones[bad]=zones[good[np.argmin(abs(good[:,None]-bad),axis=0)]] if len(bad) else zones[bad]
+...
+z=int(zones[ti]); lo,hi=ZONES[z]
+dist=np.where(pos<lo,pos-lo,np.where(pos>hi,pos-hi,0.)).astype(np.float32)
+```
 
-iii. The notes describe distance to the closest point of the active fixed zone, making every in-zone sample exactly zero.
+iii. The notes justify the omission handling by saying reward-location blocks are contiguous, so unlabeled omission trials can be filled from nearby labeled trials.
 
 ## 7-c. How is `output` *Distance to reward zone* thresholded into categories?
 
-i. Explicit Boolean masks implement the seven requested classes at -50, -10, 0, 10, and 50 cm.
+i. The continuous signed distance is mapped into seven integer classes using explicit threshold comparisons: `< -50`, `[-50,-10)`, `[-10,0)`, `0`, `(0,10]`, `(10,50]`, and `> 50`.
 
-ii. `y[d < -50]=0; y[(d>=-50)&(d<-10)]=1; ...; y[d>50]=6`.
+ii.
+```python
+def discretize_distance(d):
+    y=np.empty(d.shape,np.int64)
+    y[d < -50]=0; y[(d>=-50)&(d<-10)]=1; y[(d>=-10)&(d<0)]=2
+    y[d==0]=3; y[(d>0)&(d<=10)]=4; y[(d>10)&(d<=50)]=5; y[d>50]=6
+    return y
+...
+out=np.vstack([discretize_distance(dist), ...]).astype(np.int64)
+```
 
-iii. The thresholds are presented as a direct implementation of the decoder specification.
+iii. The notes say these bins were chosen to match the decoder task specification exactly.
 
 ## 7-d. How is `output` *Distance to reward zone* aligned with the neural data?
 
-i. Position is interpolated at the same 100-ms centers used for neural binning; the derived distance therefore has identical columns.
+i. Position is first interpolated onto the same 100 ms bin centers used for neural activity, and distance is then computed on that shared time base.
 
-ii. `pos=np.interp(centers,bt,B['position'])` and the shared-length assertion.
+ii.
+```python
+pos=np.interp(centers,bt,B['position']).astype(np.float32)
+...
+ni=np.searchsorted(neural_t,centers-DT/2); nj=np.searchsorted(neural_t,centers+DT/2)
+...
+dist=np.where(pos<lo,pos-lo,np.where(pos>hi,pos-hi,0.)).astype(np.float32)
+```
 
-iii. The notes report exact independent checks of interpolated position and derived output classes.
+iii. The notes explicitly describe position and speed as linearly interpolated to the common bin centers so outputs and neural data are time-aligned.
 
 ## 8-a. What variables in the raw data is `output` *Absolute position* derived from?
 
-i. It is derived directly from behavior `position` and behavior timestamps.
+i. Absolute position is derived from the `position` behavior time series.
 
-ii. `pos=np.interp(centers,bt,B['position']).astype(np.float32)`.
+ii.
+```python
+pos=np.interp(centers,bt,B['position']).astype(np.float32)
+```
 
-iii. The position stream records location along the 450-cm virtual corridor.
+iii. The notes identify `position` as the native track-position variable in centimeters.
 
 ## 8-b. What processing is involved in computing `output` *Absolute position*?
 
-i. Position is linearly interpolated to the common 100-ms bin centers, then discretized. It is not smoothed or clipped.
+i. The AI linearly interpolates raw position onto the 100 ms trial-centered bins and then discretizes those interpolated values into 5 track bins.
 
-ii. `pos=np.interp(centers,bt,B['position'])`.
+ii.
+```python
+pos=np.interp(centers,bt,B['position']).astype(np.float32)
+poscls=np.digitize(pos,[90,180,270,360],right=False).astype(np.int64)
+...
+out=np.vstack([discretize_distance(dist),poscls, ...]).astype(np.int64)
+```
 
-iii. The agent chose linear interpolation for continuous position to align independent sampling grids.
+iii. The notes say continuous behavior variables should be interpolated to the common temporal grid before discretization.
 
 ## 8-c. How is `output` *Absolute position* thresholded into categories?
 
-i. `np.digitize` with thresholds 90, 180, 270, and 360 cm yields five integer classes.
+i. The AI uses `np.digitize` with thresholds at 90, 180, 270, and 360 cm, producing five categories.
 
-ii. `poscls=np.digitize(pos,[90,180,270,360],right=False).astype(np.int64)`.
+ii.
+```python
+poscls=np.digitize(pos,[90,180,270,360],right=False).astype(np.int64)
+```
 
-iii. These are the requested five equal 90-cm bins over the 450-cm track.
+iii. The notes say this implements five equal-width bins across the 450 cm track.
 
 ## 8-d. How is `output` *Absolute position* aligned with the neural data?
 
-i. It is evaluated at the same bin centers as neural activity and checked to have the same number of columns.
+i. Absolute position is aligned by interpolation to the same 100 ms bin centers used for neural binning.
 
-ii. `np.interp(centers,bt,B['position'])` and `assert X.shape[1]==...==out.shape[1]`.
+ii.
+```python
+centers=t_start+DT/2+np.arange(max(1,int(np.floor((t_end-t_start)/DT))))*DT
+...
+pos=np.interp(centers,bt,B['position']).astype(np.float32)
+```
 
-iii. Timestamp-based interpolation was chosen instead of assuming index alignment.
+iii. The notes say all continuous behavior outputs are put on the common neural bin grid.
 
 ## 9-a. What variables in the raw data is `output` *Lick* derived from?
 
-i. It comes from the behavior `lick` stream and behavior timestamps.
+i. Lick is derived from the `lick` behavior time series.
 
-ii. `jj=nearest_idx(bt,centers); lick=(B['lick'][jj]>0).astype(np.int64)`.
+ii.
+```python
+jj=nearest_idx(bt,centers)
+lick=(B['lick'][jj]>0).astype(np.int64)
+```
 
-iii. The agent identifies lick as a discrete/count-like stream and uses nearest-sample alignment.
+iii. The notes describe lick as a frame-sampled behavior variable that is binarized for decoding.
 
 ## 9-b. What processing is involved in computing `output` *Lick*?
 
-i. The nearest native sample is selected at each bin center and any positive value is binarized to 1.
+i. The AI aligns lick by taking the nearest behavior sample to each 100 ms bin center and then binarizes it with `> 0`.
 
-ii. `lick=(B['lick'][jj]>0).astype(np.int64)`.
+ii.
+```python
+jj=nearest_idx(bt,centers)
+lick=(B['lick'][jj]>0).astype(np.int64)
+...
+out=np.vstack([...,lick,...]).astype(np.int64)
+```
 
-iii. Binarization matches the required no/yes output and, according to the notes, the paper's pre-smoothing binary lick representation.
+iii. The notes justify binarizing lick by citing the paper’s use of binary licks per frame before downstream smoothing in the GLM analyses.
 
 ## 9-c. How is `output` *Lick* aligned with the neural data?
 
-i. Nearest behavior samples are selected at the same centers used for neural bins.
+i. Lick is aligned to neural data by nearest-neighbor resampling from behavior timestamps onto the shared 100 ms neural bin centers.
 
-ii. `jj=nearest_idx(bt,centers)`.
+ii.
+```python
+jj=nearest_idx(bt,centers)
+lick=(B['lick'][jj]>0).astype(np.int64)
+```
 
-iii. The agent uses nearest-neighbor rather than linear interpolation because lick is discrete.
+iii. The notes distinguish discrete streams from continuous ones: continuous variables are interpolated, while discrete streams such as lick use nearest-sample alignment.
 
 ## 10-a. What variables in the raw data is `output` *Reward zone location* derived from?
 
-i. It is inferred from `reward_zone` activation together with `position`; trials without activation inherit the nearest trial's label.
+i. Reward zone location is derived from the `reward_zone` behavior time series together with `position`, exactly as in the zone-inference step used for distance to reward zone.
 
-ii. `raw_zone.append(zone_for_trial(float(np.median(B['position'][s+hit]))))`; `zones[bad]=zones[good[np.argmin(...)] ]`.
+ii.
+```python
+hit=np.flatnonzero(B['reward_zone'][s:e+1]>0)
+if len(hit): raw_zone.append(zone_for_trial(float(np.median(B['position'][s+hit]))))
+else: raw_zone.append(-1)
+...
+z=int(zones[ti])
+```
 
-iii. The agent argues that the native signal is transient and task blocks are contiguous, so neighboring trials supply omission labels.
+iii. The notes state that the raw `reward_zone` stream is transient and not itself the A/B/C identity, so position-localized activation is used to infer the active fixed zone.
 
 ## 10-b. What processing is involved in computing `output` *Reward zone location*?
 
-i. Median activation position is assigned to the nearest hard-coded zone center, encoded A/B/C as 0/1/2, nearest-trial-filled if absent, and repeated across time.
+i. The AI infers a trial-level zone index `z` using the same procedure as in 7-b, then repeats that integer (`0=A`, `1=B`, `2=C`) across all time bins in the trial.
 
-ii. `return int(np.argmin(np.abs(ZONES.mean(1)-pos)))`; `np.full(len(centers),z)`.
+ii.
+```python
+good=np.flatnonzero(np.asarray(raw_zone)>=0)
+...
+zones[bad]=zones[good[np.argmin(abs(good[:,None]-bad),axis=0)]] if len(bad) else zones[bad]
+...
+z=int(zones[ti])
+...
+out=np.vstack([...,np.full(len(centers),z), ...]).astype(np.int64)
+```
 
-iii. Balanced full-data counts and presence of all three classes were used as sanity checks.
+iii. The notes say reward-location blocks are contiguous, so nearest labeled trials can supply omission trials with no local `reward_zone` activation.
 
 ## 11-a. What variables in the raw data is `output` *Reward outcome* derived from?
 
-i. It comes solely from the sparse behavior `Reward` event timestamps.
+i. Reward outcome is derived from the sparse `Reward` event timestamps.
 
-ii. `rew_t=np.asarray(beh['Reward'].timestamps[:],float)`.
+ii.
+```python
+rew_t=np.asarray(beh['Reward'].timestamps[:],float)
+...
+rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))
+```
 
-iii. The agent treats delivered Reward events as authoritative rather than using omission flags.
+iii. The notes identify `Reward` as an event `TimeSeries` whose timestamps determine rewarded versus omission trials.
 
 ## 11-b. What processing is involved in computing `output` *Reward outcome*?
 
-i. A trial is 1 when any reward timestamp lies inclusively between its start and teleport timestamps, otherwise 0; this value is repeated for every bin.
+i. For each trial, the AI checks whether any reward timestamp lies between that trial’s start and end timestamps, converts that Boolean to `0/1`, and repeats it across all bins in the trial.
 
-ii. `rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))`; `np.full(len(centers),rewarded)`.
+ii.
+```python
+rewarded=int(np.any((rew_t>=t_start)&(rew_t<=t_end)))
+...
+out=np.vstack([...,np.full(len(centers),rewarded)]).astype(np.int64)
+```
 
-iii. The notes report independent checks on rewarded, omission, and multi-plane trials.
+iii. The notes say rewarded and omission trials should both be preserved, with reward outcome represented as a trial-level binary variable.
 
 ## 12. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Invalid sessions/trials raise errors; missing reward-zone activation is nearest-neighbor-filled across trials; behavior beyond neural coverage is excluded; empty neural bins use the nearest neural sample; shape and finiteness assertions guard output. No general NaN imputation is done.
+i. The AI handles several edge cases directly in code: multi-plane ROI references are resolved plane-by-plane through each `DynamicTableRegion`; missing neural timestamps are reconstructed from `starting_time` and `rate`; empty 100 ms bins fall back to the nearest neural sample; trials outside complete neural coverage are discarded; omission trials with no `reward_zone` activation are filled from the nearest labeled trial; and the code raises hard errors if no zone can be inferred or fewer than two valid trials remain.
 
-ii. `if not len(good): raise ValueError(...)`; `if b>a: ... else: xp[:,k]=neural_all[nearest_idx(...)]`; `assert ... and np.isfinite(X).all()`.
+ii.
+```python
+if rr.timestamps is not None:
+    neural_t=np.asarray(rr.timestamps[:],float)
+    effective_rate=1.0/np.median(np.diff(neural_t))
+else:
+    effective_rate=nominal_rate/n_planes
+    neural_t=float(rr.starting_time)+np.arange(nt)/effective_rate
+...
+if b>a: xp[:,k]=neural_all[a:b].mean(0)
+else: xp[:,k]=neural_all[nearest_idx(neural_t,np.array([centers[k]]))[0]]
+...
+pairs=[(s,e) for s,e in pairs if bt[s]>=neural_start and bt[e]<=neural_end]
+...
+if not len(good): raise ValueError(f'{fn}: cannot infer reward zone')
+```
 
-iii. These choices arose from multi-plane and incomplete-imaging failures found during validation; the notes document rerunning full conversion and checks after fixes.
+iii. The notes explain that these checks were added after debugging multi-plane ROI mismatches and validator warnings from trials extending beyond imaging coverage.
 
 ## 13-a. What are the most time-consuming steps of the code?
 
-i. Reading complete deconvolved matrices, per-bin neural means inside every trial/plane, serializing the 5.89-GiB pickle, and downstream decoder training are the costly operations. The conversion notes report a corrected full run of 124.5 seconds.
+i. The code’s main expensive operations are loading full NWB sessions, materializing full deconvolved arrays for every plane, looping over trials and 100 ms bins to average neural samples, and serializing the final pickle. Plot generation can add extra cost when `--show-processing` is enabled.
 
-ii. `neural_all=np.asarray(rr.data[:, :],np.float32)[:,valid]`; nested `for ti...`, `for plane...`, `for k...`; `pickle.dump(...)`.
+ii.
+```python
+with NWBHDF5IO(str(fn),'r',load_namespaces=True) as io:
+    nwb=io.read()
+...
+neural_all=np.asarray(rr.data[:, :],np.float32)[:,valid]
+...
+for ti,(s,e) in enumerate(pairs):
+    ...
+    for plane_name,neural_t,neural_all in plane_data:
+        ...
+        for k,(a,b) in enumerate(zip(ni,nj)):
+            if b>a: xp[:,k]=neural_all[a:b].mean(0)
+```
 
-iii. The agent says one read per session and vectorized timestamp searches keep conversion under a few minutes; large NWB arrays and serialization dominate.
+iii. The notes say the converter reads each full deconvolved matrix once per session and identify the “small per-bin mean loop” as the remaining bounded hotspot.
 
 ## 13-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The inner loop over temporal bins that computes means could be replaced by grouped/reduce operations. Trial and plane loops are natural but parts of zone extraction and binning could also be batched.
+i. The clearest vectorization opportunity is the inner loop over 100 ms bins inside each plane, which currently averages one bin at a time. The outer per-trial loops for pairing starts, inferring zones, and building constant label arrays are also serial.
 
-ii. `for k,(a,b) in enumerate(zip(ni,nj)): if b>a: xp[:,k]=neural_all[a:b].mean(0)`.
+ii.
+```python
+for j,s in enumerate(starts):
+    e0=tele[tele>=s]
+    if len(e0) and (j+1==len(starts) or e0[0]<starts[j+1]): pairs.append((int(s),int(e0[0])))
+...
+for s,e in pairs:
+    hit=np.flatnonzero(B['reward_zone'][s:e+1]>0)
+...
+for ti,(s,e) in enumerate(pairs):
+    ...
+    for plane_name,neural_t,neural_all in plane_data:
+        ...
+        for k,(a,b) in enumerate(zip(ni,nj)):
+            if b>a: xp[:,k]=neural_all[a:b].mean(0)
+```
 
-iii. The notes acknowledge the small per-bin loop but characterize it as bounded by trial duration; timestamp searches and interpolation were already vectorized.
+iii. The notes claim large repeated I/O was already removed, so the remaining optimization target is mostly within the per-trial binning loops.
 
 ## 13-c. What processing does the code repeat multiple times?
 
-i. It repeatedly performs `searchsorted` and per-bin averaging for every plane and trial, creates repeated per-trial constant vectors, and scans each trial's reward-zone slice. It avoids repeated file reads by loading each session matrix once.
+i. The code largely avoids a separate survey/conversion pass, but it still repeats a few computations: `searchsorted` is rerun for every plane and trial, `nearest_idx` can be called again for empty bins, and constant trial-level labels are rebuilt with `np.full` for every trial. Diagnostic plots also re-read already computed arrays when plotting.
 
-ii. `np.searchsorted(neural_t,centers-DT/2)` inside the trial/plane loops and multiple `np.full(len(centers),...)` calls.
+ii.
+```python
+for ti,(s,e) in enumerate(pairs):
+    ...
+    for plane_name,neural_t,neural_all in plane_data:
+        ni=np.searchsorted(neural_t,centers-DT/2); nj=np.searchsorted(neural_t,centers+DT/2)
+        ...
+        for k,(a,b) in enumerate(zip(ni,nj)):
+            if b>a: xp[:,k]=neural_all[a:b].mean(0)
+            else: xp[:,k]=neural_all[nearest_idx(neural_t,np.array([centers[k]]))[0]]
+    ...
+    inp=np.vstack([centers-t_start,np.full(len(centers),env),np.full(len(centers),trialnum),np.full(len(centers),prev)]).astype(np.float32)
+```
 
-iii. The agent specifically highlights one neural read per session and one-time curated-column extraction as implemented speedups.
+iii. The notes explicitly contrast this with the earlier survey-heavy design and say the final script reads each full neural matrix only once per session.
 
 ## 13-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. `process_file` accepts an unused `show` argument and stores/prints extensive session metadata; `plane_name` is carried through tuples but unused in conversion. Plotting is optional and its figures are not consumed by the decoder. The required input variables themselves are saved although the provided decoder predicts only outputs from neural data.
+i. The converter computes and stores session-level bookkeeping that the decoder itself does not use, including `rates`, per-session `info`, trial-zone histograms, reward counts, and optional plotting support. It also carries an unused `show` argument in `process_file`. These are mostly diagnostics/metadata rather than data used downstream by the decoder.
 
-ii. `def process_file(fn, show=False)`; `plane_data.append((plane_name,neural_t,neural_all))`; optional `plot_session(...)`.
+ii.
+```python
+def process_file(fn, show=False):
+...
+plane_data=[]; rates=[]
+...
+info=dict(session_id=sid,file=str(fn),n_trials=len(pairs),n_neurons=int(n_valid),rate=float(rates[0]),plane_rates=rates,n_planes=len(plane_data),zones=np.bincount(zones,minlength=3).tolist(),rewarded=int(sum(outcomes)),excluded_no_neural=excluded_no_neural)
+...
+if a.show_processing and i<2: plot_session(info,N,I,O)
+```
 
-iii. Plots and metadata were retained for auditability and visual sanity checking, not decoder computation.
+iii. The notes emphasize extensive sanity checks and metadata auditing, so this extra bookkeeping was intentional for validation rather than for the decoder model itself.

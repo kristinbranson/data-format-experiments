@@ -2,295 +2,419 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The submitted script discovers every `.mat` file in the selected data directory, sorts the paths, and opens each MATLAB v7.3/HDF5 file with `h5py`. It reads the `trace`, `position`, and `blocked` reference datasets and dereferences each session inside `process_mat_file`. Full mode is the default; `--sample` limits the result to two sessions.
+i. The AI does not load the HDF5 `.mat` files directly. Instead, it hard-codes the seven animal IDs, loads the sidecar `joblib` file for each animal from `/app/data/<animal>`, and reads `trace`, `position`, `envs`, and `blocked` from the loaded dictionary. Trials are not stored explicitly in the source; they are created later by splitting each session.
 
 ii.
 ```python
-mat_files = sorted(glob.glob(f'{args.datadir}/*.mat'))
+ANIMALS = [
+    "QLAK-CA1-08",
+    "QLAK-CA1-30",
+    "QLAK-CA1-50",
+    "QLAK-CA1-51",
+    "QLAK-CA1-56",
+    "QLAK-CA1-74",
+    "QLAK-CA1-75",
+]
 ...
-for subj_i, mat_file in enumerate(mat_files):
-    sessions = process_mat_file(mat_file)
-...
-f = h5py.File(filepath, 'r')
-trace_refs = f['trace']
-pos_refs = f['position']
-blk_refs = f['blocked'][:][0]
+for animal_index, animal in enumerate(ANIMALS):
+    source_path = data_dir / animal
+    wrapped = joblib.load(source_path)
+    source = wrapped[animal]
+
+    traces = np.asarray(source["trace"])
+    positions = np.asarray(source["position"])
+    envs = np.asarray(source["envs"]).reshape(-1)
+    blocked = source["blocked"]
 ```
 
-iii. The trajectory initially inspected the provided joblib files and said it would use their final rise-extracted traces and aligned positions. It does not justify the submitted switch to duplicate `.mat` files/HDF5. The code comments imply that these files contain the same session data and that HDF5 references are the appropriate loading mechanism.
+iii. In the trajectory, the AI said the "source files already contain the paper's final rise-extracted binary calcium events and frame-aligned position" (step 9), so it chose the prepackaged `joblib` objects rather than reloading the `.mat` files. It also treated the data as 207 daily sessions across the seven hard-coded animals (steps 14, 32, 49).
 
 ## 1-b. How are the data split into subjects?
 
-i. One sorted `.mat` file is treated as one mouse. The filename stem is the subject ID, and the file's enumeration index is appended to `subject_idx` for each session.
+i. Subjects are defined by the hard-coded `ANIMALS` list. Each list entry becomes one subject, and `subject_idx` stores the index of that animal for every session appended from that subject.
 
 ii.
 ```python
-name = mat_file.split('/')[-1].replace('.mat', '')
-subjects.append(name)
+ANIMALS = [
+    "QLAK-CA1-08",
+    "QLAK-CA1-30",
+    "QLAK-CA1-50",
+    "QLAK-CA1-51",
+    "QLAK-CA1-56",
+    "QLAK-CA1-74",
+    "QLAK-CA1-75",
+]
 ...
-subject_idx_list.append(subj_i)
+for animal_index, animal in enumerate(ANIMALS):
+    ...
+    for day in range(traces.shape[0]):
+        ...
+        subject_idx.append(animal_index)
 ```
 
-iii. The submitted code provides no explicit rationale beyond its one-file-per-subject structure. The trajectory identified the same seven named animals in the source data.
+iii. The trajectory repeatedly refers to "7 subjects" and processes fixed animal names rather than discovering subjects from the filesystem (steps 32, 49, 54).
 
 ## 1-c. How are the data split into sessions?
 
-i. Every entry in a subject file's `trace` reference array is treated as a recording session. The corresponding trace, position, and blocked-geometry entries at the same index are loaded together, and each session becomes one outer-list element.
+i. Each day / recording index along the first axis of the `trace`, `position`, `envs`, and `blocked` arrays is treated as one session. The AI calls these "recording day" sessions.
 
 ii.
 ```python
-n_recording_sessions = trace_refs.shape[0]
-for i in range(n_recording_sessions):
-    trace = f[trace_refs[i][0]][:]
-    position = f[pos_refs[i][0]][:].T
-    blk_indices = f[blk_refs[i]][:].flatten()
+traces = np.asarray(source["trace"])
+positions = np.asarray(source["position"])
+envs = np.asarray(source["envs"]).reshape(-1)
+blocked = source["blocked"]
+...
+for day in range(traces.shape[0]):
+    day_trace = traces[day]
+    ...
+    session_info.append(
+        {
+            "subject": animal,
+            "source_day_index": day,
+            "environment": str(envs[day]),
 ```
 
-iii. The trajectory reasoned that a recording day/environment is the natural decoder session and emphasized preserving session boundaries. The HDF5 reference-array entries represent those recording sessions.
+iii. The AI explicitly described the files as containing "207 daily sessions" and said it would preserve those session boundaries (steps 14, 32, 49). It also wrote `"session_definition": "one recording day in one environment"` into metadata.
 
 ## 1-d. How are the data split into trials?
 
-i. Each continuous session is divided into consecutive, non-overlapping 1,800-frame chunks (60 seconds at 30 Hz). Only complete chunks are returned; all trailing frames are discarded.
+i. Trials are created by splitting every session into exactly 40 contiguous, nearly equal segments with `np.array_split`. This keeps every source frame, so trial lengths vary slightly instead of being exactly 1800 frames. The code treats these as the "nominal 40 one-minute trials."
 
 ii.
 ```python
-TRIAL_LENGTH = SAMPLING_RATE * TRIAL_DURATION_SEC
+FPS = 30.0
+N_TRIALS = 40
 ...
-n_trials = data.shape[1] // trial_length
-return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
+def split_trials(array: np.ndarray, axis: int) -> list[np.ndarray]:
+    """Split a full recording into the nominal 40 contiguous minute windows."""
+    return [np.ascontiguousarray(x) for x in np.array_split(array, N_TRIALS, axis=axis)]
+...
+neural_trials = split_trials(session_neural_full, axis=1)
+output_trials = split_trials(session_output_full, axis=1)
+input_trials = [geometry.copy() for _ in range(N_TRIALS)]
 ```
 
-iii. The current docstring justifies this as fixed one-minute trials. This conflicts with the trajectory: after observing slightly different recording lengths, the agent explicitly chose exactly 40 nearly equal `np.array_split` windows to retain every frame and avoid either a short 41st trial or discarded data. That rationale is not implemented by the submitted script.
+iii. The trajectory gives the rationale directly: session lengths vary slightly around 40 minutes, so the AI chose `array_split` to "preserve every aligned frame" and avoid either discarding almost a minute or creating a short extra trial; it noted resulting trial lengths of 1,796-1,806 frames (steps 25 and 54).
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are not quality-filtered. Every complete 1,800-frame chunk is retained, while a final incomplete chunk is dropped solely because of its length.
+i. The AI does not filter or drop individual trials after splitting. Every one of the 40 per-session trial windows is kept. The only checks are session-level assertions, such as rejecting partially finite neuron traces or sessions with too many samples in blocked bins.
 
 ii.
 ```python
-neural_trials = split_into_trials(trace)
-output_trials = split_into_trials(output)
-input_trials = [blocked] * len(neural_trials)
+neural_trials = split_trials(session_neural_full, axis=1)
+output_trials = split_trials(session_output_full, axis=1)
+input_trials = [geometry.copy() for _ in range(N_TRIALS)]
+...
+if not np.array_equal(finite_any, finite_all):
+    raise ValueError(f"Partially finite neuron trace in {animal}, day {day}")
+...
+if blocked_position_samples / session_output_full.shape[1] > 0.05:
+    raise ValueError(
+        f"More than 5% of positions enter blocked bins in {animal}, day {day}; "
+        "check the x/y convention"
+    )
 ```
 
-iii. Neither the instructions nor the source analysis specifies a trial-level quality screen. The trajectory also planned to keep all contiguous trials and stationary frames.
+iii. The AI said it would "retain stationary frames so the 40 contiguous trials cover the full recordings" and keep all curated cells rather than apply an extra activity screen (step 29). It did not describe any trial-level curation step.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. `neural` comes directly from the raw `trace` session dataset referenced by the MATLAB file's `trace` array.
+i. `neural` is derived from the raw `trace` array loaded from each animal's `joblib` dictionary.
 
 ii.
 ```python
-trace_refs = f['trace']
+source = wrapped[animal]
+traces = np.asarray(source["trace"])
 ...
-trace = f[trace_refs[i][0]][:]
+day_trace = traces[day]
 ```
 
-iii. The trajectory established that `trace` already contains the authors' final, manually curated binary rising-phase calcium-event vectors, so it chose not to reconstruct events from raw fluorescence or video.
+iii. The trajectory says the source files already contain the paper's final neural representation, so the AI did not attempt to derive neural data from other variables or from video (step 9).
 
 ## 2-b. How is the `neural` data processed?
 
-i. After absent neurons are removed, traces are cast to `float32` and transposed from time-by-neuron to neuron-by-time. They are otherwise left at native frame resolution and then sliced into trials.
+i. For each day/session, the AI selects only neurons with fully finite traces, casts the resulting session matrix to `float32`, checks that the values are binary `0/1`, and leaves the 30 Hz frames unchanged. It does not smooth, rebin, deconvolve, or otherwise transform the traces before trial splitting.
 
 ii.
 ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
-trace = trace[:, active_mask].astype(np.float32).T
-neural_trials = split_into_trials(trace)
+day_trace = traces[day]
+finite_any = np.any(np.isfinite(day_trace), axis=1)
+finite_all = np.all(np.isfinite(day_trace), axis=1)
+...
+present = finite_all
+...
+session_neural_full = np.asarray(day_trace[present], dtype=np.float32)
+if not np.all((session_neural_full == 0) | (session_neural_full == 1)):
+    raise ValueError(f"Non-binary rise-extracted trace in {animal}, day {day}")
+...
+neural_trials = split_trials(session_neural_full, axis=1)
 ```
 
-iii. The trajectory concluded that the source values are already binary rise-extracted events and that further calcium extraction, interpolation, smoothing, or activity screening would depart from the supplied processing. `float32` was selected for decoder compatibility.
+iii. The AI justified this by saying the files "already contain the paper's final rise-extracted binary calcium events" and therefore it would not redo calcium extraction (step 9). It also said keeping all finite registered cells exactly reproduced the paper's 69,744 session-specific neurons (step 29).
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. A neuron column is removed only if all its values in the session are NaN. No place-cell, event-count, running-speed, or activity filter is applied.
+i. A neuron is kept only if its entire day/session trace is finite. All-NaN rows are treated as registered cells absent on that day and removed. The AI also checks for the unexpected case of a neuron being partly finite and partly non-finite, and raises an error if that happens. It explicitly does not apply the paper code's downstream ">5 event" feature screen.
 
 ii.
 ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
-trace = trace[:, active_mask].astype(np.float32).T
+finite_any = np.any(np.isfinite(day_trace), axis=1)
+finite_all = np.all(np.isfinite(day_trace), axis=1)
+if not np.array_equal(finite_any, finite_all):
+    raise ValueError(f"Partially finite neuron trace in {animal}, day {day}")
+present = finite_all
+if not np.any(present):
+    raise ValueError(f"No registered neurons in {animal}, day {day}")
+...
+session_neural_full = np.asarray(day_trace[present], dtype=np.float32)
+...
+if total_session_neurons != 69_744:
+    raise ValueError(
+        "Registered-neuron total differs from the paper's 69,744 rate maps: "
+        f"got {total_session_neurons}"
+    )
 ```
 
-iii. The trajectory found that NaNs represent cross-day registered cells absent on that day, and that retaining finite registered cells recovered the paper's 69,744 session-specific maps. It explicitly rejected the paper decoder's `>5` running-event feature screen as model-specific rather than source preprocessing. Unlike the trajectory implementation, the submitted code does not reject partially finite traces or verify the total neuron count.
+iii. In step 29, the AI said the 69,744-neuron total was a "strong reference check" and that it would keep all finite registered cells per day. It also explicitly rejected the ">5 running events" filter as a decoder-model feature screen rather than source preprocessing.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. There is no experimental-event alignment. Time zero is implicitly the start of each artificial contiguous one-minute chunk.
+i. There is no biological or stimulus event alignment. The AI keeps the continuous 30 Hz frames as-is and defines alignment implicitly by the start of each contiguous trial window. Its metadata names the alignment event as the "start of each contiguous nominal one-minute window."
 
 ii.
 ```python
-neural_trials = split_into_trials(trace)
+neural_trials = split_trials(session_neural_full, axis=1)
+...
+"metadata": {
+    ...
+    "temporal_alignment_event": "start of each contiguous nominal one-minute window",
+    "off_start": 0.0,
+    "off_end": 60.0,
 ```
 
-iii. The trajectory noted that these are continuous recordings with already frame-aligned neural and position streams and no stimulus event to align to. The submitted metadata omits an explicit `temporal_alignment_event`.
+iii. The trajectory emphasizes that the recordings are continuous and already frame-aligned with position (step 9), then explains that trials are contiguous windows carved from those sessions (step 25). The alignment event was therefore introduced by the conversion rather than taken from the experiment.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The native 30 Hz samples are retained, giving `1000/30 = 33.333...` ms per time bin. No temporal rebinning or resampling is performed.
+i. The converted data keeps the native 30 Hz sampling. The time bin size is `1000 / 30 = 33.33...` ms, and the AI does not apply any temporal rebinning or resampling.
 
 ii.
 ```python
-SAMPLING_RATE = 30
-TIME_BIN_SIZE = 1000.0 / SAMPLING_RATE
+FPS = 30.0
 ...
-'time_bin_size': TIME_BIN_SIZE,
+"metadata": {
+    ...
+    "time_bin_size": 1000.0 / FPS,
+    ...
+    "source_sampling_rate_hz": FPS,
 ```
 
-iii. The trajectory identified simultaneous 30 Hz acquisition and chose to preserve exact framewise neural/behavioral alignment despite the large output size.
+iii. The AI said it would preserve the paper's "30 Hz frame alignment" and keep all frames rather than temporally coarsen them (steps 9, 14, 25).
 
 ## 3-a. What variables in the raw data is `input` *Environment geometry* derived from?
 
-i. Environment geometry comes from each session's raw `blocked` entry, which lists blocked 3×3 arena-cell indices; `-1` denotes the unobstructed square.
+i. Environment geometry is derived from the raw `blocked` entry for each day/session.
 
 ii.
 ```python
-blk_refs = f['blocked'][:][0]
+blocked = source["blocked"]
 ...
-blk_indices = f[blk_refs[i]][:].flatten()
+geometry = geometry_vector(blocked[day])
 ```
 
-iii. The trajectory compared blocked IDs against observed positions and concluded that they use the same row-major spatial convention as the desired output.
+iii. The trajectory explains that the geometry convention was resolved by comparing blocked-cell IDs against the observed positions, so the AI chose to treat `blocked` as the source of the geometry input (step 20).
 
 ## 3-b. What processing is involved in computing `input` *Environment geometry*?
 
-i. Blocked IDs are converted into a static nine-element `float32` multi-hot vector, with 1 for blocked and 0 for accessible. The `[-1]` sentinel produces all zeros. The same vector object is placed in every trial of a session.
+i. The AI converts each session's `blocked` entry into a 9-element static row-major vector with `1` for blocked cells and `0` for accessible cells. The special value `-1` means the square environment and produces an all-zero vector. That vector is copied for every trial in the session.
 
 ii.
 ```python
-blocked = np.zeros(n_positions, dtype=np.float32)
-if not (len(blk_indices) == 1 and blk_indices[0] == -1):
-    blocked[blk_indices.astype(int)] = 1
+def geometry_vector(blocked_entry: object) -> np.ndarray:
+    raw = blocked_entry[0] if isinstance(blocked_entry, list) else blocked_entry
+    blocked = np.asarray(raw).reshape(-1).astype(np.int64)
+    geometry = np.zeros(GRID_SIZE * GRID_SIZE, dtype=np.float32)
+    blocked = blocked[blocked >= 0]
+    if blocked.size:
+        if blocked.max() >= geometry.size:
+            raise ValueError(f"Invalid blocked-cell ID(s): {blocked.tolist()}")
+        geometry[blocked] = 1.0
+    return geometry
 ...
-input_trials = [blocked] * len(neural_trials)
+input_trials = [geometry.copy() for _ in range(N_TRIALS)]
 ```
 
-iii. The trajectory justified one independent binary feature per arena cell and a static per-session/per-trial representation. It also validated the row-major convention empirically. Sharing the immutable array is an implementation shortcut; the trajectory version instead copied it per trial.
+iii. In step 20, the AI said it had resolved the geometry indexing as row-major `y_bin * 3 + x_bin` and would use that same convention for the nine geometry inputs. The top-of-file docstring also records the `-1` sentinel rule.
 
 ## 4-a. What variables in the raw data is `output` *Mouse position* derived from?
 
-i. Mouse position is derived from each session's raw `position` dataset, transposed into a `(2, time)` x/y array.
+i. `output` mouse position is derived from the raw `position` array for each day/session.
 
 ii.
 ```python
-position = f[pos_refs[i][0]][:].T
+positions = np.asarray(source["position"])
+...
+session_output_full = discretize_position(positions[day])
 ```
 
-iii. The trajectory identified these as the source's frame-aligned DeepLabCut coordinates in the 75×75 cm arena.
+iii. The trajectory says the source files already contain frame-aligned position, so the AI used `position` directly as the behavioral stream to discretize (step 9).
 
 ## 4-b. What processing is involved in computing `output` *Mouse position*?
 
-i. The x and y coordinates are independently discretized using fixed 25 cm boundaries at 25 and 50 cm. Bins are clipped to 0–2, then flattened row-major as `y_bin * 3 + x_bin`; the result is stored as a one-row `int8` time series.
+i. The AI converts `(x, y)` coordinates into one categorical time series over a 3x3 grid. It divides the 75 cm arena into 25 cm bins with `floor(position / 25)`, clips both axes to `[0, 2]`, and then encodes the spatial bin as the row-major label `y * 3 + x`.
 
 ii.
 ```python
-edges = np.linspace(0, arena_size, n_grid + 1)[1:-1]
-x_bin = np.clip(np.digitize(position[0], edges), 0, n_grid - 1)
-y_bin = np.clip(np.digitize(position[1], edges), 0, n_grid - 1)
-return (y_bin * n_grid + x_bin).astype(np.int8)
-...
-output = discretize_position(position)[np.newaxis, :]
+def discretize_position(position: np.ndarray) -> np.ndarray:
+    if position.ndim != 2 or position.shape[0] != 2:
+        raise ValueError(f"Expected position shape (2, time), got {position.shape}")
+    bin_width = ARENA_SIZE_CM / GRID_SIZE
+    xy = np.floor(position / bin_width).astype(np.int64)
+    xy = np.clip(xy, 0, GRID_SIZE - 1)
+    location = xy[1] * GRID_SIZE + xy[0]
+    return location[np.newaxis, :]
 ```
 
-iii. The trajectory tested coordinate conventions against blocked cells and found that `y*3+x` minimized impossible wall occupancy and agrees with the blocked IDs.
+iii. The trajectory says the row-major convention was chosen because it matched the blocked-cell IDs and minimized impossible visits into blocked cells (step 20).
 
 ## 4-c. How is `output` *Mouse position* thresholded into categories?
 
-i. Values below 25 cm map to axis bin 0, values from 25 up to 50 cm map to bin 1, and values at or above 50 cm map to bin 2; clipping also assigns boundary overshoots to an edge bin. Combining x/y yields classes 0–8.
+i. Position is thresholded by fixed 25 cm boundaries on each axis, creating three bins per axis and therefore nine categories total. Values exactly at 75 cm, or slight tracking overshoots beyond the arena, are clipped into the outermost bin instead of being dropped.
 
 ii.
 ```python
-edges = np.linspace(0, arena_size, n_grid + 1)[1:-1]
-x_bin = np.clip(np.digitize(position[0], edges), 0, n_grid - 1)
-y_bin = np.clip(np.digitize(position[1], edges), 0, n_grid - 1)
-return (y_bin * n_grid + x_bin).astype(np.int8)
+bin_width = ARENA_SIZE_CM / GRID_SIZE
+xy = np.floor(position / bin_width).astype(np.int64)
+# Source values can be exactly 75 cm; those belong to the last, not a fourth,
+# spatial bin.  Clipping also protects against tiny tracking overshoots.
+xy = np.clip(xy, 0, GRID_SIZE - 1)
+location = xy[1] * GRID_SIZE + xy[0]
 ```
 
-iii. The requested output is a 3×3 grid in a 75 cm square, so the agent used equal 25 cm spatial bins. The trajectory specifically noted clipping exact 75 cm values and small overshoots into the last bin.
+iii. The AI justified the clipping in the code comments themselves: exact boundary values and small tracking overshoots should stay in the outer bin rather than create invalid categories.
 
 ## 4-d. How is `output` *Mouse position* aligned with the neural data?
 
-i. Position and neural arrays are assumed to be frame-aligned in the source and are independently sliced using the same 1,800-frame boundaries. Thus retained output trials align sample-for-sample with retained neural trials.
+i. The AI assumes neural and position streams are already aligned frame-by-frame within each day/session. It validates equal session counts and equal time-axis lengths, then splits neural and position with the same 40-window function so they remain synchronized.
 
 ii.
 ```python
-neural_trials = split_into_trials(trace)
-output_trials = split_into_trials(output)
+if traces.shape[0] != positions.shape[0] or traces.shape[2] != positions.shape[2]:
+    raise ValueError(f"Neural/position alignment mismatch for {animal}")
+...
+session_output_full = discretize_position(positions[day])
+...
+neural_trials = split_trials(session_neural_full, axis=1)
+output_trials = split_trials(session_output_full, axis=1)
 ```
 
-iii. The trajectory verified matching source frame dimensions and chose not to interpolate either stream. It emphasized retaining exact correspondence; the submitted code preserves alignment but jointly drops each session's remainder.
+iii. In step 9, the AI said the files already contained "frame-aligned position." Step 25 then explains that the same contiguous-window segmentation is applied to preserve that alignment.
 
 ## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Entirely NaN neuron columns are treated as absent registered cells and removed. Incomplete trailing time segments are silently discarded. Position values outside the nominal arena are clipped into edge bins. There are no explicit shape, partial-NaN, binary-value, blocked-position, or empty-session checks, and the HDF5 file is closed only after normal completion.
+i. The AI handles several small-data issues defensively rather than imputing values. All-NaN neurons are removed as absent registrations, partially finite neuron traces trigger an error, exact-boundary or slight out-of-bounds positions are clipped into valid bins, and a small number of samples falling into blocked bins is tolerated and audited. The AI does not interpolate missing neural or behavioral data, and it keeps all recording frames by splitting sessions into 40 nearly equal windows.
 
 ii.
 ```python
-active_mask = ~np.all(np.isnan(trace), axis=0)
+finite_any = np.any(np.isfinite(day_trace), axis=1)
+finite_all = np.all(np.isfinite(day_trace), axis=1)
+if not np.array_equal(finite_any, finite_all):
+    raise ValueError(f"Partially finite neuron trace in {animal}, day {day}")
+present = finite_all
 ...
-n_trials = data.shape[1] // trial_length
+xy = np.floor(position / bin_width).astype(np.int64)
+xy = np.clip(xy, 0, GRID_SIZE - 1)
 ...
-x_bin = np.clip(np.digitize(position[0], edges), 0, n_grid - 1)
+blocked_position_samples = int(
+    np.count_nonzero(geometry[session_output_full[0]] != 0)
+)
+if blocked_position_samples / session_output_full.shape[1] > 0.05:
+    raise ValueError(
+        f"More than 5% of positions enter blocked bins in {animal}, day {day}; "
+        "check the x/y convention"
+    )
 ```
 
-iii. The trajectory justified removing absent-day cells and clipping small tracking overshoots. It also decided to retain and audit rare positions in blocked bins, reject partially finite traces and structural mismatches, and retain all frames. Those safeguards and the retain-all-frames policy are absent from the submitted code.
+iii. The trajectory says the AI wanted to preserve exact neural/behavioral frame alignment and keep all frames, while still making boundary excursions and indexing mistakes auditable (steps 20, 25, 29, 32).
 
 ## 6-a. What are the most time-consuming steps of the code?
 
-i. Reading the large per-session trace arrays from HDF5 and serializing the resulting full pickle dominate conversion time and I/O. Array casting/transposition and all-NaN scans touch every neural value and are the main computational work. Decoder training is downstream and not part of this converter.
+i. The expensive steps are loading each large `joblib` animal file, materializing and storing all 207 sessions at 30 Hz, and writing the very large output pickle. The code also calls `gc.collect()` after each subject to manage memory pressure.
 
 ii.
 ```python
-trace = f[trace_refs[i][0]][:]
-active_mask = ~np.all(np.isnan(trace), axis=0)
-trace = trace[:, active_mask].astype(np.float32).T
+for animal_index, animal in enumerate(ANIMALS):
+    source_path = data_dir / animal
+    print(f"Loading {source_path} ...", flush=True)
+    wrapped = joblib.load(source_path)
+    ...
+    del wrapped, source, traces, positions, envs, blocked
+    gc.collect()
 ...
-pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+with temporary.open("wb") as handle:
+    pickle.dump(converted, handle, protocol=pickle.HIGHEST_PROTOCOL)
 ```
 
-iii. The trajectory observed that the native-frame dataset contains billions of neural values and produced an approximately 18.8 GiB pickle, making loading, memory movement, and writing the natural bottlenecks.
+iii. The trajectory explicitly flagged the scale of the full conversion: 207 sessions, 69,744 session-neurons, roughly five billion neural values, and an 18.82 GiB pickle (steps 14 and 49).
 
 ## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The subject/session loops are required for variable neuron counts and referenced datasets. The Python trial-slicing comprehensions could be replaced by reshape/split operations for fixed-length retained data, and summary concatenation could be avoided, but these loops are small (about 40 iterations per session) relative to I/O.
+i. Most numeric work is already vectorized with NumPy. The remaining Python-level loops are mainly structural loops over animals and sessions, plus the per-trial duplication of the static geometry vector. The latter could be replaced with a broadcasted/shared representation if downstream code allowed it, but the converter keeps a Python list of 40 separate trial inputs.
 
 ii.
 ```python
-return [data[:, i * trial_length:(i + 1) * trial_length] for i in range(n_trials)]
-...
-for subj_i, mat_file in enumerate(mat_files):
+for animal_index, animal in enumerate(ANIMALS):
     ...
-    for sess_i, sess in enumerate(sessions):
+    for day in range(traces.shape[0]):
+        ...
+        input_trials = [geometry.copy() for _ in range(N_TRIALS)]
 ```
 
-iii. The trajectory did not identify a loop-vectorization problem. Its performance concern focused on total native-frame volume and the downstream trainer, not the short trial-list construction loops.
+iii. The trajectory does not discuss vectorization explicitly. This is inferred from the final code structure.
 
 ## 6-c. What processing does the code repeat multiple times?
 
-i. `split_into_trials` separately computes the same trial count and boundaries for neural and output data. Per-session diagnostic printing also concatenates all output trials and scans unique labels after the full output was already discretized.
+i. The code repeats the same trial split separately for neural and output arrays, duplicates the same geometry vector for every trial in a session, and iterates again to record per-trial lengths into metadata. It also reloads per-animal arrays and reruns the same validation logic for every session.
 
 ii.
 ```python
-neural_trials = split_into_trials(trace)
-output_trials = split_into_trials(output)
+neural_trials = split_trials(session_neural_full, axis=1)
+output_trials = split_trials(session_output_full, axis=1)
+input_trials = [geometry.copy() for _ in range(N_TRIALS)]
 ...
-output_classes = np.unique(np.concatenate([t.flatten() for t in sess['output']]))
+"trial_lengths": [int(x.shape[1]) for x in neural_trials],
 ```
 
-iii. No justification was recorded for this repetition. It is straightforward and low-cost compared with reading and copying neural arrays, but shared slice boundaries could make the alignment invariant more explicit.
+iii. The trajectory does not call these repetitions out explicitly; this is visible from the final implementation.
 
 ## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The script computes `output_classes`, converts the geometry to integers for `blocked_str`, and derives display-only trial dimensions for console logging; none are saved or used downstream. It also seeds NumPy although the converter uses no randomness. `--show-processing` is parsed but intentionally has no effect.
+i. Several computations are used only for validation or metadata, not for the decoder inputs/outputs themselves: loading `envs`, counting `blocked_position_samples`, checking the global 69,744-neuron invariant, storing verbose `session_info`, and repeatedly copying the static geometry vector for each trial. These steps make the conversion more auditable but are not required by downstream decoding.
 
 ii.
 ```python
-np.random.seed(sum(ord(c) for c in _lee2025_seed) % 2**31)
+envs = np.asarray(source["envs"]).reshape(-1)
 ...
-output_classes = np.unique(np.concatenate([t.flatten() for t in sess['output']]))
-blocked_str = sess['input'][0].astype(int) if n_trials > 0 else []
+blocked_position_samples = int(
+    np.count_nonzero(geometry[session_output_full[0]] != 0)
+)
 ...
-parser.add_argument('--show-processing', action='store_true',
-                    help='Show processing details (no effect, for testing)')
+session_info.append(
+    {
+        "subject": animal,
+        "source_day_index": day,
+        "environment": str(envs[day]),
+        "n_source_frames": int(day_trace.shape[1]),
+        "n_neurons": int(present.sum()),
+        "blocked_position_samples": blocked_position_samples,
+        "trial_lengths": [int(x.shape[1]) for x in neural_trials],
+    }
+)
+...
+if total_session_neurons != 69_744:
+    raise ValueError(...)
 ```
 
-iii. The trajectory did not discuss these remnants. They appear intended for reproducibility conventions, diagnostics, and test-interface compatibility, but they do not affect the converted dataset.
+iii. The trajectory shows these as audit checks: the AI wanted to verify its neuron count against the paper and ensure the discretized positions were consistent with the geometry mapping (steps 20, 29, 32, 54).

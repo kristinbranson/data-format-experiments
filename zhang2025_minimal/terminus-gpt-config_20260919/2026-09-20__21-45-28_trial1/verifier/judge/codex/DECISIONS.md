@@ -2,388 +2,516 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent initializes local ONE, activates the Brainwidemap cache, reads `bwm_release.csv`, groups it by session `eid`, and resolves each session path. Trials and camera arrays are opened directly; wheel and spike sorting use ONE/IBL loaders. `MAX_SESSIONS` optionally limits a test run.
+i. The AI uses the local ONE cache plus the Zhang repository's curated `/app/code/code_zhang2025/data/bwm_release.csv` as the master index. It loads the `Brainwidemap` cache, groups the release CSV by `eid`, resolves each session path with `one.eid2path`, reads the newest trials parquet directly from disk, loads wheel data through `one.load_object`, loads whisker motion energy by directly `np.load`-ing the left-camera files, and loads spikes per probe with `SpikeSortingLoader`.
 
 ii. ```python
 one = ONE(mode='local', cache_dir=CACHE)
 one.load_cache(CACHE / 'Brainwidemap')
 release = pd.read_csv(RELEASE).drop(columns=['Unnamed: 0'], errors='ignore')
+
 for si, (eid, probes) in enumerate(release.groupby('eid', sort=False), 1):
     spath = one.eid2path(eid)
     tr = load_trials(spath)
 ```
 
-iii. The trajectory says the release contains the intended full data (no `DATALIMIT_SUBSET.csv` was present), local ONE resolves session paths, and the release CSV supplies the curated sessions/probes.
+```python
+wheel = one.load_object(eid, 'wheel', collection='alf')
+mef = newest(alf, 'leftCamera.ROIMotionEnergy.npy')
+tf = newest(alf, '_ibl_leftCamera.times.npy')
+me, mt = np.load(mef, mmap_mode='r'), np.load(tf, mmap_mode='r')
+```
+
+iii. In the trajectory, the AI explicitly decided to work offline from the staged ONE cache, concluded that `bwm_release.csv` was the curated paper/repository session list, and chose direct local loading because Alyx/network access was unreliable in the environment.
 
 ## 1-b. How are the data split into subjects?
 
-i. The subject attached to each release-CSV session group is saved with the session. Unique subjects are later collected in first-seen order and each retained session gets an integer `subject_idx`.
+i. Subject identity is taken from the `subject` column of the grouped `bwm_release.csv` rows. Each processed session stores a single subject string, then the final output builds `subjects` from first appearance order and constructs `subject_idx` from that list.
 
 ii. ```python
-sessions.append(dict(eid=str(eid), subject=str(probes.subject.iloc[0]), ...))
+sessions.append(dict(eid=str(eid), subject=str(probes.subject.iloc[0]),
+    trials=ti, neural=neural, regions=np.asarray(region_names),
+    ...))
+```
+
+```python
 subjects = list(dict.fromkeys(s['subject'] for s in sessions))
 subj_map = {x:i for i,x in enumerate(subjects)}
+...
 subject_idx=np.array([subj_map[s['subject']] for s in kept],np.int32)
 ```
 
-iii. The trajectory treated the release metadata as the authoritative subject identifier, avoiding filename/path parsing.
+iii. The trajectory rationale was that the release CSV already provided per-session subject IDs, so there was no need to derive subjects from paths or separate metadata.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each distinct `eid` in the release CSV is one session; all listed probes for that `eid` are processed and merged into one session population.
+i. The AI treats each unique `eid` as one session and groups the probe-level release table by `eid`. All probe insertions belonging to that `eid` are merged into one session-level example.
 
 ii. ```python
 for si, (eid, probes) in enumerate(release.groupby('eid', sort=False), 1):
     ...
     for r in probes.itertuples(index=False):
+        ssl = SpikeSortingLoader(eid=eid, pname=r.probe_name, one=one)
 ```
 
-iii. The trajectory identified `eid` as ONE's unique session identifier and the release CSV as the curated session/probe index.
+iii. In the trajectory, the AI inferred that `bwm_release.csv` has one row per probe insertion and that sessions therefore had to be reconstructed by grouping rows with the same `eid`.
 
 ## 1-d. How are the data split into trials?
 
-i. The trials parquet table supplies one row per trial. Indices passing the validity mask are used to slice trial variables, and continuous streams are windowed separately around each retained trial's stimulus onset.
+i. Trials are taken directly from rows of the session's trials table parquet. The script creates a Boolean validity mask over rows, then uses the surviving row indices `ti` as the trial split for neural and behavioral extraction.
 
 ii. ```python
+tr = load_trials(spath)
+valid = np.ones(len(tr), bool)
+...
 ti = np.flatnonzero(valid)
+...
 onsets = tr.stimOn_times.to_numpy(float)[ti]
-for j, onset in enumerate(onsets):
-    lo, hi = np.searchsorted(st, [onset + OFF0, onset + OFF1])
 ```
 
-iii. The agent reasoned that the ALF trials table already defines trial boundaries/events, so no inferred trial segmentation is required.
+iii. The trajectory states that the full trial table was available and already contained the per-trial variables needed, so trial boundaries came directly from that table.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. A trial must have finite choice, prior, feedback type/time, stimulus onset, and first movement; reaction time must be 0.08–2.00 s; choice must be ±1; rounded prior must be 0.2/0.5/0.8. After behavior binning/gap filling, wheel and whisker must be finite in every bin. Sessions need at least two retained trials.
+i. The AI keeps only trials with finite `choice`, `probabilityLeft`, `feedbackType`, `feedback_times`, `stimOn_times`, and `firstMovement_times`; first-movement latency between 0.08 and 2.00 s after stimulus onset; binary choices in `{-1, 1}`; and rounded `probabilityLeft` in `{0.2, 0.5, 0.8}`. After behavior is extracted, it further drops trials whose wheel or whisker traces still contain NaNs after gap filling, and it drops sessions left with fewer than two valid trials.
 
 ii. ```python
 needed = ['choice','probabilityLeft','feedbackType','feedback_times',
           'stimOn_times','firstMovement_times']
-for c in needed: valid &= np.isfinite(tr[c].to_numpy(float))
+...
+for c in needed:
+    valid &= np.isfinite(tr[c].to_numpy(float))
+rt = tr.firstMovement_times.to_numpy(float) - tr.stimOn_times.to_numpy(float)
 valid &= (rt >= .08) & (rt <= 2.00)
 valid &= np.isin(tr.choice.to_numpy(float), [-1, 1])
 valid &= np.isin(np.round(tr.probabilityLeft.to_numpy(float), 1), [.2, .5, .8])
-good_trials = np.isfinite(wheel_b).all(1) & np.isfinite(whisk_b).all(1)
 ```
 
-iii. The trajectory cites the paper's 80-ms to 2-s reaction-time curation and no-choice exclusion. Complete behavior was required for fixed-size decoder outputs; finite feedback fields were added as required events.
+```python
+good_trials = np.isfinite(wheel_b).all(1) & np.isfinite(whisk_b).all(1)
+if good_trials.sum() < 2:
+    raise ValueError('fewer than two trials with complete behavior')
+```
+
+iii. The trajectory says the AI adopted the paper's 80 ms to 2 s first-movement filter and valid choice/prior constraints, and then added complete-behavior requirements so every retained trial would have decoder outputs in all bins.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural arrays come from spike times and spike cluster assignments. Cluster IDs, quality labels, and atlas IDs determine which spike clusters become output neurons and their brain-region labels.
+i. The neural tensor is built from spike timestamps and spike cluster assignments for each probe. Cluster metadata fields `label`, `cluster_id`, and `atlas_id` are used to decide which units survive and which brain region label each neuron gets.
 
 ii. ```python
 spikes, clusters, channels = ssl.load_spike_sorting()
 clusters = ssl.merge_clusters(spikes, clusters, channels)
+labels = np.asarray(clusters['label'])
 ids = np.asarray(clusters['cluster_id'], int)
-... probe_data.append((np.asarray(spikes.times), np.asarray(spikes.clusters), gids, acr))
+atlas_ids = np.asarray(clusters['atlas_id'])
 ```
 
-iii. The trajectory recognized `spikes.times` and `spikes.clusters` as the direct neural observations, with cluster metadata used only for curation/anatomy.
+```python
+probe_data.append((np.asarray(spikes.times), np.asarray(spikes.clusters), gids, acr))
+```
+
+iii. In the trajectory, the AI identified `spikes.times` and `spikes.clusters` as the core neural signals and used cluster metadata only for QC and anatomical labeling.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Good neurons from every probe in a session are concatenated. Their spikes are histogrammed into neuron-by-100 arrays of raw spike counts; no smoothing or division by bin width is applied. Counts are stored as `uint16`.
-
-ii. ```python
-neural = np.zeros((len(ti), n_neurons, len(CENTERS)), dtype=np.uint16)
-bb = np.floor((st[lo:hi][ok] - onset - OFF0) / DT).astype(np.int32)
-np.add.at(neural[j], (cc[ok][inside], bb[inside]), 1)
-```
-
-iii. The agent read the methods as specifying 20-ms spike counts and deliberately used integer storage to keep the 185,891-trial pickle manageable; the trajectory notes the validator converts it for training.
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. It keeps `clusters.label == 1`, valid positive atlas IDs, and Beryl gray-matter acronyms excluding `root`, `void`, and `fiber tracts`. A region needs at least five good neurons in a session; after all sessions are processed it must occur in at least two sessions.
-
-ii. ```python
-good = (labels == 1) & np.isfinite(atlas_ids) & (atlas_ids > 0)
-keep = ~np.isin(acr, ['root','void','fiber tracts'])
-allowed = set(vals[cnt >= 5])
-allowed_global = {r for r,n in prevalence.items() if n >= 2}
-```
-
-iii. The trajectory calls label 1 the RIGOR well-isolated-unit criterion and attributes the ≥5-neuron/session and ≥2-session prevalence rules to the paper's regional analyses.
-
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
-
-i. Spikes are selected on the shared session clock from 0.5 s before through 1.5 s after each `stimOn_times` value, then stimulus onset is subtracted when assigning relative bins.
-
-ii. ```python
-onsets = tr.stimOn_times.to_numpy(float)[ti]
-lo, hi = np.searchsorted(st, [onset + OFF0, onset + OFF1])
-bb = np.floor((st[lo:hi][ok] - onset - OFF0) / DT).astype(np.int32)
-```
-
-iii. The trajectory says IBL synchronizes neural and behavioral streams upstream, so alignment only requires using the same session-clock stimulus onset.
-
-## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
-
-i. Resolution is 20 ms. Each two-second window has 100 bins. Spikes are binned once at that resolution, with no later neural resampling.
+i. For each retained session, the AI bins spikes into 100 bins of 20 ms over a -0.5 s to 1.5 s window around stimulus onset. It merges all probes from the session into one neuron population, remaps cluster IDs to contiguous output rows, and accumulates spike counts with `np.add.at`. It stores raw spike counts as `uint16`; it does not divide by bin width to convert to firing rates.
 
 ii. ```python
 DT = 0.020
 OFF0, OFF1 = -0.5, 1.5
 EDGES = np.arange(OFF0, OFF1 + DT/2, DT)
-```
-
-iii. The trajectory explicitly found the paper configuration of two-second trials, 20-ms bins, and 100 time points.
-
-## 3-a. What variables in the raw data is `input` *Time since stimulus onset* derived from?
-
-i. It is defined from each trial's `stimOn_times` alignment and the fixed bin edges; the saved values are the relative bin centers and are identical across trials.
-
-ii. ```python
 CENTERS = (EDGES[:-1] + EDGES[1:]) / 2
-np.vstack((CENTERS.astype(np.float32), ...))
 ```
 
-iii. The agent used the reference window and stimulus-onset event discovered in the paper code.
+```python
+neural = np.zeros((len(ti), n_neurons, len(CENTERS)), dtype=np.uint16)
+...
+bb = np.floor((st[lo:hi][ok] - onset - OFF0) / DT).astype(np.int32)
+inside = (bb >= 0) & (bb < len(CENTERS))
+np.add.at(neural[j], (cc[ok][inside], bb[inside]), 1)
+```
 
-## 3-b. What processing is involved in computing `input` *Time since stimulus onset*?
+iii. The trajectory says the AI followed the repository's stimulus-aligned 2 s window and 20 ms bins, then intentionally kept spike counts in `uint16` to keep the 459-session export tractable in memory and on disk.
 
-i. Adjacent -0.5-to-1.5-s bin edges are averaged to produce centers from -0.49 through 1.49 s; no raw signal is transformed.
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. The AI keeps only units with `clusters['label'] == 1`, finite positive `atlas_id`, and Beryl acronyms not in `{'root', 'void', 'fiber tracts'}`. It then applies an additional per-session region filter requiring at least 5 surviving neurons in a Beryl region, and a later cross-session region filter requiring a region to appear in at least 2 sessions.
 
 ii. ```python
+good = (labels == 1) & np.isfinite(atlas_ids) & (atlas_ids > 0)
+...
+mapped = atlas.remap(atlas_ids[good].astype(int), source_map='Allen', target_map='Beryl')
+acr = np.asarray(atlas.get(mapped)['acronym']).astype(str)
+keep = ~np.isin(acr, ['root','void','fiber tracts'])
+```
+
+```python
+vals, cnt = np.unique(all_regions, return_counts=True)
+allowed = set(vals[cnt >= 5])
+...
+allowed_global = {r for r,n in prevalence.items() if n >= 2}
+```
+
+iii. In the trajectory, the AI justified this by citing the methods text and paper curation rules: use well-isolated units, keep only grey-matter Beryl regions, require at least 5 good neurons in a session-region, and retain only regions observed in at least 2 sessions.
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Every trial is aligned to `stimOn_times`. For each onset, the script slices spikes in `[onset-0.5, onset+1.5)` and converts spike times to onset-relative bin indices, so time zero is visual stimulus onset.
+
+ii. ```python
+onsets = tr.stimOn_times.to_numpy(float)[ti]
+...
+lo, hi = np.searchsorted(st, [onset + OFF0, onset + OFF1])
+bb = np.floor((st[lo:hi][ok] - onset - OFF0) / DT).astype(np.int32)
+```
+
+iii. The trajectory explicitly notes that the original continuous wheel decoder used a different alignment, but this task overrode that and required stimulus-onset alignment for all streams.
+
+## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+
+i. The converted neural data uses 20 ms bins over a 2 s window, giving 100 time bins per trial. There is no later rebinning or resampling of the neural signal.
+
+ii. ```python
+DT = 0.020
+OFF0, OFF1 = -0.5, 1.5
 EDGES = np.arange(OFF0, OFF1 + DT/2, DT)
 CENTERS = (EDGES[:-1] + EDGES[1:]) / 2
 ```
 
-iii. The trajectory treats this as a decoder coordinate defined by the analysis grid rather than a measured stream.
+iii. The trajectory repeatedly cites the Zhang code and methods text for the exact `[-0.5, 1.5]` window and 20 ms bin size.
 
-## 3-c. How is the `input` *Time since stimulus onset* aligned with the neural data?
+## 3-a. What variables in the raw data is `input` *Time since stimulus onset* derived from?
 
-i. Each time value is the center of the exact edge interval used to histogram the corresponding neural column.
+i. The input is defined from the stimulus-onset alignment event in the trials table and the fixed bin grid. The per-trial raw event is `stimOn_times`; the output values themselves are the shared bin centers `CENTERS`.
+
+ii. ```python
+onsets = tr.stimOn_times.to_numpy(float)[ti]
+DT = 0.020
+OFF0, OFF1 = -0.5, 1.5
+CENTERS = (EDGES[:-1] + EDGES[1:]) / 2
+```
+
+iii. The trajectory rationale was that the decoder input should mirror the neural bin grid around stimulus onset rather than recover another raw variable.
+
+## 3-b. What processing is involved in computing `input` *Time since stimulus onset*?
+
+i. No additional raw-data processing is done. The AI defines this input as the 100 bin centers spanning -0.49 s to 1.49 s relative to stimulus onset and reuses the same vector for every trial.
+
+ii. ```python
+input_out.append([np.vstack((CENTERS.astype(np.float32),
+                    np.full(len(CENTERS),s['block_trial'][j],np.float32)))
+                  for j in range(len(s['trials']))])
+```
+
+iii. In the trajectory, the AI treated this as a task-defined decoder covariate rather than a measured signal needing preprocessing.
+
+## 3-c. How is `input` *Time since stimulus onset* aligned with the neural data?
+
+i. The time-since-stimulus input uses exactly the same `CENTERS` array that the neural bins imply, so it is aligned bin-for-bin with the onset-relative neural counts.
 
 ii. ```python
 bb = np.floor((st[lo:hi][ok] - onset - OFF0) / DT).astype(np.int32)
-input_out.append([np.vstack((CENTERS.astype(np.float32), ...)) ...])
+...
+input_out.append([np.vstack((CENTERS.astype(np.float32),
+                    np.full(len(CENTERS),s['block_trial'][j],np.float32)))
+                  for j in range(len(s['trials']))])
 ```
 
-iii. The same stimulus onset, offsets, and 20-ms grid are used for both arrays.
+iii. The AI's trajectory explicitly describes this as a single common stimulus-aligned grid reused for neural data and decoder inputs/outputs.
 
 ## 4-a. What variables in the raw data is `input` *Trial number in block* derived from?
 
-i. It is derived from the trial table's `probabilityLeft`; a changed or previously nonfinite probability begins a new block.
+i. It is derived from the per-trial `probabilityLeft` sequence. The AI infers block boundaries by detecting when the rounded `probabilityLeft` value changes across consecutive trials.
 
 ii. ```python
 probs = np.round(tr.probabilityLeft.to_numpy(float), 1)
-if j == 0 or probs[j] != probs[j-1] or not np.isfinite(probs[j-1]): k = 0
-```
-
-iii. The trajectory inferred blocks from the prior because the trials table has no separate block identifier.
-
-## 4-b. What processing is involved in computing `input` *Trial number in block*?
-
-i. All original trials are traversed before filtering. The counter is zero-based, resets when prior changes, increments otherwise, and the retained values are broadcast over all 100 time bins.
-
-ii. ```python
 for j in range(len(tr)):
     if j == 0 or probs[j] != probs[j-1] or not np.isfinite(probs[j-1]): k = 0
     else: k += 1
     block_trial[j] = k
-np.full(len(CENTERS),s['block_trial'][j],np.float32)
 ```
 
-iii. Counting before filtering preserves the animal's true position even when intervening trials are later excluded.
+iii. The trajectory rationale was that no explicit block ID was available, so block membership had to be reconstructed from the prior-probability schedule.
+
+## 4-b. What processing is involved in computing `input` *Trial number in block*?
+
+i. The AI walks through the full session trial table once, resets a counter at the first trial or whenever `probabilityLeft` changes, increments otherwise, and stores a zero-based within-block count. Only after computing the full-session count does it index by retained trials `ti`.
+
+ii. ```python
+block_trial = np.zeros(len(tr), np.float32); k = 0
+probs = np.round(tr.probabilityLeft.to_numpy(float), 1)
+for j in range(len(tr)):
+    if j == 0 or probs[j] != probs[j-1] or not np.isfinite(probs[j-1]): k = 0
+    else: k += 1
+    block_trial[j] = k
+...
+block_trial=block_trial[ti]
+```
+
+iii. The trajectory says this was meant to reflect the animal's original block progression, not the renumbered order after QC filtering.
 
 ## 5-a. What variables in the raw data is `output` *Choice* derived from?
 
-i. It comes from `tr.choice`, whose valid values are +1 for left and -1 for right.
+i. Choice is derived from `tr.choice` in the trials table.
 
 ii. ```python
-choice = (tr.choice.to_numpy(float)[ti] == -1).astype(np.int8)
+choice = (tr.choice.to_numpy(float)[ti] == -1).astype(np.int8)  # IBL: +1 left, -1 right
 ```
 
-iii. The trajectory caught and corrected an initial reversal after confirming IBL's sign convention.
+iii. The trajectory shows the AI eventually corrected its first implementation after realizing IBL uses `+1` for left and `-1` for right.
 
 ## 5-b. What processing is involved in computing `output` *Choice*?
 
-i. Valid +1 values map to 0 (left), and -1 values map to 1 (right); the scalar category is repeated over the trial's 100 bins.
+i. The processing is a binary recode: retained trials with IBL `choice == -1` become decoder label `1` (right), while retained trials with `choice == +1` become `0` (left). This scalar is then repeated across all 100 bins of the trial.
 
 ii. ```python
-choice = (... == -1).astype(np.int8)
-np.full(len(CENTERS),s['choice'][j],np.int8)
+choice = (tr.choice.to_numpy(float)[ti] == -1).astype(np.int8)
+...
+output_out.append([np.vstack((np.full(len(CENTERS),s['choice'][j],np.int8),
+                     np.full(len(CENTERS),s['prior'][j],np.int8),
+                     s['wheel'][j],s['whisker'][j]))
+                   for j in range(len(s['trials']))])
 ```
 
-iii. This directly implements the requested left=0/right=1 coding.
+iii. The trajectory explains that this recoding was required to satisfy the task's explicit label convention `left = 0, right = 1`.
 
 ## 6-a. What variables in the raw data is `output` *Prior probability of left* derived from?
 
-i. It comes from the trials table's `probabilityLeft` column.
+i. It is derived from `tr.probabilityLeft` in the trials table.
 
 ii. ```python
 pleft = np.round(tr.probabilityLeft.to_numpy(float)[ti], 1)
+prior = np.array([{.2:0,.5:1,.8:2}[float(x)] for x in pleft], np.int8)
 ```
 
-iii. The agent identified this column as the experiment's block prior.
+iii. The trajectory treated this as a direct categorical remapping of the task's block-prior variable.
 
 ## 6-b. What processing is involved in computing `output` *Prior probability of left*?
 
-i. Values are rounded to one decimal and mapped 0.2→0, 0.5→1, 0.8→2, then repeated over time.
+i. The AI rounds the raw values to one decimal place and maps `0.2 -> 0`, `0.5 -> 1`, and `0.8 -> 2`. Like choice, the resulting categorical value is then broadcast across all 100 bins of each retained trial.
 
 ii. ```python
+pleft = np.round(tr.probabilityLeft.to_numpy(float)[ti], 1)
 prior = np.array([{.2:0,.5:1,.8:2}[float(x)] for x in pleft], np.int8)
+```
+
+```python
 np.full(len(CENTERS),s['prior'][j],np.int8)
 ```
 
-iii. The mapping is explicitly required by the task.
+iii. The trajectory justification was that the decoder task explicitly requested this 3-class encoding.
 
 ## 7-a. What variables in the raw data is `output` *Wheel speed* derived from?
 
-i. It is derived from the wheel object's timestamps and angular position.
+i. Wheel speed is derived from the wheel object's `timestamps` and `position` arrays.
 
 ii. ```python
 wheel = one.load_object(eid, 'wheel', collection='alf')
 wpos, wt = interpolate_position(np.asarray(wheel.timestamps), np.asarray(wheel.position), freq=1000)
+ws, _ = velocity_filtered(wpos, 1000)
 ```
 
-iii. The trajectory found that standard IBL wheel velocity is computed from timestamped position.
+iii. The trajectory explicitly says it wanted the standard IBL wheel-processing path: interpolate position, then compute filtered velocity.
 
 ## 7-b. What processing is involved in computing `output` *Wheel speed*?
 
-i. Position is interpolated to 1 kHz, passed through `velocity_filtered` (including its default low-pass processing), converted to absolute velocity, averaged within each 20-ms trial bin, and empty bins are interpolated from other bins in that trial.
+i. The AI interpolates wheel position to 1 kHz, computes low-pass filtered velocity with `velocity_filtered`, takes the absolute value, averages that speed within each stimulus-aligned 20 ms bin using `binned_mean`, fills short NaN gaps within a trial by interpolation, and later discretizes the result session-wise into tertiles.
 
 ii. ```python
+wpos, wt = interpolate_position(np.asarray(wheel.timestamps), np.asarray(wheel.position), freq=1000)
 ws, _ = velocity_filtered(wpos, 1000)
 wheel_b = fill_short_gaps(binned_mean(wt, np.abs(ws), onsets))
 ```
 
-iii. The trajectory says interpolation/filtering follow the standard brainbox/SessionLoader wheel procedure; bin means were chosen to aggregate all samples in each neural bin.
+iii. In the trajectory, the AI justified this as the closest available standard IBL processing after discovering that the installed brainbox version lacked the exact helper it first expected.
 
 ## 7-c. How is `output` *Wheel speed* thresholded into categories?
 
-i. All finite wheel-bin values in a session are split at session-wide 1/3 and 2/3 quantiles with `np.digitize`, producing 0/1/2. A tiny deterministic perturbation is used only if both thresholds coincide.
+i. The wheel-speed bins are session-wise tertiles. The AI computes the 1/3 and 2/3 quantiles over all finite wheel-speed bins in that session and applies `np.digitize`. If both quantiles coincide, it adds a tiny deterministic ramp before recomputing thresholds.
 
 ii. ```python
-q = np.quantile(finite, [1/3, 2/3])
-if q[0] == q[1]:
-    q = np.quantile(finite + np.linspace(0, 1e-7, finite.size), [1/3, 2/3])
-return np.digitize(x, q, right=False).astype(np.int8), q.tolist()
+def tertiles(x):
+    finite = x[np.isfinite(x)]
+    q = np.quantile(finite, [1/3, 2/3])
+    if q[0] == q[1]:
+        q = np.quantile(finite + np.linspace(0, 1e-7, finite.size), [1/3, 2/3])
+    return np.digitize(x, q, right=False).astype(np.int8), q.tolist()
+
+wheel_c, wheel_q = tertiles(wheel_b)
 ```
 
-iii. Tertiles were required to make the continuous behavior a three-class output while keeping classes approximately balanced per session.
+iii. The trajectory says this was the AI's chosen task-specific discretization because the original paper decoded continuous wheel variables, while the current task required three categorical bins.
 
 ## 7-d. How is `output` *Wheel speed* aligned with the neural data?
 
-i. Wheel samples on the shared clock are averaged between the same stimulus-relative edges used for neural bins, yielding one category per neural column.
+i. Wheel speed is expressed on the same 100 onset-relative bins as the neural data. For each trial onset, the AI computes 20 ms bin averages over the `[onset-0.5, onset+1.5)` window.
 
 ii. ```python
 ix = np.searchsorted(times, onset + EDGES)
-sm = cs[ix[1:]] - cs[ix[:-1]]
-np.divide(sm, n, out=out[i], where=n > 0)
+...
+wheel_b = fill_short_gaps(binned_mean(wt, np.abs(ws), onsets))
 ```
 
-iii. The shared session clock and identical bin edges provide binwise temporal alignment.
+iii. The trajectory repeatedly states that all decoder streams should share the single stimulus-aligned 20 ms grid.
 
 ## 8-a. What variables in the raw data is `output` *Whisker motion energy* derived from?
 
-i. It uses the left camera's released ROI motion-energy array and left-camera frame timestamps, truncated to their common length.
+i. The AI derives whisker motion energy from `leftCamera.ROIMotionEnergy.npy` and `_ibl_leftCamera.times.npy` only. It does not fall back to right-camera motion energy when left-camera data are missing.
 
 ii. ```python
 mef = newest(alf, 'leftCamera.ROIMotionEnergy.npy')
 tf = newest(alf, '_ibl_leftCamera.times.npy')
 me, mt = np.load(mef, mmap_mode='r'), np.load(tf, mmap_mode='r')
-n = min(len(me), len(mt))
 ```
 
-iii. The trajectory chose the high-frame-rate left side view as the whisker-pad signal; sessions lacking it were skipped.
+iii. The trajectory says the AI chose the left camera because it is the high-frame-rate side view used for whisker-pad motion, and later accepted session drops when those files were missing.
 
 ## 8-b. What processing is involved in computing `output` *Whisker motion energy*?
 
-i. The released values receive no filtering or normalization. They are averaged per 20-ms trial bin, missing bins are interpolated within each row, and the result is discretized by session tertiles.
+i. The AI loads the released motion-energy trace and timestamps, truncates them to the shared minimum length, computes mean motion energy within each stimulus-aligned 20 ms bin, fills short NaN gaps within trials by interpolation, and later discretizes the resulting trace session-wise into tertiles.
 
 ii. ```python
+me, mt = np.load(mef, mmap_mode='r'), np.load(tf, mmap_mode='r')
+n = min(len(me), len(mt))
 whisk_b = fill_short_gaps(binned_mean(mt[:n], me[:n], onsets))
+...
 whisk_c, whisk_q = tertiles(whisk_b)
 ```
 
-iii. The trajectory regarded the released ROI motion energy as already processed and applied only time aggregation and task-required categorization.
+iii. The trajectory did not give a separate whisker-specific rationale beyond reusing the same time-grid and tertile strategy as wheel speed.
 
 ## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
 
-i. It uses the same session-wide 1/3 and 2/3 quantile routine as wheel speed, yielding categories 0, 1, and 2.
+i. It is thresholded exactly like wheel speed: session-wise tertiles computed over all finite whisker-motion-energy bins, with the same tie-breaking fallback if both thresholds are equal.
 
 ii. ```python
 whisk_c, whisk_q = tertiles(whisk_b)
-q = np.quantile(finite, [1/3, 2/3])
 ```
 
-iii. The agent sought approximately equal-frequency low/medium/high classes within each session.
+iii. The trajectory presents this as a consistent task-driven discretization for the two continuous time-varying behavioral outputs.
 
 ## 8-d. How is `output` *Whisker motion energy* aligned with the neural data?
 
-i. Camera samples are grouped by the same absolute `stimOn_times + EDGES` intervals used for neural bins.
+i. Whisker motion energy is aligned to stimulus onset and summarized on the same 100 onset-relative 20 ms bins as the neural data.
 
 ii. ```python
-whisk_b = fill_short_gaps(binned_mean(mt[:n], me[:n], onsets))
 ix = np.searchsorted(times, onset + EDGES)
+...
+whisk_b = fill_short_gaps(binned_mean(mt[:n], me[:n], onsets))
 ```
 
-iii. Camera times and spike times share the synchronized session clock, so common trial edges align them.
+iii. The trajectory justification matches the wheel signal: use one common stimulus-aligned binning grid for all streams.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Required nonfinite trial fields are excluded. Behavior arrays are length-matched; empty behavior bins are interpolated when a row has at least two finite bins, otherwise incomplete trials are dropped. Missing/invalid probes are effectively skipped, and any session exception is recorded and skipped. Sessions with fewer than two trials or no qualifying neural region are excluded.
+i. Missing or malformed inputs are mostly handled by dropping data. Missing required trial columns or too few surviving trials raise exceptions that skip the session. Missing left-camera files also skip the session. Missing/invalid behavior samples within a trial are averaged into bins, then short NaN gaps are interpolated; trials still containing NaNs afterward are dropped. Missing or unusable probes are handled by continuing past them, but a session with no surviving neurons or no qualifying region is skipped.
 
 ii. ```python
-n = min(len(me), len(mt))
-row[~ok] = np.interp(q[~ok], q[ok], row[ok])
+def newest(path, pattern):
+    fs = list(path.rglob(pattern))
+    if not fs:
+        raise FileNotFoundError(f'{pattern} below {path}')
+```
+
+```python
+if not probe_data:
+    raise ValueError('no well-isolated grey-matter neurons')
+...
+if n_neurons == 0:
+    raise ValueError('no region has >=5 well-isolated neurons')
+...
 except Exception as exc:
     failures.append((str(eid), f'{type(exc).__name__}: {exc}'))
 ```
 
-iii. The trajectory prioritized a fixed complete decoder tensor, preserving small internal gaps by interpolation while logging sessions that cannot be made usable.
+```python
+def fill_short_gaps(x):
+    ...
+    if ok.sum() >= 2:
+        row[~ok] = np.interp(q[~ok], q[ok], row[ok])
+```
+
+iii. The trajectory explicitly describes this as pragmatic failure handling for a large staged dataset: keep going across sessions, record failures, and only retain trials/sessions with complete decoder-ready data.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. Loading/merging large spike-sorting arrays and iterating through every session/trial to bin spikes dominate runtime; full conversion took a long monitored run over 459 sessions. Serialization/verification of the 5.2-GB pickle is also substantial.
-
-ii. ```python
-spikes, clusters, channels = ssl.load_spike_sorting()
-for j, onset in enumerate(onsets):
-    ...
-    np.add.at(neural[j], (cc[ok][inside], bb[inside]), 1)
-```
-
-iii. The trajectory repeatedly identified spike-file I/O and large spike vectors as the expensive work and monitored the full run session by session.
-
-## 10-b. What loops in the code could have been vectorized to improve efficiency?
-
-i. The per-trial loops in `binned_mean`, `fill_short_gaps`, spike binning, block counting, and final per-trial assembly could potentially be vectorized or batched. The spike loop already limits work with `searchsorted`, avoiding a full-vector scan per trial.
-
-ii. ```python
-for i, onset in enumerate(onsets):
-for row in x:
-for j, onset in enumerate(onsets):
-for j in range(len(tr)):
-```
-
-iii. The trajectory explicitly chose indexed trial slices for clarity and efficiency on irregular windows, while using lookup maps and `searchsorted` to remove the worst repeated scans.
-
-## 10-c. What processing does the code repeat multiple times?
-
-i. It repeatedly searches/slices by trial for spikes and both behavior streams, applies gap filling and tertile logic separately to wheel and whisker, and later loops over every trial again to build list-based output arrays.
-
-ii. ```python
-wheel_b = fill_short_gaps(binned_mean(...))
-whisk_b = fill_short_gaps(binned_mean(...))
-neural_out.append([s['neural'][j,nk] for j in range(len(s['trials']))])
-```
-
-iii. The trajectory did not offer a separate justification beyond keeping stream-specific transformations explicit and satisfying the nested target format.
-
-## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
-
-i. It loads/merges cluster channels and computes metadata fields that are not directly decoded; it bins neurons from regions that may later fail the across-session prevalence filter; and it carries feedback fields only for filtering although feedback is not an input/output. Test-only `MAX_SESSIONS` handling is irrelevant to the full run.
+i. The dominant work is loading spike-sorting outputs for each probe and binning large spike trains into per-trial neural tensors. The trajectory first identified full-vector per-neuron scans as too slow, then replaced them with a more efficient per-trial accumulation scheme.
 
 ii. ```python
 spikes, clusters, channels = ssl.load_spike_sorting()
 clusters = ssl.merge_clusters(spikes, clusters, channels)
-needed = [..., 'feedbackType','feedback_times', ...]
-nk = np.isin(s['regions'], list(allowed_global))
 ```
 
-iii. The trajectory viewed merged cluster metadata as necessary for QC/anatomy and deferred global prevalence filtering because prevalence cannot be known until all sessions have been surveyed.
+```python
+for j, onset in enumerate(onsets):
+    lo, hi = np.searchsorted(st, [onset + OFF0, onset + OFF1])
+    ...
+    np.add.at(neural[j], (cc[ok][inside], bb[inside]), 1)
+```
+
+iii. In the trajectory, the AI repeatedly called spike loading the expensive part and explicitly optimized away the original per-neuron repeated scans.
+
+## 10-b. What loops in the code could have been vectorized to improve efficiency?
+
+i. The remaining obvious loops are per-trial loops in `binned_mean`, the per-trial spike-binning loop over `onsets`, and the per-trial block-counter loop over `len(tr)`. These loops are straightforward but not fully vectorized.
+
+ii. ```python
+for i, onset in enumerate(onsets):
+    ix = np.searchsorted(times, onset + EDGES)
+    ...
+```
+
+```python
+for j, onset in enumerate(onsets):
+    lo, hi = np.searchsorted(st, [onset + OFF0, onset + OFF1])
+    ...
+```
+
+```python
+for j in range(len(tr)):
+    if j == 0 or probs[j] != probs[j-1] or not np.isfinite(probs[j-1]): k = 0
+```
+
+iii. The trajectory acknowledges exactly this tradeoff: some loops could be vectorized further, but it prioritized clarity first and only optimized the clearly expensive spike path after a smoke test.
+
+## 10-c. What processing does the code repeat multiple times?
+
+i. The code repeats several small pieces of work: `binned_mean` sorts and cumulative-sums each behavioral stream separately every session; the allowed-region membership check is recomputed probe by probe; and onset-relative search/binner logic is rerun independently for wheel, whisker, and spikes. It also repeatedly constructs broadcast vectors for trial-level variables when assembling inputs and outputs.
+
+ii. ```python
+order = np.argsort(times); times, values = times[order], values[order]
+cs = np.r_[0., np.cumsum(values)]
+...
+wheel_b = fill_short_gaps(binned_mean(wt, np.abs(ws), onsets))
+...
+whisk_b = fill_short_gaps(binned_mean(mt[:n], me[:n], onsets))
+```
+
+```python
+use = np.isin(acr, list(allowed)); gids, acr = gids[use], acr[use]
+...
+np.full(len(CENTERS),s['choice'][j],np.int8)
+np.full(len(CENTERS),s['prior'][j],np.int8)
+```
+
+iii. The trajectory only called out the repeated spike scanning explicitly; the remaining repetition is visible in the final code rather than separately justified.
+
+## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
+
+i. The script computes and stores several byproducts that the downstream decoder does not use: wheel and whisker tertile thresholds in metadata, source trial indices, skipped-session logs, and rich `session_info`. It also filters on `feedbackType` and `feedback_times` even though neither variable is used in the exported inputs or outputs.
+
+ii. ```python
+needed = ['choice','probabilityLeft','feedbackType','feedback_times',
+          'stimOn_times','firstMovement_times']
+```
+
+```python
+wheel_c, wheel_q = tertiles(wheel_b)
+whisk_c, whisk_q = tertiles(whisk_b)
+...
+session_info=[dict(eid=s['eid'],source_trial_indices=s['trials'].tolist(),
+                   wheel_tertiles=s['wheel_q'],whisker_tertiles=s['whisk_q']) for s in kept],
+skipped_sessions=failures
+```
+
+iii. The trajectory frames most of this as documentation and robustness rather than decoder necessity; it wanted to preserve thresholds and failure reasons for inspection while keeping the main exported tensors categorical.

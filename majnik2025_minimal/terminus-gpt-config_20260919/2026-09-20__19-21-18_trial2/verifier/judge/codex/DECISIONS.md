@@ -2,84 +2,91 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent discovers every sorted `jm*` subject directory and every sorted subdirectory beneath each subject. For each daily session it loads `F.npy`, `Fneu.npy`, `ops.npy`, `motion_energy_glob.npy`, and `tstamps.npy`, processes the session, and appends it to the output.
+i. The AI loads all subjects by scanning `/app/data` for directories whose names start with `jm`, then loads every subdirectory under each subject as a session. Within each session it loads calcium traces from `suite2p/plane0/F.npy` and `Fneu.npy`, Suite2p parameters from `ops.npy`, and behavior from `move_deve/motion_energy_glob.npy` plus `tstamps.npy`. Trials are not loaded directly; the session-level arrays are loaded first and trialized later.
 
-ii.
+ii. 
 ```python
 subjects = sorted(p.name for p in DATA_ROOT.iterdir() if p.is_dir() and p.name.startswith('jm'))
-for si, subject in enumerate(subjects):
-    sessions = sorted(p for p in (DATA_ROOT / subject).iterdir() if p.is_dir())
-    for session in sessions:
-        activity = suite2p_baseline_corrected(session)
-        motion = aligned_motion(session, activity.shape[1])
+...
+sessions = sorted(p for p in (DATA_ROOT / subject).iterdir() if p.is_dir())
+...
+F = np.load(p / 'F.npy').astype(np.float32, copy=False)
+Fneu = np.load(p / 'Fneu.npy').astype(np.float32, copy=False)
+ops = np.load(p / 'ops.npy', allow_pickle=True).item()
+...
+motion = np.load(p / 'motion_energy_glob.npy').astype(np.float64)
+stamps = np.load(p / 'tstamps.npy').astype(np.float64)
 ```
 
-iii. The trajectory says the README and inventory established that subject folders contain daily sessions with Suite2p tracked-cell data and behavior arrays. It explicitly chose to preserve all six mice and all 41 supplied sessions.
+iii. In trajectory steps 4-5 and 7-11, the agent said it inspected the README, notebook, methods, and file inventory to determine whether to use `F`, `Fneu`, `spks`, timestamps, and motion-energy files. It concluded that the reference processing should start from raw fluorescence, that camera timestamps were needed for dropped-frame handling, and that all supplied `jm*` subject/session folders should be retained.
 
-## 1-b. How are the data split into subjects?
+## 1-b. How are the data split into subjects (mice)?
 
-i. A subject is a directory whose name starts with `jm`; subject names are sorted, and the enumeration index is recorded for every session in `subject_idx`.
+i. Subjects are defined as top-level directories under `/app/data` whose names begin with `jm`. They are sorted alphabetically and stored in that order in `subjects`.
 
-ii.
+ii. 
 ```python
 subjects = sorted(p.name for p in DATA_ROOT.iterdir() if p.is_dir() and p.name.startswith('jm'))
-for si, subject in enumerate(subjects):
-    ...
-    subject_idx.append(si)
 ```
 
-iii. The agent inferred from the documented directory structure and names that each `jm*` folder is one mouse. Sorting supplies deterministic ordering.
+iii. In steps 4, 8, 9, and 12, the agent stated that the dataset contains six subject folders and that all of them should be kept. The alphabetical sort gives a deterministic mouse ordering.
 
 ## 1-c. How are the data split into sessions?
 
-i. Every sorted subdirectory of a subject is one session and becomes one element of each session-level output list.
+i. Each session is one subdirectory under a subject directory. Sessions are sorted alphabetically within each subject and appended in that order to the output lists.
 
-ii.
+ii. 
 ```python
-sessions = sorted(p for p in (DATA_ROOT / subject).iterdir() if p.is_dir())
-for session in sessions:
-    ...
-    neural.append(...)
-    inputs.append(...)
-    outputs.append(...)
+for si, subject in enumerate(subjects):
+    sessions = sorted(p for p in (DATA_ROOT / subject).iterdir() if p.is_dir())
+    for session in sessions:
+        print(f'Processing {subject}/{session.name}', flush=True)
 ```
 
-iii. The trajectory identifies these as daily recordings and reports 41 sessions total. This follows the supplied data organization.
+iii. In steps 4, 8, 9, and 12, the agent described each daily recording subdirectory as one session and noted that there were 41 sessions total. The sorted traversal is the mechanism it used to realize that decision.
 
 ## 1-d. How are the data split into trials?
 
-i. After 10-frame averaging, each session is divided into consecutive, non-overlapping 60-second trials of 180 samples. Only complete trials are retained; the tail is truncated before `np.split`.
+i. The AI treats the recording as continuous and creates artificial trials by chopping each session into consecutive non-overlapping 60-second segments after temporal averaging. Because the averaged sampling rate is 3 Hz, each trial contains 180 time bins. Any leftover bins at the end of a session are dropped by truncating to the largest multiple of 180.
 
-ii.
+ii. 
 ```python
+AVERAGE_FRAMES = 10
+BIN_FS = FS / AVERAGE_FRAMES
+TRIAL_SECONDS = 60
 TRIAL_SAMPLES = int(TRIAL_SECONDS * BIN_FS)
+...
 ntrials = activity.shape[1] // TRIAL_SAMPLES
 usable = ntrials * TRIAL_SAMPLES
 activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 neural.append([np.ascontiguousarray(x, dtype=np.float32)
                for x in np.split(activity, ntrials, axis=1)])
+inputs.append([np.ascontiguousarray(x[None, :], dtype=np.float32)
+               for x in np.split(elapsed, ntrials)])
+outputs.append([np.ascontiguousarray(x[None, :], dtype=np.int64)
+                for x in np.split(labels, ntrials)])
 ```
 
-iii. The agent states that the task explicitly requires 60-second trials and that 30 Hz data averaged by 10 gives 3 Hz, hence 180 samples per trial.
+iii. In steps 8-12, the agent said the reference decoding analysis uses non-overlapping 10-frame averages, which makes 60-second trials equal to 180 samples. It also said sessions should be split into complete 60-second trials only.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. There is no trial-level quality filter. All complete 60-second segments are retained, while any incomplete final segment is discarded.
+i. The AI does not apply any explicit trial-level quality-control filter. The only effective exclusion is that trailing bins that do not fill a complete 60-second trial are discarded before splitting.
 
-ii.
+ii. 
 ```python
 ntrials = activity.shape[1] // TRIAL_SAMPLES
 usable = ntrials * TRIAL_SAMPLES
 activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 ```
 
-iii. No natural trials or trial-quality flags were found. The trajectory describes retaining all supplied data and only enforcing complete fixed-length segments.
+iii. In steps 7-11, the agent focused quality control on neuron inclusion and dropped camera frames, not on per-trial rejection. No trajectory step mentions any trial-quality filter beyond keeping complete trials.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural activity is derived from Suite2p `F.npy` and `Fneu.npy`; `ops.npy` supplies the neuropil and baseline parameters.
+i. The final neural data is derived from `suite2p/plane0/F.npy` and `suite2p/plane0/Fneu.npy`. `ops.npy` is also read to recover the Suite2p preprocessing parameters such as `neucoeff`, `sig_baseline`, `win_baseline`, and `fs`.
 
-ii.
+ii. 
 ```python
 F = np.load(p / 'F.npy').astype(np.float32, copy=False)
 Fneu = np.load(p / 'Fneu.npy').astype(np.float32, copy=False)
@@ -88,14 +95,15 @@ neucoeff = float(ops.get('neucoeff', 0.7))
 corrected = F - neucoeff * Fneu
 ```
 
-iii. The agent inspected the notebook, methods, and Suite2p source and concluded that the paper used Suite2p-default baseline-corrected fluorescence, formed from neuropil-corrected `F` rather than the available `spks.npy` alternative.
+iii. In steps 4-5 and 10-11, the agent said it intentionally chose raw fluorescence plus neuropil fluorescence rather than `spks.npy`, because the task asked for the same preprocessing described in the paper rather than using already deconvolved traces.
 
 ## 2-b. How is the `neural` data processed?
 
-i. The agent subtracts neuropil (`F - neucoeff*Fneu`), reproduces Suite2p's maximin baseline (Gaussian smoothing, rolling minimum, then rolling maximum) and subtracts it, then averages non-overlapping groups of 10 frames.
+i. Neural activity is processed by computing neuropil-corrected fluorescence `F - neucoeff * Fneu`, then applying a manual reimplementation of Suite2p's maximin baseline subtraction: Gaussian smoothing, rolling minimum, rolling maximum, and baseline subtraction. After that, the trace is averaged in non-overlapping groups of 10 frames.
 
-ii.
+ii. 
 ```python
+neucoeff = float(ops.get('neucoeff', 0.7))
 corrected = F - neucoeff * Fneu
 smooth = gaussian_filter1d(corrected, float(ops.get('sig_baseline', 10.0)),
                            axis=1, mode='reflect')
@@ -107,106 +115,129 @@ corrected -= base
 activity = average_ten(activity).astype(np.float32)
 ```
 
-iii. The trajectory says the methods specified Suite2p-default baseline-corrected fluorescence and 10-timestamp denoising; inspection of Suite2p source confirmed that maximin is baseline subtraction rather than division.
+iii. In steps 7-11, the agent said the methods called for "Suite2p-default baseline-corrected dF/F" and that inspecting Suite2p source confirmed this meant baseline subtraction after neuropil correction, not division by baseline. It also noted that both neural and behavioral traces should be averaged over 10 consecutive timestamps.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No additional ROI filter is applied: all supplied rows are retained.
+i. No additional neural filtering is applied in code. All neurons present in the provided Suite2p outputs are retained. The AI explicitly decided not to apply a second `iscell`-based filter.
 
-ii.
+ii. 
 ```python
-# Every supplied subject/session is retained. Track2p's Suite2p exports already
-# contain only cells tracked across every day of a subject. Their iscell scores
-# exceed the paper's default 0.5 threshold, so no second ROI filter is applied.
+for session in sessions:
+    ...
+    activity = suite2p_baseline_corrected(session)
+    ...
+    region_idx.append(np.zeros(activity.shape[0], dtype=np.int64))
 ```
 
-iii. The agent checked the data documentation and `iscell` values and found that exports already contain cells tracked across days and exceed the paper's default cell-probability threshold, so another filter would be redundant.
+iii. In steps 7, 10, and 11, the agent said the Track2p exports already contain tracked cells and that the observed `iscell` scores exceed the paper's default 0.5 threshold, so additional ROI filtering was unnecessary.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. There is no experimental event alignment. Samples remain on the session timeline and are cut into consecutive trials beginning at session start. Metadata calls this “session start; consecutive 60-second trial segmentation” and reports offsets 0 to 60 seconds.
+i. Neural data is aligned to session start rather than to any stimulus or behavioral event. Trials are consecutive windows along that session-start-aligned timeline.
 
-ii.
+ii. 
 ```python
-'temporal_alignment_event': 'session start; consecutive 60-second trial segmentation',
-'off_start': 0.0,
-'off_end': float(TRIAL_SECONDS),
+elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
+...
+'metadata': {
+    ...
+    'temporal_alignment_event': 'session start; consecutive 60-second trial segmentation',
+    'off_start': 0.0,
+    'off_end': float(TRIAL_SECONDS),
+    ...
+}
 ```
 
-iii. The agent reasoned that these are artificial segments of a continuous recording, so session start is the only alignment origin. It did not specifically justify why every trial receives the same metadata offsets despite elapsed time remaining session-relative.
+iii. In steps 8-12, the agent said the recordings are continuous and that behavior should be aligned to the neural frame grid, then split into fixed 60-second trials. That implies session-start alignment rather than event-triggered alignment.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. Source data at 30 Hz are averaged in non-overlapping blocks of 10 frames, producing 3 Hz data and 333.33 ms bins for both neural and behavioral streams.
+i. The converted data uses 333.333... ms bins, obtained by averaging non-overlapping groups of 10 frames from the original 30 Hz sampling. This rebinning is applied to both neural and motion data before trialization and before motion-energy discretization.
 
-ii.
+ii. 
 ```python
+FS = 30.0
 AVERAGE_FRAMES = 10
 BIN_FS = FS / AVERAGE_FRAMES
 ...
-return x.reshape(*x.shape[:-1], n, AVERAGE_FRAMES).mean(axis=-1)
+activity = average_ten(activity).astype(np.float32)
+motion = average_ten(motion)
 ...
 'time_bin_size': 1000.0 / BIN_FS,
 ```
 
-iii. The trajectory quotes the paper's decoding procedure as averaging both dF/F and behavior over 10 consecutive timestamps and notes this keeps the streams synchronized.
+iii. In steps 7-12, the agent repeatedly justified this with the methods statement that decoding analyses denoised both neural and behavioral traces by averaging 10 consecutive timestamps.
 
 ## 3-a. What variables in the raw data is `input` *Time from start of experiment* derived from?
 
-i. It is generated from the binned sample index and the known 3 Hz sampling rate, not loaded from a raw variable.
+i. The time input is not read from a raw file. It is synthesized from the index of each binned time point and the post-binning sample rate, yielding elapsed seconds from the start of the session.
 
-ii.
+ii. 
 ```python
 elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
-```
-
-iii. The agent used the confirmed constant 30 Hz imaging rate and 10-frame averaging; a synthetic index clock is therefore equivalent to elapsed imaging time.
-
-## 3-b. What processing is involved in computing `input` *Time from start of experiment*?
-
-i. A zero-based index for every binned session sample is divided by 3 Hz, then truncated with the other streams to complete trials and cast/retained as `float32`.
-
-ii.
-```python
-elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
-...
-activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
-```
-
-iii. The trajectory emphasizes that elapsed time remains relative to session start rather than resetting at each artificial trial.
-
-## 3-c. How is the `input` *Time from start of experiment* aligned with the neural data?
-
-i. Time is created after neural averaging with exactly one value per neural bin, receives the identical usable-length truncation, and is split at the identical 180-sample boundaries.
-
-ii.
-```python
-elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
-activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 inputs.append([np.ascontiguousarray(x[None, :], dtype=np.float32)
                for x in np.split(elapsed, ntrials)])
 ```
 
-iii. The common sample count and split boundaries were chosen to maintain one-to-one temporal alignment with neural bins.
+iii. In steps 8, 11, and 12, the agent said it would "retain global elapsed session time as input" and that this variable should remain relative to session start rather than resetting on each trial.
+
+## 3-b. What processing is involved in computing `input` *Time from start of experiment*?
+
+i. After neural activity is binned to 3 Hz, the AI constructs a uniformly spaced time vector with `np.arange(...) / BIN_FS`. It then truncates the vector to complete trials and splits it with the same trial boundaries as the neural data.
+
+ii. 
+```python
+activity = average_ten(activity).astype(np.float32)
+...
+elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
+...
+elapsed = elapsed[:usable]
+inputs.append([np.ascontiguousarray(x[None, :], dtype=np.float32)
+               for x in np.split(elapsed, ntrials)])
+```
+
+iii. In steps 8 and 11, the agent justified this as the natural consequence of 10-frame averaging and of keeping elapsed time on the same 3 Hz grid as the other signals.
+
+## 3-c. How is `input` *Time from start of experiment* aligned with the neural data?
+
+i. The time input is exactly aligned with neural data because it is generated after the neural trace has been binned, then truncated to the same usable length, and split with the same `np.split` boundaries.
+
+ii. 
+```python
+activity = average_ten(activity).astype(np.float32)
+motion = average_ten(motion)
+labels = quintiles(motion)
+elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
+...
+activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
+...
+for x in np.split(activity, ntrials, axis=1)
+for x in np.split(elapsed, ntrials)
+```
+
+iii. In step 11, the agent explicitly said it would "retain global elapsed session time as input" while splitting into the same 60-second trials as the neural data.
 
 ## 4-a. What variables in the raw data is `output` *Motion energy* derived from?
 
-i. It uses the precomputed global motion energy in `motion_energy_glob.npy` and camera timestamps in `tstamps.npy` for alignment.
+i. Motion energy is derived from `move_deve/motion_energy_glob.npy`, and its temporal alignment is derived from `move_deve/tstamps.npy`. The AI does not use `interframe_int.npy`.
 
-ii.
+ii. 
 ```python
 motion = np.load(p / 'motion_energy_glob.npy').astype(np.float64)
 stamps = np.load(p / 'tstamps.npy').astype(np.float64)
 ```
 
-iii. The trajectory says motion energy is the paper's sum of squared inter-frame pixel differences and that timestamp gaps identify dropped behavior-camera frames.
+iii. In steps 4, 5, 8, and 11, the agent said that dropped camera frames should be handled from the timestamp stream because the timestamp gaps locate missing frames directly, and because some sessions showed gap structure that made timestamp-based alignment preferable to simple length padding.
 
 ## 4-b. What processing is involved in computing `output` *Motion energy*?
 
-i. The precomputed trace is interpolated onto a regular imaging-length grid derived from camera timestamps, averaged over 10 frames, and converted to session-specific quintile labels.
+i. The AI interpolates the motion-energy trace from irregular camera timestamps onto a regular imaging-frame grid whose spacing is the median positive timestamp difference. It then averages the aligned trace in groups of 10 frames and discretizes the averaged values into five within-session quintiles.
 
-ii.
+ii. 
 ```python
+positive_dt = np.diff(stamps)
+step = np.median(positive_dt[positive_dt > 0])
 target = stamps[0] + np.arange(nframes, dtype=np.float64) * step
 return np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
 ...
@@ -214,83 +245,103 @@ motion = average_ten(motion)
 labels = quintiles(motion)
 ```
 
-iii. The agent found dropped frames, including timestamp gaps in some equal-length arrays, and therefore preferred timestamp interpolation over padding. Ten-frame averaging follows the paper and occurs before categorical discretization.
+iii. In steps 8-11, the agent justified this by saying the timestamp clock is not in seconds but still provides the correct relative frame grid, that interpolation is preferable to naive padding, and that the paper's decoding analysis averages neural and behavioral traces before discretization.
 
 ## 4-c. How is `output` *Motion energy* thresholded into categories?
 
-i. Four 20th-percentile boundaries are calculated independently for each complete binned session. `searchsorted(..., side='right')` assigns integer classes 0–4.
+i. The AI computes the 20th, 40th, 60th, and 80th percentiles of the binned motion-energy trace separately within each session, then assigns quintile labels 0-4 using those four cut points.
 
-ii.
+ii. 
 ```python
 def quintiles(x: np.ndarray) -> np.ndarray:
     edges = np.quantile(x, [0.2, 0.4, 0.6, 0.8])
     return np.searchsorted(edges, x, side='right').astype(np.int64)
 ```
 
-iii. This directly implements the requested five equal-percentile bins selected per session. The agent checked that percentile ties were not problematic.
+iii. In steps 9-12, the agent said motion-energy quantiles were well separated and that the requested categorical target should be built from five per-session percentile bins after averaging.
 
 ## 4-d. How is `output` *Motion energy* aligned with the neural data?
 
-i. The median positive camera-timestamp increment defines the regular frame step. Motion is linearly interpolated at exactly `nframes` target locations beginning at the first camera timestamp, then neural and motion streams are averaged by the same factor and split identically.
+i. Motion energy is aligned to neural data by interpolating the camera-derived motion trace onto a target vector of length `nframes`, where `nframes` is the raw neural frame count. After that raw-frame alignment, both streams are averaged with the same 10-frame bins and split into trials with the same boundaries.
 
-ii.
+ii. 
 ```python
-positive_dt = np.diff(stamps)
-step = np.median(positive_dt[positive_dt > 0])
-target = stamps[0] + np.arange(nframes, dtype=np.float64) * step
-return np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
+activity = suite2p_baseline_corrected(session)
+motion = aligned_motion(session, activity.shape[1])
+activity = average_ten(activity).astype(np.float32)
+motion = average_ten(motion)
+...
+activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 ```
 
-iii. The agent reasoned that timestamps encode exact missing-frame locations and observed gaps even where raw lengths matched. It judged timestamp interpolation onto the neural grid safer than shifting the remainder of the trace or padding at the end.
+iii. In steps 8 and 11, the agent explicitly said it would "interpolate motion energy onto the 30 Hz neural grid using camera timestamps" and then average both streams in non-overlapping 10-frame bins so that they stay aligned.
 
 ## 5. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Motion/timestamp length mismatches raise an error. Dropped-camera gaps are repaired by timestamp-based linear interpolation; extrapolated endpoints use the nearest motion value. Incomplete trial tails are discarded.
+i. The AI handles camera irregularities by using timestamps and interpolation rather than assuming the motion-energy array is already on the correct frame grid. It raises an error if motion and timestamp arrays disagree in length. It also discards any end-of-session remainder that does not fit a full 60-second trial.
 
-ii.
+ii. 
 ```python
 if len(motion) != len(stamps):
     raise ValueError(f'motion/timestamp mismatch in {session}')
 ...
-np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
+positive_dt = np.diff(stamps)
+step = np.median(positive_dt[positive_dt > 0])
+target = stamps[0] + np.arange(nframes, dtype=np.float64) * step
+return np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
 ...
 usable = ntrials * TRIAL_SAMPLES
+activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 ```
 
-iii. The README reportedly permitted treating dropped frames as missing or interpolating them. The agent selected interpolation to preserve framewise alignment and explicit failure for internally inconsistent source arrays.
+iii. In steps 4, 8, and 11, the agent said the dataset contains occasional dropped camera frames and that timestamp-based interpolation is the right way to correct them. In steps 8 and 12, it also emphasized keeping only complete 60-second trials.
 
 ## 6-a. What are the most time-consuming steps of the code?
 
-i. The full-session, per-neuron Gaussian/minimum/maximum baseline correction is the dominant computation; loading large arrays and materializing the converted dataset are secondary costs.
+i. The most expensive work is the session-level neural preprocessing: loading the large fluorescence arrays and running the Suite2p-like baseline correction (Gaussian smoothing plus rolling min/max filters) across all neurons and all frames. Motion interpolation and per-session averaging are also linear-time over long session traces, but smaller than the calcium preprocessing.
 
-ii.
+ii. 
 ```python
-smooth = gaussian_filter1d(corrected, ..., axis=1, mode='reflect')
+F = np.load(p / 'F.npy').astype(np.float32, copy=False)
+Fneu = np.load(p / 'Fneu.npy').astype(np.float32, copy=False)
+...
+smooth = gaussian_filter1d(corrected, float(ops.get('sig_baseline', 10.0)),
+                           axis=1, mode='reflect')
 base = minimum_filter1d(smooth, size=window, axis=1, mode='reflect')
 base = maximum_filter1d(base, size=window, axis=1, mode='reflect')
+...
+return np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
 ```
 
-iii. The trajectory inspected whether Suite2p preprocessing was available and describes baseline preprocessing over every neuron and full session as the key processing operation. The final implementation uses SciPy on CPU.
+iii. The trajectory does not contain an explicit runtime profile, but steps 10-11 show the agent concentrating on exact reproduction of Suite2p preprocessing as the main algorithmic component, which is the clear computational bottleneck in the written code.
 
 ## 6-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. Session/subject loops are needed because shapes and files differ. Trial conversion uses Python list comprehensions around already vectorized `np.split`; these could be reduced by retaining views or restructuring storage, but the required nested-list format still requires per-trial objects. Dropped-frame repair itself is vectorized through `np.interp`.
+i. The AI already kept the heavy per-time operations vectorized. The remaining Python loops are at the subject/session level and for packaging session arrays into per-trial lists. Compared with the human reference, the AI specifically avoided a Python loop over dropped frames by using one `np.interp` call.
 
-ii.
+ii. 
 ```python
-neural.append([np.ascontiguousarray(x, dtype=np.float32)
-               for x in np.split(activity, ntrials, axis=1)])
-inputs.append([np.ascontiguousarray(x[None, :], dtype=np.float32)
-               for x in np.split(elapsed, ntrials)])
+for si, subject in enumerate(subjects):
+    sessions = sorted(p for p in (DATA_ROOT / subject).iterdir() if p.is_dir())
+    for session in sessions:
+        ...
+        neural.append([np.ascontiguousarray(x, dtype=np.float32)
+                       for x in np.split(activity, ntrials, axis=1)])
+        inputs.append([np.ascontiguousarray(x[None, :], dtype=np.float32)
+                       for x in np.split(elapsed, ntrials)])
+        outputs.append([np.ascontiguousarray(x[None, :], dtype=np.int64)
+                        for x in np.split(labels, ntrials)])
+...
+return np.interp(target, stamps, motion, left=motion[0], right=motion[-1])
 ```
 
-iii. The trajectory deliberately chose timestamp-based interpolation, avoiding a repeated `np.insert` loop. It did not identify further loops as bottlenecks.
+iii. In steps 8 and 11, the agent explicitly chose timestamp-based interpolation onto the whole neural grid, which is the reason the code avoids a per-dropped-frame insertion loop.
 
 ## 6-c. What processing does the code repeat multiple times?
 
-i. Loading, baseline correction, timestamp alignment, averaging, percentile calculation, and splitting repeat once per session. Contiguous conversion repeats once for each trial and each of the three streams. These repetitions reflect session-specific files, neuron counts, alignment, and quintile thresholds.
+i. There is no major repeated processing beyond the intended per-session repetition of the same preprocessing pipeline. Within each session, the code also creates contiguous per-trial copies after session-level arrays have already been computed, but it does not rerun neural or motion preprocessing multiple times on the same data.
 
-ii.
+ii. 
 ```python
 for session in sessions:
     activity = suite2p_baseline_corrected(session)
@@ -298,23 +349,32 @@ for session in sessions:
     activity = average_ten(activity).astype(np.float32)
     motion = average_ten(motion)
     labels = quintiles(motion)
+    ...
+    neural.append([np.ascontiguousarray(x, dtype=np.float32)
+                   for x in np.split(activity, ntrials, axis=1)])
 ```
 
-iii. The trajectory does not flag avoidable repeated processing; it stresses that quintiles must be selected per session and all sessions must be processed.
+iii. No trajectory step identifies any deliberate repeated computation as a design choice. The repetition that exists is the intended once-per-session processing pipeline.
 
 ## 6-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. No major scientific processing is computed and then discarded. There are potentially unnecessary copies from `np.ascontiguousarray`, and rich `session_info` metadata is not required by decoder training, but both make the saved output robust and auditable.
+i. There is no large obviously wasted computation, but the AI does do some extra bookkeeping that is not needed for the decoder: it loads `ops.npy` only to recover preprocessing parameters, builds a `session_info` metadata list, and computes full-session arrays before truncating the leftover tail that does not make a complete trial.
 
-ii.
+ii. 
 ```python
-np.ascontiguousarray(x, dtype=np.float32)
+ops = np.load(p / 'ops.npy', allow_pickle=True).item()
+...
+elapsed = (np.arange(activity.shape[1], dtype=np.float32) / BIN_FS)
+...
+usable = ntrials * TRIAL_SAMPLES
+activity, labels, elapsed = activity[:, :usable], labels[:usable], elapsed[:usable]
 ...
 session_info.append({
     'subject': subject, 'session': session.name,
     'n_neurons': int(activity.shape[0]), 'n_trials': ntrials,
-    ...
+    'duration_seconds': float(usable / BIN_FS),
+    'source_imaging_rate_hz': FS,
 })
 ```
 
-iii. The trajectory reports validating and training the decoder but does not identify discarded conversion work. The copies ensure predictable layout/dtypes, and metadata documents provenance even if the decoder ignores it.
+iii. The trajectory does not justify these as downstream requirements. They appear to be convenience or provenance choices added by the AI while implementing the converter.

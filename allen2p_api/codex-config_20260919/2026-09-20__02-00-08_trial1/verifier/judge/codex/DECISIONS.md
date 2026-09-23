@@ -2,88 +2,174 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent constructs an AllenSDK `VisualBehaviorOphysProjectCache`, obtains the experiment table, and selects locally present, active experiments whose project code is exactly `VisualBehavior`. It discovers locally available IDs by matching the table against cached NWB filenames, then loads every selected experiment with `get_behavior_ophys_experiment`, in up to 16 worker processes.
+i. The AI script creates an AllenSDK `VisualBehaviorOphysProjectCache` rooted at `/app/data`, reads the ophys experiment table, and then restricts processing to locally cached experiment files whose metadata satisfy `project_code == "VisualBehavior"` and `passive == False`. It then loads each kept experiment with `get_behavior_ophys_experiment()`. Trials are not loaded globally up front; they are loaded per experiment inside `extract_session()`.
 
 ii.
 ```python
-return cls.from_s3_cache(cache_dir=DATA_DIR)
-...
-file_ids = {int(path.stem.rsplit("_", 1)[1]) for path in
-            (DATA_DIR / "visual-behavior-ophys-1.1.0" /
-             "behavior_ophys_experiments").glob("*.nwb")}
-keep = (table.index.isin(file_ids) & table["project_code"].eq("VisualBehavior")
-        & ~table["passive"].astype(bool))
-...
-exp = cache.get_behavior_ophys_experiment(int(experiment_id))
+def make_cache():
+    cls = _import_cache_class()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return cls.from_s3_cache(cache_dir=DATA_DIR)
+
+def local_experiment_ids(cache) -> list[int]:
+    table = cache.get_ophys_experiment_table()
+    file_ids = {
+        int(path.stem.rsplit("_", 1)[1])
+        for path in (DATA_DIR / "visual-behavior-ophys-1.1.0" /
+                     "behavior_ophys_experiments").glob("*.nwb")
+    }
+    keep = (
+        table.index.isin(file_ids)
+        & table["project_code"].eq("VisualBehavior")
+        & ~table["passive"].astype(bool)
+    )
+    return sorted(table.index[keep].astype(int).tolist())
 ```
 
-iii. The notes say this uses the SDK for detailed access, avoids fetching absent cache entries, excludes passive replay sessions, and parallelizes expensive SDK trace decompression. The agent emphasizes that it never opens NWB contents directly.
+```python
+def extract_session(experiment_id: int) -> dict:
+    cache = make_cache()
+    exp = cache.get_behavior_ophys_experiment(int(experiment_id))
+```
+
+iii. In `CONVERSION_NOTES.md`, the AI says it wanted to use the AllenSDK cache only, avoid direct NWB reads, stay on the exact `VisualBehavior` project, and exclude passive replay sessions because the paper "did not analyze" them and because passive sessions produce artificial all-miss/all-correct-reject outcome tables.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are the sorted unique string-valued `mouse_id` metadata across retained experiments; each experiment/session receives the corresponding index.
+i. Subjects are defined by unique `mouse_id` values collected from the per-experiment metadata returned by the SDK. The final `subjects` list is sorted, and each retained experiment/session gets a `subject_idx` pointing into that list.
 
 ii.
 ```python
-"mouse_id": str(meta["mouse_id"]),
-...
-subjects = sorted({s["mouse_id"] for s in raw_sessions})
-subject_map = {name: i for i, name in enumerate(subjects)}
+result = {
+    ...
+    "mouse_id": str(meta["mouse_id"]),
+    ...
+}
 ```
 
-iii. The notes identify SDK mouse ID as the animal identifier and validate the resulting 37 local mice against the supplied cache metadata.
+```python
+subjects = sorted({s["mouse_id"] for s in raw_sessions})
+subject_map = {name: i for i, name in enumerate(subjects)}
+...
+"subjects": subjects,
+"subject_idx": np.asarray([subject_map[s["mouse_id"]] for s in raw_sessions],
+                          dtype=np.int32),
+```
+
+iii. The notes describe `mouse_id` as the canonical SDK animal identifier and report cohort counts in terms of distinct mice after the experiment-level filtering.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each retained `ophys_experiment_id` is emitted as one decoder session; `ophys_session_id` is retained only as metadata. Experiments are sorted by experiment ID.
+i. The AI effectively treats each retained `ophys_experiment_id` as one decoder session. It preserves `ophys_session_id` in metadata, but it does not merge multiple experiments into one larger session object. Each returned `result` from `extract_session()` becomes one entry in the final session lists.
 
 ii.
 ```python
-ids = local_experiment_ids(cache)
-...
-raw_sessions.append(result)
-raw_sessions.sort(key=lambda x: x["experiment_id"])
-...
-neural.append(s["neural"])
+def extract_session(experiment_id: int) -> dict:
+    ...
+    result = {
+        "experiment_id": int(experiment_id),
+        "ophys_session_id": int(meta["ophys_session_id"]),
+        ...
+    }
+    return result
 ```
 
-iii. The agent states that the exact single-plane `VisualBehavior` project has a one-to-one experiment/session relationship in this local release, so experiment-level loading produces the intended sessions.
+```python
+with ProcessPoolExecutor(max_workers=workers) as pool:
+    futures = {pool.submit(extract_session, eid): eid for eid in ids}
+    ...
+    raw_sessions.append(result)
+...
+for s in raw_sessions:
+    ...
+    neural.append(s["neural"])
+```
+
+iii. In the notes, the AI argues that the exact `VisualBehavior` subset is single-plane, so "session and experiment are one-to-one" for its chosen cohort and no cross-plane merge is needed.
 
 ## 1-d. How are the data split into trials?
 
-i. The SDK `trials` table defines variable-length trials. For each eligible row, the agent creates a 30 Hz half-open grid from `start_time` through (but not including) `stop_time`, concatenates all grids for processing, then splits arrays back using stored lengths.
+i. Trials are taken from the AllenSDK `exp.trials` table. The script sorts that table by `start_time`, keeps only eligible go/catch rows, and then creates one half-open time grid per trial from `start_time` to `stop_time`. Each trial gets its own neural and output slices on that grid.
 
 ii.
 ```python
-def _trial_grid(start, stop):
+trials = exp.trials.sort_values("start_time")
+eligible = (
+    (trials["go"] | trials["catch"])
+    & ~trials["aborted"]
+    & ~trials["auto_rewarded"]
+)
+trials = trials.loc[eligible].copy()
+```
+
+```python
+def _trial_grid(start: float, stop: float) -> np.ndarray:
     n = int(np.ceil((stop - start) * FS - 1e-10))
     grid = start + np.arange(max(0, n), dtype=np.float64) * DT
     return grid[grid < stop]
-...
+
 grids = [_trial_grid(float(r.start_time), float(r.stop_time))
          for r in trials.itertuples()]
 ```
 
-iii. The notes justify full SDK trial intervals to preserve pre-change and response periods and a half-open interval to prevent duplicated boundary samples.
+iii. The notes say the AI followed the SDK trial table because it already contains task-defined start/stop times and trial-type/outcome labels, and it intentionally used half-open `[start_time, stop_time)` trial windows to avoid duplicating boundary samples.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Only go or catch trials are retained; aborted and auto-rewarded trials are removed. Outcomes must be exactly one of four mutually exclusive flags, grids must be nonempty, and an experiment must have at least two eligible trials. Passive experiments are filtered earlier.
+i. Trials are filtered to `(go OR catch) AND NOT aborted AND NOT auto_rewarded`. Sessions with fewer than two eligible trials are rejected. Trials whose generated 30 Hz grids are empty are also rejected by raising an error. The code does not explicitly require `change_time.notna()`.
 
 ii.
 ```python
-eligible = ((trials["go"] | trials["catch"])
-            & ~trials["aborted"] & ~trials["auto_rewarded"])
+eligible = (
+    (trials["go"] | trials["catch"])
+    & ~trials["aborted"]
+    & ~trials["auto_rewarded"]
+)
+trials = trials.loc[eligible].copy()
+if len(trials) < 2:
+    raise ValueError(f"{experiment_id}: fewer than two eligible trials")
 ...
-if len(trials) < 2: raise ValueError(...)
-if not np.all(outcome_bool.sum(axis=1) == 1): raise ValueError(...)
+if any(len(g) == 0 for g in grids):
+    raise ValueError(f"{experiment_id}: empty eligible trial grid")
 ```
 
-iii. The agent cites the explicit task requirement for go/catch and exclusion of aborted/auto-rewarded trials; it also treats exclusivity, nonempty grids, and minimum trial count as defensive validation.
+iii. The notes justify these exclusions as matching the task instructions exactly for trial type, and they say passive sessions were separately removed because their outcomes are not genuine behavior.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data comes from `exp.events`: the SDK's raw L0 calcium-event magnitude for each valid cell, with cell IDs taken from that table's index.
+i. Neural data are derived from the AllenSDK event table, specifically `exp.events["events"]`, not from `dff_traces`.
+
+ii.
+```python
+event_table = exp.events
+cell_ids = event_table.index.to_numpy(copy=True)
+events = np.vstack(event_table["events"].to_numpy()).astype(np.float32)
+ophys_t = np.asarray(exp.ophys_timestamps, dtype=np.float64)
+```
+
+iii. The notes explicitly say the AI chose raw L0 calcium event magnitudes because the supplied paper’s neural analyses and decoder used event traces to reduce slow calcium-decay effects.
+
+## 2-b. How is the `neural` data processed?
+
+i. The event traces are stacked into a cell-by-time matrix, checked against `ophys_timestamps`, linearly interpolated from the native ophys timestamps onto one concatenated 30 Hz trial grid, and then split back into per-trial matrices. The saved matrices are `float32`.
+
+ii.
+```python
+events = np.vstack(event_table["events"].to_numpy()).astype(np.float32)
+ophys_t = np.asarray(exp.ophys_timestamps, dtype=np.float64)
+if events.shape[1] != len(ophys_t):
+    raise ValueError(f"{experiment_id}: event/timestamp length mismatch")
+neural_all = interp_rows_shared_time(ophys_t, events, all_t)
+neural = [neural_all[:, offsets[i]:offsets[i + 1]]
+          for i in range(len(lengths))]
+```
+
+iii. The notes justify this as keeping the AllenSDK preprocessing of the event traces, while matching the paper’s use of 30 Hz interpolation and avoiding repeated per-neuron, per-trial interpolation work.
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. There is no extra per-cell quality filter in the script. The AI relies on the SDK’s valid-cell/event tables and only applies higher-level experiment/session filters such as exact `VisualBehavior` and active behavior.
 
 ii.
 ```python
@@ -92,360 +178,507 @@ cell_ids = event_table.index.to_numpy(copy=True)
 events = np.vstack(event_table["events"].to_numpy()).astype(np.float32)
 ```
 
-iii. The notes say the paper analyzed event magnitudes and that SDK event/cell tables already reflect valid-ROI quality control; the agent therefore chose events rather than recomputing fluorescence or dF/F.
-
-## 2-b. How is the `neural` data processed?
-
-i. Every cell's event trace is linearly interpolated from `ophys_timestamps` onto the concatenated 30 Hz trial grids, converted to float32, and split into neuron-by-time trial matrices. A shared vectorized timestamp-bracketing routine avoids one interpolation search per neuron.
-
-ii.
 ```python
-neural_all = interp_rows_shared_time(ophys_t, events, all_t)
-neural = [neural_all[:, offsets[i]:offsets[i + 1]]
-          for i in range(len(lengths))]
+keep = (
+    table.index.isin(file_ids)
+    & table["project_code"].eq("VisualBehavior")
+    & ~table["passive"].astype(bool)
+)
 ```
 
-iii. The agent says the paper interpolated calcium events to 30 Hz and reports verifying the optimized interpolation against independent `np.interp` to within about `4.77e-7`.
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. There is no additional neuron-level filtering beyond the cells exposed in the SDK event table. Sessions require at least one cell through internal validation; all-zero event trials are retained.
-
-ii.
-```python
-cell_ids = event_table.index.to_numpy(copy=True)
-...
-assert len(data["brain_region_idx"][si]) == ncell and ncell > 0
-```
-
-iii. The agent argues SDK valid ROIs already embody the whitepaper QC. It independently confirmed that all-zero trials are genuine sparse-event trials and avoided activity-based filtering that would bias the sample.
+iii. The notes say the SDK already exposes QC-filtered valid ROIs/cells, so no extra ad hoc neural thresholding was applied.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Neural samples are placed on a trial-relative grid whose zero is `trials.start_time`; absolute grid times drive interpolation against synchronized ophys timestamps. Each trial ends at its SDK stop time.
+i. Trial-level neural data are aligned to trial start. For each eligible trial, the script builds a relative 30 Hz grid spanning `[start_time, stop_time)`, interpolates the full-session event traces onto the concatenated trial timestamps, and then slices the resulting array trial by trial.
 
 ii.
 ```python
-grids = [_trial_grid(float(r.start_time), float(r.stop_time))
-         for r in trials.itertuples()]
-...
-"temporal_alignment_event": "trial start (AllenSDK trials.start_time)",
+def _trial_grid(start: float, stop: float) -> np.ndarray:
+    n = int(np.ceil((stop - start) * FS - 1e-10))
+    grid = start + np.arange(max(0, n), dtype=np.float64) * DT
+    return grid[grid < stop]
 ```
 
-iii. The notes say this honors ophys-timestamp alignment while representing the complete trial and that independent reconstruction found no offset or boundary leakage.
+```python
+grids = [_trial_grid(float(r.start_time), float(r.stop_time))
+         for r in trials.itertuples()]
+all_t = np.concatenate(grids)
+neural_all = interp_rows_shared_time(ophys_t, events, all_t)
+```
+
+iii. The notes say the temporal origin is "trial start (AllenSDK trials.start_time)" and that alignment still comes from the synchronized ophys timestamps even though the final trial grid is resampled to 30 Hz.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. Resolution is exactly 30 Hz, or 33.333 ms. The code performs linear temporal resampling from the native ophys frame times; it does not aggregate/count events into bins.
+i. The converted data use a fixed 30 Hz time base (`DT = 1/30 s`, `time_bin_size = 1000/30 ms`) for all sessions and trials. Yes: the neural and behavioral streams are resampled/interpolated onto that common 30 Hz grid.
 
 ii.
 ```python
 FS = 30.0
 DT = 1.0 / FS
-...
-"time_bin_size": 1000.0 / FS,
-"neural_resampling": "linear interpolation from synchronized ophys timestamps",
 ```
 
-iii. The agent attributes 30 Hz interpolation to the paper's methods and distinguishes it from spike/event counting.
+```python
+"metadata": {
+    ...
+    "time_bin_size": 1000.0 / FS,
+    "sampling_rate_hz": FS,
+    "neural_resampling": "linear interpolation from synchronized ophys timestamps",
+    ...
+}
+```
+
+iii. The notes justify 30 Hz by pointing to the paper’s 30 Hz interpolation and to the fact that running and eye signals are naturally near that scale, while also giving every session exactly the same bin size.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. Image identity is derived from task-block rows of `exp.stimulus_presentations`, specifically `start_time`, `end_time`, `image_name`, and `omitted`. Unfilled time bins retain the explicit gray class.
+i. Image identity is derived from `exp.stimulus_presentations`, specifically the task-block rows whose `stimulus_block_name` contains `change_detection`, together with each row’s `image_name`, `start_time`, `end_time`, and `omitted` flags.
 
 ii.
 ```python
 stim = exp.stimulus_presentations
-task = stim[stim["stimulus_block_name"].str.contains("change_detection", na=False)]
-...
-if hi > lo and not bool(row.omitted):
-    name = str(row.image_name)
-    image_all[idx[valid]] = IMAGE_TO_INT[name]
+task = stim[
+    stim["stimulus_block_name"].str.contains("change_detection", na=False)
+].sort_values("start_time")
 ```
 
-iii. The agent says presentation intervals are the direct source for the flashed image/gray cadence and reports a non-gray fraction consistent with 250 ms image plus 500 ms gray.
+```python
+for row in task.itertuples():
+    start = float(row.start_time)
+    end = float(row.end_time)
+    ...
+    if hi > lo and not bool(row.omitted):
+        ...
+        name = str(row.image_name)
+        if name not in IMAGE_TO_INT:
+            raise ValueError(f"{experiment_id}: unknown image {name}")
+        image_all[idx[valid]] = IMAGE_TO_INT[name]
+```
+
+iii. The notes say the AI used stimulus presentations because they give the actual on-screen flash intervals and omitted flashes, which the trial table alone does not fully specify for a time-varying identity signal.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. A fixed global mapping assigns 0 to gray and 1–16 to the A/B natural images. Each 30 Hz point within a non-omitted task presentation gets that image's code; other points remain gray.
+i. The script initializes image labels to `0`, which corresponds to `"gray"`, and then overwrites only the non-omitted image-presentation intervals with integer codes from a fixed global 17-class mapping (`gray` plus 16 image IDs). The mapping is predefined, not discovered from the data.
 
 ii.
 ```python
-IMAGE_VALUES = ["gray", "im000", ..., "im106"]
+IMAGE_VALUES = [
+    "gray", "im000", "im031", "im035", "im045", "im054", "im061",
+    "im062", "im063", "im065", "im066", "im069", "im073", "im075",
+    "im077", "im085", "im106",
+]
 IMAGE_TO_INT = {name: idx for idx, name in enumerate(IMAGE_VALUES)}
-image_all = np.zeros(len(all_t), dtype=np.int16)
 ```
 
-iii. The fixed mapping ensures cross-session consistency and explicitly represents the requested non-gray image identity together with inter-presentation gray periods.
+```python
+image_all = np.zeros(len(all_t), dtype=np.int16)
+...
+image_all[idx[valid]] = IMAGE_TO_INT[name]
+```
+
+iii. The notes justify the explicit `"gray"` class because the task has 250 ms image flashes separated by 500 ms gray screens, and the requested output asks for image identity only during the non-gray screen.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. Stimulus interval membership is evaluated directly at the same concatenated 30 Hz timestamps (`all_t`) used to interpolate neural events, then split by the same lengths.
+i. Image identity is computed on the exact same concatenated 30 Hz trial timestamps (`all_t`) used for neural interpolation. For each stimulus presentation, the script finds the overlapping sample indices in `all_t` and labels only those samples that actually fall inside `[start_time, end_time)`.
 
 ii.
 ```python
 lo = int(np.searchsorted(all_t, start, side="left"))
 hi = int(np.searchsorted(all_t, end, side="left"))
-valid = (all_t[idx] >= start) & (all_t[idx] < end)
-...
-image_trials = split_vector(s["image"], lengths)
+if hi > lo and not bool(row.omitted):
+    idx = np.arange(lo, hi)
+    valid = (all_t[idx] >= start) & (all_t[idx] < end)
+    image_all[idx[valid]] = IMAGE_TO_INT[name]
 ```
 
-iii. The agent notes that common target timestamps guarantee framewise alignment and that the explicit interval condition prevents labels in excluded inter-trial gaps from leaking into retained trials.
+iii. The notes explicitly say the same synchronized ophys-derived time base is used for neural and stimulus signals, so the identity labels are assigned directly onto the decoder time grid.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. Image change uses `is_change`, `omitted`, and the start/end times of task rows in `stimulus_presentations`.
+i. Image change is derived from the same filtered `stimulus_presentations` table, using each row’s `is_change`, `start_time`, `end_time`, and `omitted` fields rather than `trials.change_time`.
 
 ii.
 ```python
-if hi > lo and not bool(row.omitted):
+for row in task.itertuples():
+    start = float(row.start_time)
+    end = float(row.end_time)
     ...
-    if bool(row.is_change):
-        change_all[idx[valid]] = 1
+    if hi > lo and not bool(row.omitted):
+        ...
+        if bool(row.is_change):
+            change_all[idx[valid]] = 1
 ```
 
-iii. The notes explain that `is_change` directly identifies a changed-image presentation; catch/sham and omitted presentations therefore stay zero.
+iii. The notes say this choice ties "image change" to the actual changed-image presentation interval instead of to a trial-table scalar time.
 
 ## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. A zero-initialized binary vector is set to one throughout each actual changed-image presentation (about 250 ms), not merely at a single sample.
+i. The script starts with an all-zero vector and sets the value to `1` only during time bins that overlap a changed, non-omitted image presentation. It does not extend the label through the following gray period.
 
 ii.
 ```python
 change_all = np.zeros(len(all_t), dtype=np.int16)
 ...
-change_all[idx[valid]] = 1
+if bool(row.is_change):
+    change_all[idx[valid]] = 1
 ```
 
-iii. After a one-bin target decoded poorly, the agent revised it to the full changed-image flash, arguing this is a sampling-robust operationalization of “right after” and improves decoding.
+iii. The notes explain that the AI first tried a one-bin impulse, then broadened it to the full changed-image flash because that was a more stable operationalization of "right after" for pointwise decoding.
 
 ## 4-c. How is `output` *Image change* thresholded into categories?
 
-i. It is already binary: 0 is `no_change`, and 1 is `change`; no numeric thresholding is applied.
+i. It is not thresholded from a continuous value. It is directly constructed as a binary categorical output with values `0 = no_change` and `1 = change`.
 
 ii.
 ```python
 change_all = np.zeros(len(all_t), dtype=np.int16)
 ...
-["no_change", "change"],
+if bool(row.is_change):
+    change_all[idx[valid]] = 1
 ```
 
-iii. The source `is_change` flag is boolean, so the agent considered further thresholding unnecessary.
+```python
+"output_values": [
+    IMAGE_VALUES,
+    ["no_change", "change"],
+    ...
+],
+```
+
+iii. The notes describe image change as an event label, not a measured continuous signal, so there is no extra thresholding stage.
 
 ## 4-d. How is `output` *Image change* aligned with the neural data?
 
-i. Change labels are assigned by stimulus intervals on exactly the same `all_t` grid as neural activity and split using identical trial boundaries.
+i. The change labels are assigned on the same `all_t` trial timestamps used for the neural data, using interval overlap with each changed-image presentation.
 
 ii.
 ```python
-valid = (all_t[idx] >= start) & (all_t[idx] < end)
-change_all[idx[valid]] = 1
+lo = int(np.searchsorted(all_t, start, side="left"))
+hi = int(np.searchsorted(all_t, end, side="left"))
 ...
-change_trials = split_vector(s["change"], lengths)
+if bool(row.is_change):
+    change_all[idx[valid]] = 1
 ```
 
-iii. The notes cite shared target timestamps and visual/independent checks that each change label coincides with the changed-image flash.
+iii. The notes justify this the same way as image identity alignment: the label lives on the common decoder time grid derived from synchronized ophys time.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. Running speed comes from the SDK `exp.running_speed` table's `timestamps` and `speed` columns.
+i. Running speed comes from `exp.running_speed`, using the SDK-provided `timestamps` and `speed` columns.
 
 ii.
 ```python
 running = exp.running_speed
-run_all = finite_interp(running["timestamps"], running["speed"], all_t,
-                        "running speed")
+...
+run_all = finite_interp(running["timestamps"], running["speed"],
+                        all_t, "running speed")
 ```
 
-iii. The agent describes this as the SDK's reference-filtered wheel speed in cm/s.
+iii. The notes say the AI intentionally used the SDK-computed running speed rather than recomputing wheel velocity itself.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Finite samples are stably sorted, duplicate timestamps removed, and linearly interpolated to the 30 Hz grid. Four cohort-wide quantiles (20/40/60/80%) are computed, and `searchsorted(..., side="right")` assigns classes 0–4.
+i. The script removes nonfinite samples inside `finite_interp()`, requires at least two finite points, linearly interpolates the running speed onto the concatenated 30 Hz trial timestamps, then computes cohort-wide quintile cut points and discretizes each sample with `np.searchsorted`.
 
 ii.
 ```python
-run_all = finite_interp(..., all_t, "running speed")
+def finite_interp(source_t, source_x, target_t, label: str):
+    source_t = np.asarray(source_t, dtype=np.float64)
+    source_x = np.asarray(source_x, dtype=np.float64)
+    good = np.isfinite(source_t) & np.isfinite(source_x)
+    if good.sum() < 2:
+        raise ValueError(f"fewer than two finite {label} samples")
+    ...
+    return np.interp(target_t, t, x).astype(np.float32)
+```
+
+```python
+run_edges = percentile_edges([s["running"] for s in raw_sessions], "running")
 ...
-edges = np.quantile(joined, [0.2, 0.4, 0.6, 0.8])
 run_bin = np.searchsorted(run_edges, s["running"], side="right").astype(np.int16)
 ```
 
-iii. The agent justifies interpolation by synchronized clocks and global quintiles by the requirement for five equal percentile bins and consistent categories across sessions.
+iii. The notes justify this as using the SDK-filtered locomotion signal, aligning it to the decoder time base, and making five balanced categories across the cohort.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Four global cohort thresholds at the 20th, 40th, 60th, and 80th percentiles form five bins; repeated/non-increasing edges are rejected.
+i. Running speed is discretized into five percentile bins using the 20th, 40th, 60th, and 80th percentiles computed across all retained sessions.
 
 ii.
 ```python
-edges = np.quantile(joined, [0.2, 0.4, 0.6, 0.8])
-if np.any(np.diff(edges) <= 0): raise ValueError(...)
-np.searchsorted(run_edges, s["running"], side="right")
+def percentile_edges(values: list[np.ndarray], label: str) -> np.ndarray:
+    joined = np.concatenate(values).astype(np.float32, copy=False)
+    ...
+    edges = np.quantile(joined, [0.2, 0.4, 0.6, 0.8]).astype(np.float64)
+    ...
+    return edges
 ```
 
-iii. The notes report each resulting class contains 20% of all retained time samples to rounding.
+```python
+run_bin = np.searchsorted(run_edges, s["running"], side="right").astype(np.int16)
+...
+"output_values": [
+    ...,
+    ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"],
+    ...
+],
+```
+
+iii. The notes explicitly say the bins are cohort-wide quintiles so the categories are comparable across sessions.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Speed is interpolated directly onto the same `all_t` target timestamps used for neural traces, then split with the same trial lengths.
+i. Running speed is interpolated directly onto the same concatenated 30 Hz trial timestamps used for neural interpolation, then split into the same per-trial lengths.
 
 ii.
 ```python
-neural_all = interp_rows_shared_time(ophys_t, events, all_t)
-run_all = finite_interp(..., all_t, "running speed")
+run_all = finite_interp(running["timestamps"], running["speed"],
+                        all_t, "running speed")
+...
+run_trials = split_vector(run_bin, lengths)
+...
+out_trials.append(np.vstack([
+    image_trials[i], change_trials[i], run_trials[i], pupil_trials[i],
+    np.full(int(length), s["outcome"][i], dtype=np.int16),
+]).astype(np.int16, copy=False))
 ```
 
-iii. The agent says hardware-synchronized timestamps and a common target grid provide direct temporal alignment.
+iii. The notes say all continuous streams were aligned to the same ophys-derived decoder grid before trial splitting.
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. Pupil diameter comes from `exp.eye_tracking`: timestamps plus both `pupil_width` and `pupil_height`. It is defined as twice the larger ellipse half-axis.
+i. Pupil diameter is derived from `exp.eye_tracking`, specifically from the cleaned `pupil_width` and `pupil_height` columns. The code defines diameter as `2 * max(width, height)` per sample.
 
 ii.
 ```python
+eye = exp.eye_tracking
+if eye is None or eye.empty:
+    raise MissingRequiredData("eye tracking table is missing or empty")
+...
 pupil_diameter = 2.0 * np.maximum(
     eye["pupil_width"].to_numpy(dtype=np.float64),
     eye["pupil_height"].to_numpy(dtype=np.float64),
 )
 ```
 
-iii. The agent cites the SDK/whitepaper interpretation of width and height as ellipse half-axes and diameter as the full major axis. It says cleaned columns contain NaNs for likely blinks.
+iii. The notes say the SDK/whitepaper treat width and height as ellipse half-axes and that the major full axis is the intended pupil diameter measure.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. The major-axis diameter is computed, nonfinite samples (including blink/outlier gaps) are discarded, remaining points are sorted/deduplicated and linearly interpolated to 30 Hz. Global 20/40/60/80% quantiles then produce five classes.
+i. After computing `2 * max(width, height)`, the script keeps only finite samples through `finite_interp()`, linearly interpolates onto the 30 Hz trial timestamps, computes cohort-wide quintile edges, and discretizes each sample with `np.searchsorted`. Sessions with missing or empty eye-tracking tables are excluded.
 
 ii.
 ```python
-good = np.isfinite(source_t) & np.isfinite(source_x)
-...
-return np.interp(target_t, t, x).astype(np.float32)
-...
-pupil_bin = np.searchsorted(pupil_edges, s["pupil"], side="right")
+try:
+    pupil_all = finite_interp(eye["timestamps"], pupil_diameter,
+                              all_t, "pupil diameter")
+except ValueError as exc:
+    raise MissingRequiredData(str(exc)) from exc
 ```
 
-iii. The agent says this avoids blink contamination, follows the paper's interpolation, and yields balanced cohort-wide categories.
+```python
+pupil_edges = percentile_edges([s["pupil"] for s in raw_sessions], "pupil")
+...
+pupil_bin = np.searchsorted(pupil_edges, s["pupil"], side="right").astype(np.int16)
+```
+
+iii. The notes justify this as using the cleaned SDK pupil geometry, interpolating through bounded blink/missing gaps rather than creating a sixth "missing" class, and dropping the few sessions where the signal is unusable.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Four global thresholds at pupil-diameter percentiles 20, 40, 60, and 80 define integer classes 0–4; degenerate edges are rejected.
+i. Pupil diameter is thresholded into five cohort-wide percentile bins using the 20th, 40th, 60th, and 80th percentiles across all retained sessions.
 
 ii.
 ```python
 pupil_edges = percentile_edges([s["pupil"] for s in raw_sessions], "pupil")
+...
 pupil_bin = np.searchsorted(pupil_edges, s["pupil"], side="right").astype(np.int16)
 ```
 
-iii. The notes report the five pupil classes are globally equal in frequency to within one sample.
+```python
+"output_values": [
+    ...,
+    ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"],
+    ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"],
+    ...
+],
+```
+
+iii. The notes say the thresholds are cohort-wide quintiles for class balance and cross-session consistency.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Cleaned pupil diameter is interpolated directly to the same 30 Hz `all_t` timestamps as neural data and split using the same stored trial lengths.
+i. Pupil diameter is interpolated onto the same concatenated 30 Hz trial timestamps used for neural interpolation, then split into per-trial segments with the same lengths as the neural trials.
 
 ii.
 ```python
-pupil_all = finite_interp(eye["timestamps"], pupil_diameter, all_t,
-                          "pupil diameter")
+pupil_all = finite_interp(eye["timestamps"], pupil_diameter,
+                          all_t, "pupil diameter")
+...
+pupil_trials = split_vector(pupil_bin, lengths)
 ```
 
-iii. The agent cites synchronized SDK clocks and independent trial-level reconstruction checks.
+iii. The notes say pupil, running, stimulus labels, and neural traces all share the same ophys-derived decoder time grid.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. It is derived from the trials table's boolean `hit`, `miss`, `false_alarm`, and `correct_reject` columns.
+i. Trial outcome is derived from the trial-table boolean columns `hit`, `miss`, `false_alarm`, and `correct_reject`.
 
 ii.
 ```python
 OUTCOME_COLUMNS = ["hit", "miss", "false_alarm", "correct_reject"]
+...
 outcome_bool = trials[OUTCOME_COLUMNS].to_numpy(dtype=bool)
+if not np.all(outcome_bool.sum(axis=1) == 1):
+    bad = trials.index[outcome_bool.sum(axis=1) != 1].tolist()
+    raise ValueError(f"{experiment_id}: nonexclusive outcomes in {bad[:5]}")
+outcomes = outcome_bool.argmax(axis=1).astype(np.int16)
 ```
 
-iii. The agent calls these the SDK's canonical mutually exclusive outcomes and explicitly verifies exclusivity.
+iii. The notes say these are the SDK’s mutually exclusive task outcomes for the eligible trial set.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. `argmax` maps the four exclusive booleans to codes 0–3, then the selected code is repeated across every time point of that trial.
+i. The code checks that exactly one of the four outcome flags is true for each eligible trial, maps that one-hot row to integer codes `0..3` with `argmax`, and then repeats that static outcome value across all time bins of that trial in the final output matrix.
 
 ii.
 ```python
-outcomes = outcome_bool.argmax(axis=1).astype(np.int16)
+outcome_bool = trials[OUTCOME_COLUMNS].to_numpy(dtype=bool)
 ...
-np.full(int(length), s["outcome"][i], dtype=np.int16)
+outcomes = outcome_bool.argmax(axis=1).astype(np.int16)
 ```
 
-iii. The static repetition satisfies the common `(outputs, time)` representation while preserving a per-trial target; the notes verify aggregate codes exactly against the SDK counts.
+```python
+out_trials.append(np.vstack([
+    image_trials[i], change_trials[i], run_trials[i], pupil_trials[i],
+    np.full(int(length), s["outcome"][i], dtype=np.int16),
+]).astype(np.int16, copy=False))
+```
+
+iii. The notes say repeating the static trial outcome through time was necessary because the target format expects one output array per trial while the other outputs are time-varying.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Running/pupil interpolation drops nonfinite and duplicate-time samples and requires two unique finite points. Empty eye tables or insufficient required behavioral samples cause the experiment to be explicitly excluded and logged. Other extraction errors abort the conversion. Empty trial grids, too few trials, nonexclusive outcomes, length mismatches, unknown images, nonfinite final arrays, and degenerate percentile edges raise errors. Interpolation uses endpoint values outside sampled support.
+i. The script handles several problems explicitly: it requires at least two eligible trials; it raises on empty trial grids; it checks event/timestamp length consistency; it removes nonfinite running/pupil samples before interpolation; it excludes sessions when running or pupil lack enough finite values; and it excludes sessions with missing or empty eye-tracking tables. For interpolation, `np.interp` is used, so edge samples are filled with the nearest finite value rather than being left as NaN.
 
 ii.
 ```python
+class MissingRequiredData(RuntimeError):
+    """A published session cannot supply one of the required decoder outputs."""
+```
+
+```python
 good = np.isfinite(source_t) & np.isfinite(source_x)
-if good.sum() < 2: raise ValueError(...)
+if good.sum() < 2:
+    raise ValueError(f"fewer than two finite {label} samples")
+...
+return np.interp(target_t, t, x).astype(np.float32)
+```
+
+```python
+eye = exp.eye_tracking
+if eye is None or eye.empty:
+    raise MissingRequiredData("eye tracking table is missing or empty")
 ...
 except MissingRequiredData as exc:
     exclusions.append({"experiment_id": int(eid), "reason": str(exc)})
+    print(f"[{done}/{len(ids)}] {eid}: EXCLUDED ({exc})", flush=True)
     continue
-except Exception as exc:
-    raise RuntimeError(f"experiment {eid} failed") from exc
 ```
 
-iii. The agent argues that excluding three sessions with empty eye tables is preferable to fabricating required pupil labels, while retaining and documenting genuine all-zero neural trials. It uses assertions and independent sanity checks rather than silently repairing structural inconsistencies.
+iii. The notes say the AI preferred excluding truly unusable sessions over inventing pupil labels, while interpolating across bounded finite gaps for otherwise valid sessions.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. SDK construction and compressed event-trace reads/decompression dominate. Finalizing, validating, and serializing the 7.6 GiB pickle are secondary costs.
+i. The expensive part is loading each experiment and decompressing/constructing the large AllenSDK data objects, especially the neural traces. The notes also identify interpolation over large full-session arrays as a performance concern, but the dominant wall-time cost in the final full run is SDK trace decompression/I/O.
 
 ii.
 ```python
+def extract_session(experiment_id: int) -> dict:
+    ...
+    cache = make_cache()
+    exp = cache.get_behavior_ophys_experiment(int(experiment_id))
+```
+
+```python
+workers = min(16, len(ids), max(1, (os.cpu_count() or 2) // 2))
 with ProcessPoolExecutor(max_workers=workers) as pool:
     futures = {pool.submit(extract_session, eid): eid for eid in ids}
 ```
 
-iii. Timed optimization in the notes found decompression, rather than interpolation, became the full-cache bottleneck; 16 independent workers reduced the full conversion to about 73 seconds.
+iii. In Step 6 and Step 10, the notes say the full-cache bottleneck was SDK trace decompression and that increasing worker count reduced total conversion time substantially.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The agent already vectorized interpolation across neurons and concatenated all trial grids. Remaining loops over stimulus presentations, trial splitting/assembly, sessions, and validation could be further batched, though variable trial lengths make some looping natural.
+i. The AI specifically targeted the expensive "interpolate each neuron separately" pattern and replaced it with a vectorized interpolation routine that computes timestamp brackets once and applies them to all cells. Trial timestamps are also concatenated before splitting so repeated per-trial interpolation is avoided.
 
 ii.
 ```python
-for row in task.itertuples(): ...
-for i, length in enumerate(lengths): ...
-for si in range(ns): ...
+def interp_rows_shared_time(source_t: np.ndarray, source_x: np.ndarray,
+                            target_t: np.ndarray) -> np.ndarray:
+    right = np.searchsorted(source_t, target_t, side="right")
+    right = np.clip(right, 1, len(source_t) - 1)
+    left = right - 1
+    denom = source_t[right] - source_t[left]
+    weight = ((target_t - source_t[left]) / denom).astype(np.float32)
+    lo = source_x[:, left]
+    hi = source_x[:, right]
+    out = lo + (hi - lo) * weight[None, :]
 ```
 
-iii. The notes specifically identify per-neuron/per-trial interpolation as avoidable repetition and say shared bracketing removed it. They regard SDK I/O/decompression as more important than the remaining lightweight loops.
+iii. The notes explicitly say the earlier naive approach repeated binary searches for every neuron and that this shared-time interpolation was added as the main vectorization improvement.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. Each worker reconstructs its own cache object; output construction performs several separate `split_vector` passes with repeated cumulative-offset calculation; validation traverses all trial arrays again; optional plotting splits running and pupil again. Stimulus rows are also searched against the concatenated timeline one by one.
+i. The code still repeats some setup per experiment: every worker calls `make_cache()` again, every experiment reloads its own SDK object, and every session reruns trial-grid construction and stimulus-interval assignment. What it intentionally avoids repeating is per-trial/per-neuron interpolation: neural, running, and pupil are each interpolated once per session onto one concatenated target vector.
 
 ii.
 ```python
-cache = make_cache()  # inside extract_session, once per worker task
-...
-run_trials = split_vector(run_bin, lengths)
-pupil_trials = split_vector(pupil_bin, lengths)
-image_trials = split_vector(s["image"], lengths)
-change_trials = split_vector(s["change"], lengths)
+def extract_session(experiment_id: int) -> dict:
+    ...
+    cache = make_cache()
+    exp = cache.get_behavior_ophys_experiment(int(experiment_id))
 ```
 
-iii. The notes focus on repetition that was removed (one timestamp search per neuron/trial). They accept remaining passes as modest relative to decompression and useful for validation/readability.
+```python
+grids = [_trial_grid(float(r.start_time), float(r.stop_time))
+         for r in trials.itertuples()]
+all_t = np.concatenate(grids)
+...
+for row in task.itertuples():
+    ...
+```
+
+iii. The notes emphasize that repeated interpolation was removed by concatenating trial grids and interpolating each stream once per session, but they also describe independent worker loads for each experiment as part of the performance strategy.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. Several extracted intermediates are retained only transiently or for metadata/diagnostics: trial IDs, starts/stops, continuous running and pupil after discretization, cell IDs beyond their count, detailed counters, and timing. Optional processing plots are diagnostic and not consumed by training. There is otherwise little heavy discarded processing because fluorescence, masks, and images are not loaded.
+i. The script computes and stores several metadata fields that the downstream decoder does not need, such as `image_set`, `experience_level`, `source_trial_count`, `eligible_trial_count`, `go_count`, `catch_count`, `outcome_counts`, and `ophys_frame_rate`. It also supports optional plotting via `--show-processing`. These are useful for documentation and sanity checks, but not used by the decoder itself.
 
 ii.
 ```python
-result = {"trial_ids": ..., "trial_starts": ..., "trial_stops": ...,
-          "running": run_all, "pupil": pupil_all, ...}
-...
-data = finalize(raw_sessions, run_edges, pupil_edges, exclusions=exclusions)
+result = {
+    ...
+    "image_set": str(meta["session_type"]).split("images_")[-1][:1],
+    "experience_level": "Familiar" if "images_A" in str(meta["session_type"])
+                        else "Novel",
+    ...
+    "source_trial_count": int(len(exp.trials)),
+    "eligible_trial_count": int(len(trials)),
+    "go_count": int(trials["go"].sum()),
+    "catch_count": int(trials["catch"].sum()),
+    "outcome_counts": outcome_bool.sum(axis=0).astype(int).tolist(),
+    "ophys_frame_rate": float(meta["ophys_frame_rate"]),
+    ...
+}
 ```
 
-iii. The agent explicitly says it avoids loading ROI masks, fluorescence, and image data, keeps only needed output-ready intermediates, and uses optional plots/metadata for auditability and sanity checking.
+```python
+if args.show_processing:
+    plot_processing(raw_sessions, data)
+```
+
+iii. The notes explicitly frame these as documentation, sanity-check, and audit fields added for validation and reproducibility rather than as features required by downstream decoding.

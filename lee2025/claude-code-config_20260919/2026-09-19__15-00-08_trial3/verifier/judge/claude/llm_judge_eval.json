@@ -1,149 +1,149 @@
 {
-  "1-a": {
-    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The human reference loads the seven MATLAB v7.3 files with h5py; the AI loads the seven joblib files with joblib.load. These are the same data in two containers, and the AI explicitly verified this (the reference code's own mat2joblib/save_dat produces the joblib file from the .mat file, and load_dat's default format is 'joblib'). The AI extracts exactly the same fields the human does (trace, position, blocked) plus envs for provenance, and covers all 7 subjects / 207 sessions / all frames. The only stylistic difference is that the AI hard-codes the animal list (copied from main.py's `animals`) rather than globbing the directory; this is slightly less general but produces the identical, complete set and additionally guarantees a deterministic subject order. The AI went further than the human by using the .mat path via h5py as an independent cross-check of its joblib-based loader, which is a strength rather than a deviation.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "process_animal does exactly one joblib.load per animal and iterates all days (`days = list(range(trace.shape[0]))`) when days is None, which is the case in --full mode (`jobs = [(a, None) for a in ANIMALS]`). The conversion log confirms all 7 animals and 31/31/31/21/31/31/31 = 207 sessions were loaded and processed, matching the documented intent."
-  },
-  "1-b": {
-    "question": "How are the data split into subjects (mice)?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical to the human reference: one data file = one mouse, with the animal ID as the subject name. `subjects` is the list of the 7 QLAK-CA1-XX IDs and `subject_idx` indexes into it per session. The AI additionally validated the split against the paper's per-animal cell statistics (mean 773.3, min 515, max 952 vs the paper's 773 +/- 68 SE, 515-952), which the human did not do.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`data['subjects'] = list(ANIMALS)` and `data['subject_idx'].append(ANIMALS.index(s['animal']))` produce a correct index into the subject list for every session. The verification output reports 7 subjects with the expected 31/31/31/21/31/31/31 session counts, so the mapping is right despite the out-of-order completion of the parallel workers (sessions are appended per-animal-result, so order within `results` is preserved by joblib.Parallel)."
-  },
-  "1-c": {
-    "question": "How are the data split into sessions?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as the human reference: each recording day within an animal file becomes one session (iterating axis 0 of trace/position/blocked). Both keep all 207 sessions with no session-level exclusion. The AI adds a defensive skip for sessions with fewer than 2 usable trials, which is required by the target format spec ('at least two trials within each session') and never actually fired, so no data was lost.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`for day in days` over `range(trace.shape[0])` with per-day slices `trace[day]`, `position[day]`, `blocked[day]`, `envs[day]` gives one output session per recording day. The verification log shows exactly 207 sessions and the printed per-session lines show a distinct geometry/day for each, matching the documented decision."
-  },
-  "1-d": {
-    "question": "How are the data split into trials?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both split the continuous recording into non-overlapping 1-minute blocks as the task instructions require. The AI works in 100 ms bins so a full trial is 600 bins rather than 1800 frames, which is the same 60 s of wall-clock time. Two differences, both defensible: (i) the AI keeps the trailing partial block (~18 s) as a shorter trial instead of discarding it, so no data is thrown away (the target format permits variable-length trials); (ii) within each block only moving bins are retained (assessed under 1-e), making trials variable-length and temporally non-contiguous. The latter is harmless for the provided decoder, which classifies each timepoint independently (per-session PCA projection + linear read-out, no temporal convolution or recurrence), and the AI checked this. Trial counts (39.4/session, 8,163 total) are in line with the human's 8,187.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`for start in range(0, nb, TRIAL_BINS)` with `idx = np.arange(start, min(start + TRIAL_BINS, nb))` produces consecutive non-overlapping 60 s blocks and includes the final partial block, exactly as documented. The verification output confirms T <= 600 for every trial and 40-41 blocks per session consistent with nb ~ 23,955-24,073 bins."
-  },
-  "1-e": {
-    "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The human reference applies no temporal curation at all (its answer is 'N/A'). The AI applies the reference paper's own decoding-analysis curation: speed > 5 cm/s with the speed trace smoothed by a 5-frame Gaussian, taken directly from decode_position_within's v_filt_size=5 / v_thresh=5, plus a drop of 1-min blocks retaining < 30 bins (3 s) of movement. The task instructions explicitly demand that curation match the reference code, so reproducing v_thresh=5 is the more faithful choice; the AI verified the retained fraction (51.9%) against the independently measured fraction of time above 5 cm/s, showed in a pilot that it improves balanced accuracy (0.488 vs 0.424), and its full-data validation accuracy (0.662) is well above the human reference's (0.548). The 30-bin minimum is an ad-hoc addition, but it is small in effect (0.08% of retained bins) and is properly motivated by the format requirement for usable trials. The one caveat a reviewer should be aware of — that ~48% of the recording is dropped and trials become temporally non-contiguous — is explicitly documented, and does not affect the per-timepoint decoder used for evaluation.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "compute_speed reproduces the reference formula gaussian_filter1d(norm(diff(position)*fps), sigma=5) with frame 0 left at 0 (matching vel_idx[0]=False); `moving = bin_time(speed, nb) > V_THRESH` applies the 5 cm/s threshold per 100 ms bin as the notes state; `sel = idx[moving[idx]]` selects only moving bins per trial; and `if len(sel) < MIN_TRIAL_BINS: continue` implements the 30-bin drop. Sanity check 'every retained bin has speed > 5 cm/s' passes in the AI's independent .mat-based tests, and the reported 51.9% retention matches the documented value."
-  },
-  "2-a": {
-    "question": "What variables in the raw data is the `neural` data derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical to the human reference: the `trace` field, the binarised calcium-transient rising-phase event trains shipped with the dataset, which the paper's methods state were 'treated as the firing rate in all further analyses'. No dF/F is computed (correctly, since the shipped traces are already post-processed binary events) and no other neural field is used. The AI explicitly addressed and dismissed the instructions' dF/F prompt with the right reasoning.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`trace` is the only neural input to process_session; SFPs, centroids and maps are never loaded into the neural stream. The AI's independent sanity check reconstructs every trial's neural array from the raw `.mat` trace field and matches under np.allclose."
-  },
-  "2-b": {
-    "question": "How is the `neural` data processed?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The human reference does no processing beyond transposing and casting to float32. The AI reproduces the reference code's actual decoding preprocessing: gaussian_filter1d(sigma=3 frames) along time followed by average-pooling over 3 frames, exactly fit_decoder/test_decoder's `gaussian_filter1d(traces, sigma=temporal_bin_size, axis=0)` + `AvgPool1d(3,3)`, then a scaling by fps to give events/s as get_rate_maps does. Since the instructions require matching the reference processing, this is strictly more faithful than the human's raw pass-through, and it is validated: the AI showed total event mass is conserved by smoothing+binning and that converted mean rates equal raw event rates (0.2295 vs 0.2294 Hz). The one deliberate deviation — smoothing the continuous session trace before selecting moving bins, rather than after concatenating them as the reference does — is explicitly flagged and well argued (smoothing across a discontinuous concatenation would mix samples minutes apart), and it is also the only order compatible with cutting the data into trials. The Hz scaling was shown not to drive the decoder result (rescaling by 0.2x/5x moved accuracy by <= 0.02).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly what is documented: `smoothed = gaussian_filter1d(raw, sigma=TRACE_SIGMA, axis=1)` (axis 1 = time in the (cells, frames) layout) then `neural = (bin_time(smoothed, nb) * FPS).astype(np.float32)` with bin_time performing a mean over 3-frame windows. TRACE_SIGMA=3.0 and TBIN=3 match the reference's sigma=temporal_bin_size=3. The AI's independent recomputation from the .mat files reproduces every trial elementwise."
-  },
-  "2-c": {
-    "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The human reference only removes all-NaN (unregistered) neurons. The AI removes unregistered neurons AND applies the reference code's own activity criterion from decode_position_within: cell_idx = sum(traces[vel_idx]) > cell_threshold = 5, i.e. more than 5 events during the retained moving samples. The instructions require curation to match the reference code, so applying cell_threshold=5 is the more faithful decision; it is also the natural companion of the speed filter the AI adopted. The impact is quantified and small (68,860 of 69,744 registered cell-sessions kept = 98.7%; 5,374 of 5,413 unique cells appear), so the paper's headline counts are preserved. Correctly, no place-cell/split-half selection is applied, consistent with the paper's 'inclusion of all cells in subsequent analyses'.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`registered = ~np.isnan(trace[:, 0])` is valid given the AI's verified premise that NaN is all-or-none per (cell, day); `active = events_b[:, moving].sum(axis=1) > CELL_THRESH` sums the raw binary events inside the retained moving bins and applies the strict > 5 threshold, matching both the documented decision and the reference's semantics. The resulting per-session neuron counts printed in the conversion log (e.g. 150/156, 112/113) are consistent with the claimed ~1.3% drop rate."
-  },
-  "2-d": {
-    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both reach the same substantive conclusion: there is no stimulus or behavioural alignment event, because the recordings are continuous 40-min free-exploration sessions and trials are artificial 1-minute segments. The AI states this and then does what the target format actually asks for, which the human reference omitted entirely: it fills temporal_alignment_event ('start of each 1-minute trial'), off_start = 0.0 and off_end = 60.0 s. It also documents the inter-stream alignment basis (simultaneous 30 Hz DAQ acquisition with post-hoc timestamping, so frame i <-> frame i) and asserts equal stream lengths in code. This is a more complete answer to the same correct decision.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`assert position.shape[1] == n_frames` enforces frame-for-frame correspondence; both streams are truncated to nb*TBIN frames and binned by the same bin_time with identical edges; the same `sel` index array slices neural and output within each trial. The metadata fields written match the stated alignment convention."
-  },
-  "2-e": {
-    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The human reference keeps the native 30 Hz (33.33 ms) with no rebinning. The AI rebins to 100 ms by Gaussian-smoothing (sigma = 3 frames) and average-pooling 3 frames, which is precisely what the reference code's decoding pipeline does (fit_decoder/test_decoder with temporal_bin_size=3). Given that the instructions require processing to match the reference paper and code, reproducing the reference decoder's own binning is the more faithful choice, and the AI documents the source line-by-line. It also aligns the position and speed streams to the same bin edges, keeps bin size constant across all trials and sessions as the format requires, and records time_bin_size = 100.0 ms correctly. Practical corroboration: smoothing plus 100 ms bins raises the SNR of sparse binary event trains and the AI's validation accuracy (0.662) exceeds the human reference's (0.548). The AI also correctly handles the <= 2 trailing frames that do not fill a bin.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "TBIN=3 with FPS=30 gives exactly 100 ms; bin_time truncates to nb*TBIN and reshapes to (..., nb, 3) before reducing, so bins are non-overlapping and complete; neural, position and speed all go through bin_time with the same nb. metadata['time_bin_size'] = 1000.0*TBIN/FPS = 100.0 ms, consistent with the actual binning."
-  },
-  "3-a": {
-    "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical to the human reference: the per-session `blocked` field giving the indices of occluded partitions in the [[0,1,2],[3,4,5],[6,7,8]] layout, with -1 meaning nothing blocked. The AI additionally discovered and resolved a real discrepancy between `blocked` and the reference code's get_env_mat (which is in image/y-down convention, so blocked equals the zeros of flipud(get_env_mat)), and chose the data field after validating it empirically against occupancy and against the authors' precomputed occupancy maps. That is a more thorough route to the same correct decision.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`blocked[day]` is passed straight to process_session and consumed only by blocked_vector; envs is used for labelling/metadata only, not to construct the input. The AI's independent check against the .mat `blocked` field passes for every trial of the four spot-checked sessions."
-  },
-  "3-b": {
-    "question": "What processing is involved in computing `input` *Environment geometry*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as the human reference: a 9-dimensional binary (one-hot-per-blocked-partition) vector, 1 = blocked, all zeros for the square (-1 sentinel), constant across all trials of a session and supplied as a static per-trial input, exactly as the Decoder Task specifies. The AI's input_names (blocked_r0c0 ... blocked_r2c2) are tied to the same row/column convention as its output value names, which is a small readability improvement over the human's positional blocked_0..8. The AI additionally verified that exactly 10 distinct input vectors occur, one per named geometry, across all animals and repetitions.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "blocked_vector unwraps the nested entry, filters idx >= 0 (so -1 yields an all-zero vector), and sets 1.0 at the blocked indices; `trials_input.append(blocked_vec.copy())` replicates it per trial as a (9,) float32. The verification output shows input range [0,1] for 8 dimensions and [0,0] for r2c1, which is the expected consequence of partition 7 being open in all 10 geometries, not a bug."
-  },
-  "4-a": {
-    "question": "What variables in the raw data is `output` *Mouse position* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical to the human reference: the `position` field, 2D head-tracking coordinates in cm over the 75x75 cm arena. The AI further verified the axis convention (dim 0 = x = West-East = column, dim 1 = y = North-South = row) against the `blocked` field and the precomputed occupancy maps, which is important because the paper's plotting code uses a flipped convention; the human reference assumed the same convention without documenting a check.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`position[day]` is the sole source of the output stream, and discretize_position uses pos_binned[0] as x and pos_binned[1] as y consistent with the documented convention. The AI's spot check from raw unbinned .mat position (x=58.8, y=12.9 -> bin 2) passes."
-  },
-  "4-b": {
-    "question": "What processing is involved in computing `output` *Mouse position*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Both derive the output solely by discretising the raw cm coordinates onto a fixed 3x3 grid, with no smoothing or unit conversion. The AI additionally average-pools position over the same 3-frame windows as the neural data before discretising, which is exactly what the reference test_decoder does (AvgPool1d(3,3) then astype(int)) and is the necessary consequence of its 100 ms binning decision. The strongest validation of this step is the AI's finding that, with the velocity filter removed, its per-session output distribution correlates 1.0000 with the 3x3 block sums of the authors' own precomputed 15x15 occupancy maps in all 207 sessions.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`pos_b = bin_time(position, nb)` averages position over the same 3-frame windows used for the neural data, then discretize_position converts to a partition index, and `part[sel][np.newaxis, :].astype(np.int64)` yields the (1, T) per-trial output. The AI's independent recomputation matches every trial under np.array_equal."
-  },
-  "4-c": {
-    "question": "How is `output` *Mouse position* thresholded into categories?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The core discretisation is identical to the human reference: a fixed physical grid on the 75 cm arena with 25 cm edges, clipped to [0,2] per axis, and label = 3*row + col (row from y, col from x) giving 9 classes. floor(v/25) with clipping is arithmetically equivalent to the human's np.digitize against edges [25,50] with clipping. The AI also justified the fixed grid over a per-session position maximum (needed for bin identity to be comparable across sessions and consistent with `blocked`) and noted the global position max is exactly 75.0, so this matches decode_position_within's bin_down. The one extra step — reassigning binned positions that land in a partition marked blocked to the nearest open partition — is a defensible analogue of the reference decoder's 'cleaning' of actual and predicted positions onto visited bins, and is small (152 bins in the whole dataset). It should nonetheless be checked by a human, because the CONVERSION_NOTES.md description of its frequency is stale: the notes say 14 frames all in QLAK-CA1-74 day 9, whereas the conversion log shows 152 binned samples across 4 sessions, 145 of them in QLAK-CA1-51 day 04 ('bit donut'). The magnitude is still negligible (<1% of one session, 0.006% overall) and does not change the rating, but the documentation understates it.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "discretize_position implements exactly the stated rule: clipped floor division by PART_SIZE=25 for both axes, part = 3*yb + xb, then a vectorised nearest-open-partition reassignment by Euclidean distance to PART_CENTERS for samples in blocked partitions. Verification confirms output range [0,8], 9 classes present, and the AI's independent checks confirm the output never takes a blocked partition's value and that the visited set equals the open set. The code matches the decision as described; only the frequency statistic in the notes is out of date, not the implementation."
-  },
-  "4-d": {
-    "question": "How is `output` *Mouse position* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same decision as the human reference: the two streams are recorded frame-synchronously at 30 Hz, so they are aligned index-for-index and are sliced with identical indices. The AI carries this through its extra binning and speed-filtering steps by using the same bin edges and the same retained-bin selector for both streams, and it verified alignment both visually (raw vs binned position overlay, raw events vs binned rate) and numerically against the .mat files.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`assert position.shape[1] == n_frames`; both streams truncated to nb*TBIN and binned with the same nb; within each trial `neural[:, sel]` and `part[sel]` use the identical index array, so per-trial neural and output have equal T by construction. The verification output reports no dimension-mismatch errors or warnings across all 8,163 trials."
-  },
-  "5": {
-    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The human reference handles two cases (all-NaN unregistered neurons, discarded remainder frames). The AI handles those plus four more that it found by actively probing the data: positions sitting exactly at the 75 cm edge (198 of 14.9 M frames) that would otherwise index an out-of-range bin 3 and which the reference's buffer=1e-15 is too small to prevent; binned positions falling inside a blocked partition; frame 0 having no velocity estimate (left non-moving, matching the reference's vel_idx[0]=False); and blocks/sessions with too little usable data. It also verified the premises behind its handling (NaN is all-or-none per cell-day; position has no NaNs and no dropout segments > 2 frames; recordings are not zero-padded). It documents one residual it chose not to fix (2 sessions contain a neuron silent in all retained trials) with a reasonable rationale for leaving it. This is a strictly more thorough treatment of the same data.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Each documented case has corresponding code: the `registered` NaN mask, the `[:nb*TBIN]` truncation, np.clip in discretize_position, the nearest-open reassignment, `speed[0] = 0` by construction, `len(sel) < MIN_TRIAL_BINS` and `len(s['neural']) < 2`. The verification run reports zero errors and zero warnings and no degenerate trials (T_min = 30, T_max = 561 <= 600), consistent with the claims."
-  },
-  "6-a": {
-    "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The AI reaches the same conclusion as the human reference — file loading dominates — but backs it with instrumentation the human reference lacks: per-animal load times (6.5-16.4 s), per-session processing times (0.54-0.59 s), and total wall clock (40.7 s) printed by the script itself, as the instructions required. It additionally identifies the Gaussian smoothing of the (cells x frames) trace as the dominant compute cost and the 3.44 GB pickle write as a third contributor, and it acted on the diagnosis (load each animal once, cast to float32, smooth only registered cells, parallelise over animals). A 41 s full conversion is far inside the 15-minute budget.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "time.time() instrumentation surrounds the joblib.load, the per-session loop and the whole run, and the printed timings in conversion_full_out.txt corroborate the documented breakdown (e.g. '[QLAK-CA1-75] processed 31 sessions in 18.4s (0.59s/session), load 16.4s', 'Wrote /app/converted_data.pkl (3.44 GB) in 40.7s total')."
-  },
-  "6-b": {
-    "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Like the human reference (which answers N/A), the AI has no meaningful un-vectorised hot loop. It explicitly avoided the per-frame loops that the reference code itself uses in get_rate_maps and fit_decoder, replacing them with a single reshape-and-reduce, and it vectorised the nearest-open-partition fix with a broadcast distance computation. The remaining Python loops are O(sessions) and O(trials-per-session) (<= 41 iterations), each wrapping heavy vectorised work, so vectorising them further would yield nothing measurable at 0.55 s/session. The trial loop is the only candidate and the AI correctly judged it not worth changing.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "bin_time is a pure reshape/mean/sum; compute_speed uses np.diff + np.linalg.norm + gaussian_filter1d over the whole trace; discretize_position is array arithmetic plus one broadcast norm and argmin. No per-frame or per-neuron Python loop exists in the conversion path, which matches the claim of vectorised binning in the notes."
-  },
-  "6-c": {
-    "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Neither solution has substantive repeated processing; the human reference answers N/A. The AI's residual repetitions are minor and mostly purposeful: the raw trace is traversed twice (sum-binned for the cell-activity criterion, then smoothed and mean-binned for the rate), smoothing runs on the ~1.3% of cells later dropped by curation, and each trial's neural slice is copied out with np.ascontiguousarray. The AI eliminated the repetitions that actually mattered — one file load per animal rather than per session, and smoothing only registered cells in float32 — and documented both with measured savings. At 41 s total, leaving the rest is a sound engineering call rather than an oversight.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code contains exactly the repetitions described: two bin_time calls on `raw` (how='sum' then how='mean' on the smoothed copy), gaussian_filter1d applied before the `active` mask, and per-trial ascontiguousarray copies. No hidden recomputation across sessions or animals exists — each file is read once and each session's pipeline runs once."
-  },
-  "6-d": {
-    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Comparable to the human reference (N/A) in that nothing significant is wasted. The AI's largest discarded computation is the smoothing and binning of the ~48% of bins later removed by the speed filter, but that is an unavoidable consequence of its explicitly justified decision to smooth the continuous trace before selecting moving bins (smoothing after concatenation would splice samples minutes apart). The other discards are trivial: smoothing of the ~1.3% of cells removed by curation, and bookkeeping fields (cell_idx, n_registered, n_bins, n_moving, n_dropped_trials, n_blocked_fixed, trial_bin_idx) that the decoder never reads. Those fields are not dead weight in context — they are what the AI's independent .mat-based sanity checks and the required --show-processing plots consume, so retaining them serves the instructions' validation requirements.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The identified discards are visible directly in the code: neural is computed for all nb bins before `sel` selection, smoothing precedes `neural = neural[active]`, trial_bin_idx is populated unconditionally but read only by _plot_processing, and session_info carries cell_idx and counters into metadata. Nothing is computed and then silently dropped in a way that contradicts the documented design."
-  }
+    "1-a": {
+        "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both the AI and the reference load data from files in /app/data/. The AI uses joblib files while the reference uses .mat files via h5py, but these contain identical data (as confirmed in the reference code's mat2joblib function). Both correctly load the trace, position, and blocked fields for all 7 animals.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly loads joblib files with joblib.load(), extracts the relevant fields (trace, position, envs, blocked), and iterates over all 7 animals. The parallel processing with joblib.Parallel is a valid implementation choice."
+    },
+    "1-b": {
+        "question": "How are the data split into subjects (mice)?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions correctly identify each file as one subject. The AI hardcodes the 7 animal names in ANIMALS, the reference uses sorted glob of .mat files. Both produce the same 7 subjects. The AI always lists all 7 subjects even in sample mode (the reference does the same with its sorted glob).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly maps each animal's file to a subject, creates the subjects list, and correctly computes subject_idx using ANIMALS.index()."
+    },
+    "1-c": {
+        "question": "How are the data split into sessions?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions treat each recording day as a separate session. The AI iterates over trace.shape[0] (the days axis), the reference iterates over n_recording_sessions from the reference array shape. Both produce 207 sessions (6x31 + 1x21).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly iterates over days for each animal and creates one session per day. The session structure is properly assembled into the output dictionary."
+    },
+    "1-d": {
+        "question": "How are the data split into trials?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "Both solutions split sessions into 1-minute non-overlapping segments as required by instructions. The reference uses fixed 1800-frame windows at 30 Hz and discards remainder frames. The AI uses 600-bin windows at 100 ms (after temporal rebinning) and keeps the final partial block as a shorter trial. The AI's approach is better because it preserves more data (the ~18s partial block is not discarded) and applies the speed filter to create variable-length trials. The reference's approach of fixed-length trials at 30 Hz without speed filtering also works but loses the benefits of the velocity filter. The AI also applies a minimum trial length threshold (30 bins = 3s) which provides quality control.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The trial-splitting loop correctly iterates in steps of TRIAL_BINS=600, handles the partial last block with min(start + TRIAL_BINS, nb), applies the speed filter via moving[idx], and enforces the minimum trial length threshold."
+    },
+    "1-e": {
+        "question": "How are trials filtered based on quality controls?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI applies a speed filter (> 5 cm/s) that removes low-movement time bins, matching the reference paper's decode_position_within function. It also drops trials with fewer than 30 retained bins and sessions with fewer than 2 trials. The reference solution does not apply any trial filtering. The AI's approach better matches the reference paper's own processing pipeline.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The speed filter, minimum trial length, and minimum session trial count are all correctly implemented in the code."
+    },
+    "2-a": {
+        "question": "What variables in the raw data is the `neural` data derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions derive neural data from the trace field, which contains binarized calcium-transient rising-phase event trains. Both correctly identify that no dF/F computation is needed as the data is already preprocessed.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly accesses trace from the loaded data and processes only the registered (non-NaN) cells."
+    },
+    "2-b": {
+        "question": "How is the `neural` data processed?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI applies Gaussian smoothing (sigma=3 frames) followed by average pooling over 3 frames (100 ms bins) and converts to events/s by multiplying by 30 Hz. This exactly matches the reference paper's fit_decoder function (temporal_bin_size=3, gaussian_filter1d sigma=3). The reference human solution applies no smoothing, no temporal rebinning, and no unit conversion - it simply transposes the raw traces and casts to float32. The AI's processing more faithfully reproduces the paper's decoding pipeline.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly applies gaussian_filter1d with sigma=3, uses bin_time for 3-frame average pooling via reshape-and-mean, and multiplies by FPS=30 for events/s conversion."
+    },
+    "2-c": {
+        "question": "How is the `neural` data filtered based on quality controls?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI applies two-stage filtering matching the reference paper: (1) remove unregistered cells (NaN), and (2) drop cells with <= 5 events during moving bins (cell_threshold=5 from decode_position_within). The reference human solution only removes all-NaN neurons. The AI's approach more faithfully reproduces the paper's cell curation pipeline.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly identifies registered cells via ~np.isnan(trace[:, 0]), computes events per bin, sums events over moving bins, and filters with > CELL_THRESH (5). This matches the reference paper's decode_position_within logic."
+    },
+    "2-d": {
+        "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions correctly identify that there is no stimulus event to align to - the recordings are continuous and trials are artificial segments. The AI aligns to the start of each 1-minute block, which is the same concept as the reference's approach of slicing fixed windows from the continuous recording.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly slices neural data into 1-minute blocks without any event-based alignment, as there is no event structure in this dataset."
+    },
+    "2-e": {
+        "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI uses 100 ms time bins (3 frames at 30 Hz), matching the reference paper's fit_decoder function (temporal_bin_size=3). The reference human solution keeps the native 30 Hz rate (~33.33 ms bins) without rebinning. The AI's choice better matches the paper's processing, as the 100 ms bin size is what the paper's own decoder uses.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements TBIN=3, computes bin counts as n_frames // TBIN, and uses bin_time() to reshape and average over 3-frame windows."
+    },
+    "3-a": {
+        "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions derive the input from the blocked field, which contains indices of blocked partitions. Both correctly handle the -1 value indicating no blocked partitions (square geometry).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The blocked_vector function correctly processes the blocked field, handling both the -1 case and the normal case of blocked partition indices."
+    },
+    "3-b": {
+        "question": "What processing is involved in computing `input` *Environment geometry*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions convert blocked indices to a 9-dimensional binary vector. The AI uses 1 for blocked and 0 for open, the reference uses the same convention. Both make the input static per trial (same for all trials in a session).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly creates a zeros vector, sets blocked positions to 1.0, handles the -1 case by filtering negative indices, and copies the vector for each trial."
+    },
+    "4-a": {
+        "question": "What variables in the raw data is `output` *Mouse position* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions derive the output from the position field containing 2D head coordinates in cm.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly accesses the position data and passes it through the discretization pipeline."
+    },
+    "4-b": {
+        "question": "What processing is involved in computing `output` *Mouse position*?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "Both discretize into a 3x3 grid. The AI first average-pools position over 3 frames (matching the neural temporal binning), then uses floor(pos/25) with clipping, and reassigns blocked-partition samples to the nearest open partition. The reference uses np.digitize with np.linspace edges and np.clip, without temporal binning or blocked-partition handling. The AI's approach is more thorough: the temporal binning ensures alignment with the rebinned neural data, and the blocked-partition reassignment handles a real edge case in the data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The discretize_position function correctly implements floor division by PART_SIZE=25, clips to valid range, computes partition as N_GRID*yb + xb, and reassigns blocked-partition samples using nearest-neighbor Euclidean distance."
+    },
+    "4-c": {
+        "question": "How is `output` *Mouse position* thresholded into categories?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions use a 3x3 grid (9 categories) with 25 cm bin size. The AI uses floor(pos/25) and the reference uses np.digitize with linspace edges - both produce equivalent spatial bins. The AI additionally handles the edge case of positions in blocked partitions. The partition indexing convention (3*row + col) is consistent.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The discretization code correctly computes bin indices using floor division, clips to valid range [0,2], and combines into a single partition index."
+    },
+    "4-d": {
+        "question": "How is `output` *Mouse position* aligned with the neural data?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "Both solutions exploit the frame-aligned nature of the data (same frame rate for position and neural). The AI applies identical temporal binning to both streams (bin_time with the same bin edges) and uses the same speed-filtered bin indices to slice both. The reference splits both with the same trial indices. The AI's approach is better because the temporal rebinning ensures both streams are processed identically at 100 ms resolution.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses the same bin_time function and the same sel indices for both neural and output arrays within each trial, ensuring perfect alignment."
+    },
+    "5": {
+        "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI handles more edge cases than the reference: (1) NaN filtering for unregistered cells (both do this), (2) position boundary clipping at 75 cm (AI adds explicit clip, reference uses digitize which handles edges differently), (3) blocked-partition reassignment for ~14 frames (only AI), (4) trailing frames not divisible by 3 (only AI, due to rebinning), (5) partial last block retention (AI keeps it, reference discards remainder). The reference only handles NaN filtering and discards remainder frames.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "All edge case handling is correctly implemented: np.clip for boundary positions, np.isin for blocked partition detection, truncation to complete bins in bin_time, and partial block handling in the trial loop."
+    },
+    "6-a": {
+        "question": "What are the most time-consuming steps of the code?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions correctly identify file I/O as a major bottleneck. The AI additionally notes that Gaussian smoothing is the dominant per-session processing cost. The reference notes that loading .mat files via h5py is I/O bound. Both are correct assessments of their respective implementations.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The AI's code includes timing measurements (time.time()) that confirm the stated bottlenecks. The parallel processing of animals addresses the I/O bottleneck."
+    },
+    "6-b": {
+        "question": "What loops in the code could have been vectorized to improve efficiency?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions have minimal loops. The AI's main loop is the trial-cutting loop, which is difficult to fully vectorize due to variable-length output. The reference's split_into_trials uses list comprehension over trial indices. Both are reasonable. The AI's bin_time function is already fully vectorized using reshape-and-reduce.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The AI's binning operations are correctly vectorized. The remaining loops (over sessions, over trial blocks) involve inherently sequential operations or variable-length outputs."
+    },
+    "6-c": {
+        "question": "What processing does the code repeat multiple times?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI calls bin_time multiple times on different arrays (speed, position, events, smoothed neural), but each call processes a different signal or uses a different aggregation. The reference similarly applies split_into_trials to multiple arrays. Neither has truly redundant processing.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "Each bin_time call serves a distinct purpose and operates on different data, so the repetition is necessary rather than wasteful."
+    },
+    "6-d": {
+        "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions compute some metadata that is not used by the decoder. The AI computes cell_idx, n_blocked_fixed, and detailed session_info. The reference computes output_classes and blocked_str for printing. Neither does substantial unnecessary computation.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The diagnostic information (cell_idx, n_blocked_fixed) is correctly computed and stored in metadata without affecting the main processing pipeline."
+    }
 }

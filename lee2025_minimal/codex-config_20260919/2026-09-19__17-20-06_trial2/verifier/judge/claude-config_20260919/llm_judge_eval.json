@@ -1,0 +1,149 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The expert loads the seven Zenodo .mat files with h5py; the AI loads the seven joblib versions of the very same Zenodo release (the extension-less files in /app/data) with joblib, reading the same fields (trace, position, blocked, plus envs for provenance) and ignoring SFPs/centroids/maps exactly as the expert does. The repository README lists the joblib and .mat files as equivalent distributions, and the AI verified the contents match the paper's invariants (207 sessions, 69,744 session-cells, 7 animals), which are identical to what the expert's loader produces. The choice is arguably more natural for a Python pipeline since the joblib files unpack to plain ndarrays instead of HDF5 reference arrays. Two robustness caveats worth a human glance, neither of which changes the loaded data: the animal list is hard-coded rather than globbed, and the script hard-aborts if the session-neuron total is not exactly 69,744, so it cannot be run on a subset of the data.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code loads exactly the seven named joblib files, unwraps wrapped[animal], asserts day/frame consistency across trace and position, and frees each animal before the next. The verifier output (207 sessions, 7 subjects, 69,744 CA1 neurons) confirms all data were loaded as described."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical decision to the expert: one source file = one mouse, with the animal ID as the subject name, yielding the same 7 subjects (QLAK-CA1-08/30/50/51/56/74/75) and the same subject_idx mapping from sessions to animals. The only difference is mechanical: the expert globs the directory while the AI hard-codes the seven IDs (which also gives it the dict key needed to unwrap each joblib file). That is more brittle but produces the identical split, and the AI verified in the trajectory that the file name equals the inner dict key.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "enumerate(ANIMALS) supplies animal_index, which is appended to subject_idx once per recording day, and 'subjects' is the same ANIMALS list; the verifier reports 7 subjects with 31/31/31/21/31/31/31 sessions, matching the source files."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: each recording day inside an animal's file (the first axis of the trace/position arrays) becomes one session, giving 207 sessions in total. This matches the Methods ('All sessions were 40 min, and one session was recorded per day') and the paper's reported 207 sessions, and it keeps each geometry/cell-registration in its own session, which is required because neuron counts and blocked configurations differ per day. The AI additionally records the environment name and source day index in metadata['session_info'], which the expert does not, and which is useful provenance.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loop 'for day in range(traces.shape[0])' appends exactly one entry to neural/input/output/subject_idx/brain_region_idx per day; the verifier confirms 207 sessions distributed across animals exactly as the source files are."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Different mechanics, equally well justified. The expert cuts fixed 1800-frame (60 s) blocks and discards the remainder, which for the three animals with 71,866-frame recordings means only 39 trials and ~55 s of data dropped per session. The AI instead uses np.array_split into exactly 40 contiguous windows, so every frame is retained and every session has 40 trials, at the cost of trial lengths varying between 1,796 and 1,806 frames (59.87-60.20 s) rather than being exactly 1 minute. The instructions require a constant *time bin* size (33.33 ms, satisfied) and at least two trials per session (satisfied), not a constant trial length, and the supplied verifier reported no warnings. The reasoning is explicit in the trajectory ('avoids inventing a spurious 7-second 41st trial or discarding almost a minute from shorter recordings'). Net effect on dataset statistics is small (8,280 trials vs ~8,187 for the expert recipe); neither choice is clearly superior.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "split_trials applies np.array_split(..., 40) along the time axis to both neural and output with identical boundaries, and input is replicated 40 times; the verifier reports exactly 40 trials for each of the 207 sessions with T in [1796, 1806], matching the stated decision."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the expert, the AI applies no trial-level filtering: all 8,280 windows are kept, including stationary periods. This is well justified because the distributed data are already the authors' final curated product and the paper's trial-level screens (running-speed and >5-event thresholds) belong to its own within-session Bayesian decoder rather than to the data-preparation pipeline; the AI measured the effect of those screens (69,744 vs 68,862 session-cells) before explicitly declining them. The AI goes beyond the expert only by adding session-level abort guards (partially-NaN traces, non-binary traces, >5% of positions inside blocked cells), which are sanity checks that never trigger on this dataset rather than filters.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "No branch in convert() skips or drops a trial; every session contributes exactly N_TRIALS=40 entries and the guards raise rather than filter. The 8,280 emitted trials equal 207 x 40, confirming nothing was removed."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: neural data come solely from the 'trace' field, the authors' rise-extracted binarized calcium event vectors, which the README and Methods describe as the signal 'treated as the firing rate in all further analyses'. Other fields (SFPs, centroids, maps) are correctly not used for neural activity. The AI's description is slightly more precise than the expert's (which calls the traces 'deconvolved spikes' whereas they are in fact binarized transient rising phases; the paper notes deconvolution was only an alternative control).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "session_neural_full is built from traces = np.asarray(source['trace']) and nothing else; the code even asserts the values are still strictly 0/1, confirming the intended source variable was used."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same decision as the expert: no reprocessing of the signal at all. Rows for unregistered cells are removed, the array is cast to float32, and the (n_neurons, n_timepoints) orientation is produced (no transpose is needed for the joblib layout, whereas the expert must transpose the .mat layout). No smoothing, deconvolution, normalization or z-scoring is applied, which is the right reading of the paper, since the supplied binary rising-phase vector *is* the paper's firing-rate variable. The AI additionally validates that the data are still binary after selection, which is a cheap correctness check.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The only operations applied are boolean row selection, astype(np.float32) and the binary-value assertion; the output arrays are (n_neurons, T) as described, and the verifier reports 113-564 neurons per session with no value-range warnings."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: the only neuron-level curation is removal of cells not registered on a given day, identified by NaN traces, as documented in the README. The expert keeps a neuron if it is not all-NaN; the AI keeps a neuron only if its trace is entirely finite and explicitly verifies that the two criteria agree (no partially-NaN traces exist), so the resulting sets are provably identical. The AI further validated the result against the paper's reported 69,744 rate maps, and deliberately declined the paper's decoder-specific >5-event screen with a sound rationale. No place-cell or activity screen is applied by either solution, which is correct because the decoder should see the full recorded population.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "present = np.all(np.isfinite(day_trace), axis=1) selects the kept rows, brain_region_idx length equals present.sum(), and the run-level assertion confirmed the total is exactly 69,744, as the decision states."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Substantively the same as the expert: the paradigm is continuous free foraging with no stimulus event, so there is no event-based alignment; trials are arbitrary contiguous windows and the neural and behavioral streams, acquired simultaneously at 30 Hz by the same DAQ, are cut with identical boundaries. Where the expert simply answers 'N/A' and leaves the corresponding metadata fields out of the pickle, the AI documents the window onset as the nominal alignment event and fills the required metadata (temporal_alignment_event, off_start=0.0, off_end=60.0, task_description), which is what the target format asks for. off_end is nominal rather than exact for trials that are 1,796 or 1,806 frames long, a trivial inaccuracy.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Neural and output are split by the same split_trials call on arrays with asserted-equal frame counts, so per-trial timepoints correspond frame-for-frame; the metadata strings written match the description given."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: data are kept at the native 30 Hz acquisition rate with time_bin_size = 33.333 ms and no rebinning, downsampling or smoothing. This preserves the paper's representation exactly, and the AI explicitly considered and rejected downsampling after checking that the supplied decoder does no temporal binning itself and that the ~19 GiB result still trains on the available GPU. The consequence (a very large pickle) is the same for the expert solution, so it does not differentiate the two.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "No resampling operation appears anywhere in the script; frame counts per trial sum to the full source frame count per session, and metadata reports 1000/30 ms, consistent with the stated decision."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: the geometry input is derived from the per-day 'blocked' field, the IDs of occluded partitions on the 3x3 grid, with -1 as the sentinel for the open square. This is exactly the 'which parts of the arena are blocked' variable the instructions request. The AI also reads 'envs' but correctly uses it only as descriptive metadata rather than as a decoder input, which avoids leaking a redundant categorical label.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "geometry_vector(blocked[day]) is the sole source of the input arrays; envs is written only into metadata['session_info']. The verifier shows 9 input dimensions with 0/1 ranges matching the blocked configurations."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Environment geometry*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same encoding as the expert: a static 9-element multi-hot float vector per session (1 = blocked, 0 = accessible), all zeros for the unobstructed square, repeated for every trial of the session and indexed row-major consistently with the README's [[0,1,2],[3,4,5],[6,7,8]] layout. The AI did not merely assume the layout, it validated it against the tracking data (the alternative flattenings place 11-66% of position samples inside walls), which is stronger evidence than the expert provides, and it raises on out-of-range IDs. Names are per-cell (blocked_row_r_col_c) rather than blocked_0..8, which is cosmetic.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "geometry_vector filters the -1 sentinel, sets 1.0 at the blocked indices of a zeros(9) float32 vector, and the same vector is copied into all 40 trials; the verifier's per-input ranges (all [0,1] except the never-blocked centre-bottom cell) are consistent with the source blocked lists."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Mouse position* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: the output is derived exclusively from the 'position' field, the DeepLabCut head-tracking (x, y) coordinates in cm for each frame. The AI verified the coordinate range is [0, 75] on both axes and that all samples are finite before relying on it.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "discretize_position is called only on positions[day], with a shape check enforcing the (2, time) layout; no other field contributes to the output."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Mouse position*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: no processing of the coordinates beyond discretization, i.e. no smoothing, interpolation, speed filtering or rescaling, since the supplied tracking is already the paper's final frame-aligned output. The result is a single categorical, time-varying channel of shape (1, n_timepoints) at the native 30 Hz, which is what the instructions prefer ('If at all possible, make it time-varying').",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "discretize_position performs only floor/clip/flatten and adds a leading axis; output trials are (1, T) with T equal to the matching neural trial, as the verifier's dimension checks confirm (no errors or warnings)."
+  },
+  "4-c": {
+    "question": "How is `output` *Mouse position* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Functionally identical to the expert. The expert uses np.digitize with edges [25, 50] plus a clip; the AI uses floor(coord/25) plus a clip to [0, 2]. These produce the same 9 labels for every coordinate in [0, 75], including the boundary value of exactly 75.0 cm which both map into the last bin. Both flatten row-major as class = y_bin*3 + x_bin, giving the same 9 arena-referenced classes aligned with the blocked-partition IDs, and the AI additionally confirmed this convention empirically against the geometry. Class frequencies (0.057-0.201) reflect genuine occupancy and are handled by the decoder's balanced loss.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "bin_width = 75/3 = 25, xy = clip(floor(position/25), 0, 2), location = xy[1]*3 + xy[0]; the verifier reports the output range as [0, 8] with all nine classes present, matching the described 3x3 thresholding and the output_values names."
+  },
+  "4-d": {
+    "question": "How is `output` *Mouse position* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: the two streams were acquired simultaneously at 30 Hz by the same DAQ and are supplied with identical frame counts, so they are aligned frame-for-frame and are cut with the same trial boundaries; no shift or resampling is applied. The AI adds an explicit assertion that trace and position have matching day and frame dimensions, and an independent cross-check that discretized positions essentially never fall inside declared walls, which is a genuinely informative test of alignment and of the coordinate convention that the expert does not perform.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The same split_trials(..., 40) partition is applied to neural and output arrays whose time dimensions were asserted equal, so per-trial timepoint counts match; the verifier's neural/input/output time-dimension consistency checks passed with no errors."
+  },
+  "5": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The core handling matches the expert: NaN traces for cells not registered on a day are dropped, and nothing else in the source is treated as missing (the AI confirmed no NaNs in the position stream). The AI handles the remaining edge cases at least as carefully and arguably better: it verifies NaN-ness is whole-trace rather than partial, absorbs the ragged 71,866-72,219 frame lengths with array_split instead of discarding up to ~55 s per session as the expert does, clips the exact 75.0 cm boundary samples into the last bin, and, for the handful of tracking samples that fall inside nominally blocked partitions (2 frames in one animal; 0.59% in one 'bit donut' session), retains them unaltered while recording the count per session in metadata. Investigating that anomaly before deciding, rather than silently deleting or relocating frames, is exactly the right instinct since deleting frames would break frame alignment. The only soft spot is the arbitrary 5% abort threshold, which is documented and never fires.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each described behaviour is implemented: the finite_any/finite_all equality check, present-based row selection, np.clip in discretize_position, the counted-but-retained blocked_position_samples with the 5% guard, and trial_lengths/blocked_position_samples in session_info. The verifier found no NaN/Inf and no format warnings."
+  },
+  "6-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same conclusion as the expert (loading the large source files dominates and is I/O bound), and the AI's own code makes the picture slightly fuller: in addition to the 9-32 s joblib loads per animal, the 18.8 GiB pickle write and the full-array passes over each day's trace (two isfinite reductions, the float32 copy, the binary check, and the ascontiguousarray copies) are the real costs, while discretization and geometry encoding are negligible. Total runtime was ~3 minutes, so none of this is a practical problem. The AI did bound peak memory with per-animal del/gc.collect() and wrote the pickle atomically.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The observed runtime profile in the trajectory (per-animal load times, then a single large write) is consistent with this characterization; no hidden expensive computation exists in the script."
+  },
+  "6-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answers N/A, and the AI's code is in essentially the same position: the per-animal and per-day loops are inherent to the ragged structure (different registered cells and geometry per day) and already operate on whole arrays. Two trivially avoidable loops exist in the AI's code that are absent from the expert's: 40 separate geometry.copy() calls per session (8,280 nine-element arrays where one shared array would do) and two separate full isfinite reductions where one pass would suffice. Both are negligible against the I/O cost, so this is a minor, well-tolerated inefficiency rather than a wrong decision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops described are exactly those present in the script (the per-animal/per-day loops, the 40-element list comprehension for inputs, and the trial_lengths comprehension); the code does what the analysis says it does."
+  },
+  "6-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert reports no repeated processing; the AI's code does repeat several full passes over the largest arrays: np.isfinite is computed twice per session, the 0/1 validity check re-scans the already-copied session trace and allocates two full-size boolean temporaries, the day trace is materialized twice (float32 copy, then ascontiguousarray per chunk), and present.sum() is computed twice. These are deliberate defensive checks rather than accidental duplication, and they cost a small fraction of the load/write time, so the choice is defensible even though it is measurably less lean than the expert's. Worth a human's awareness mainly because the duplicate ascontiguousarray materialization raises peak RAM on an already 19 GiB dataset.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each repeated operation cited appears verbatim in convert()/split_trials, and the script's stated purpose for them (validation and contiguity) is what the code implements."
+  },
+  "6-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert reports none; the AI's script performs a set of computations whose results never reach the decoder: the full-dataset binary-value and partial-NaN checks, the per-session blocked-position audit and its 5% guard, the 69,744-neuron assertion, the session_info bookkeeping (trial_lengths for all 8,280 trials, environment, n_source_frames), and the ascontiguousarray copies of every chunk. This is strictly more work than the expert does, but it is purposeful validation of the one genuinely ambiguous choice in the conversion (the x/y flattening convention) plus useful provenance, and its cost is small relative to loading and writing. It is a reasonable trade rather than waste, though the hard-coded 69,744 assertion is brittle: it would abort the script on any subset of the data even though nothing would actually be wrong.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "All of the cited computations exist in the code and their outputs are either only asserted on or only stored in metadata, exactly as described; none of them modifies the neural, input or output arrays."
+  }
+}

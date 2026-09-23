@@ -2,228 +2,309 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent discovers local `behavior_ophys_experiment_*.nwb` files, joins their IDs to `ophys_experiment_table.csv`, removes passive rows, and reads the NWBs directly with `h5py`. It does not filter `project_code` to `VisualBehavior`, so the supplied `VisualBehaviorMultiscope` files are also included.
+i. The AI loads local Allen release files directly from `/app/data/visual-behavior-ophys-1.1.0` using `h5py` and `pandas`, not the Allen SDK cache. It discovers experiment NWBs by globbing `behavior_ophys_experiment_*.nwb`, reads `project_metadata/ophys_experiment_table.csv`, keeps rows whose `ophys_experiment_id` has a local NWB file, drops rows marked `passive`, and later reads each session's NWB content directly from disk.
 
 ii.
 ```python
-files = {_experiment_id(path): path for path in sorted(
-    experiment_dir.glob("behavior_ophys_experiment_*.nwb"))}
+files = {
+    _experiment_id(path): path
+    for path in sorted(experiment_dir.glob("behavior_ophys_experiment_*.nwb"))
+}
+...
 table = pd.read_csv(metadata_path)
 table = table[table["ophys_experiment_id"].isin(files)].copy()
 table = table[~table["passive"].astype(bool)].copy()
 ```
 
-iii. The trajectory says the local bundle contains the experiment NWBs and metadata, and favors direct, reproducible local loading. It explicitly regards passive sessions as lacking the requested Go/Catch population. It does not justify including both project codes.
+iii. In the trajectory, the AI justified this as working from the supplied local NWB bundle and project metadata, noting the bundle contained 284 NWBs and that it was choosing a direct NWB-based pipeline rather than relying on the SDK cache. It also said it was resolving how simultaneous experiments should be combined into sessions.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subjects are the sorted unique `mouse_id` values among retained session groups, converted to strings; each session receives the corresponding integer index.
+i. Subjects are defined as unique `mouse_id` values taken from the metadata rows of retained sessions, converted to sorted strings.
 
 ii.
 ```python
 subjects = sorted({str(int(g.iloc[0]["mouse_id"])) for _, g in grouped})
 subject_to_idx = {subject: idx for idx, subject in enumerate(subjects)}
+...
+mouse_id = str(int(experiments.iloc[0]["mouse_id"]))
 subject_idx.append(subject_to_idx[mouse_id])
 ```
 
-iii. No separate rationale was recorded; the implementation uses the metadata's animal identifier, as expected.
+iii. The trajectory did not add a separate justification beyond treating `mouse_id` as the session's animal identifier.
 
 ## 1-c. How are the data split into sessions?
 
-i. Rows are grouped by `ophys_session_id`; all experiment planes in a group are combined into one session and sorted deterministically by session and experiment ID.
+i. Sessions are defined by `ophys_session_id`. All experiments sharing one `ophys_session_id` are grouped together and treated as simultaneous planes within one recording session.
 
 ii.
 ```python
 table.sort_values(["ophys_session_id", "ophys_experiment_id"], inplace=True)
+...
 for session_id, experiments in table.groupby("ophys_session_id", sort=True):
-    grouped.append((int(session_id), experiments.copy()))
+    ...
+grouped.append((int(session_id), experiments.copy()))
 ```
 
-iii. The trajectory explicitly identifies experiments sharing an `ophys_session_id` as simultaneous planes and says they should be merged.
+iii. The AI explicitly justified this in the trajectory: it said simultaneous multi-plane sessions should be merged by `ophys_session_id`, and later repeated that experiments sharing an `ophys_session_id` were concatenated as neurons in one recording session.
 
 ## 1-d. How are the data split into trials?
 
-i. Trial IDs come from `intervals/trials`. Within each retained trial, timepoints are the chronologically sorted active rows in the natural-image presentation table whose `trials_id` matches that trial. Thus a trial is a variable-length sequence of 750 ms presentation intervals, rather than all native ophys frames from trial start to stop.
+i. The AI first selects retained NWB trials from `intervals/trials`, but it does not use the full `start_time` to `stop_time` window as the trial signal. Instead, each retained trial is represented as the ordered sequence of active stimulus presentations belonging to that trial. Each timepoint in the saved trial is therefore one 750 ms image-presentation interval rather than one ophys frame.
 
 ii.
+```python
+def _eligible_trial_ids(nwb: h5py.File) -> tuple[np.ndarray, np.ndarray]:
+    trials = nwb["intervals/trials"]
+    keep = (
+        (trials["go"][:] | trials["catch"][:])
+        & ~trials["aborted"][:]
+        & ~trials["auto_rewarded"][:]
+    )
+    trial_ids = trials["id"][:][keep].astype(np.int64)
+```
+
 ```python
 for trial_id in trial_ids:
     idx = np.flatnonzero((source_trial_ids == trial_id) & active)
-    idx = idx[np.argsort(starts_source[idx])]
+    ...
     row_groups.append(np.arange(cursor, cursor + len(idx), dtype=np.int64))
 ```
 
-iii. The agent states that the paper's analysis unit is the 750 ms image-presentation interval and chose that cadence to match published processing and avoid assigning higher-resolution labels during gray periods.
+iii. The trajectory gives the clearest justification here. The AI said the “actual analysis unit” was the 750 ms image-presentation interval, that each trial should become a variable-length sequence of flashes, and that this would avoid “inventing a higher-resolution label during the gray portion.”
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Only Go or Catch trials are kept, with aborted and auto-rewarded trials removed. Outcomes must be exactly one-hot, retained trials must have an active presentation, and sessions need at least two eligible trials and usable pupil data. Passive sessions are removed earlier.
+i. The AI keeps only Go or Catch trials that are not aborted and not auto-rewarded. It also requires each retained trial to map to exactly one of the four outcome columns, requires at least one active stimulus presentation for each retained trial, and drops sessions with fewer than two eligible trials. Separately, it excludes sessions missing usable pupil data before trial extraction.
 
 ii.
 ```python
-keep = ((trials["go"][:] | trials["catch"][:])
-        & ~trials["aborted"][:] & ~trials["auto_rewarded"][:])
+keep = (
+    (trials["go"][:] | trials["catch"][:])
+    & ~trials["aborted"][:]
+    & ~trials["auto_rewarded"][:]
+)
+...
 if not np.all(outcomes.sum(axis=1) == 1):
     raise RuntimeError("Every retained trial must have exactly one trial outcome")
-if len(trial_ids) < 2:
-    ...
 ```
 
-iii. Go/Catch inclusion and aborted/auto-reward exclusion follow the task. The trajectory says sessions without eye tracking were excluded because pupil diameter would be undefined, and confirms the two-trial minimum.
+```python
+if pupil_path not in nwb:
+    excluded.append({...})
+    continue
+if np.isfinite(nwb[pupil_path][:]).sum() < 2:
+    excluded.append({...})
+    continue
+...
+if len(trial_ids) < 2:
+    excluded.append({...})
+    continue
+```
+
+iii. The AI explicitly justified excluding aborted and auto-rewarded trials and requiring Go/Catch trials. It also said three active sessions were excluded because they had no eye-tracking stream, making the required pupil output undefined.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural data comes from each NWB's inferred calcium-event timestamps and event magnitudes at `processing/ophys/event_detection/{timestamps,data}`.
+i. The saved `neural` data is derived from NWB `processing/ophys/event_detection/data` with corresponding `processing/ophys/event_detection/timestamps`, not from `dff_traces`.
 
 ii.
 ```python
-event_detection = nwb["processing/ophys/event_detection"]
-timestamps = event_detection["timestamps"][:]
-aggregated = _interval_sums(timestamps, event_detection["data"], starts)
+with h5py.File(files[experiment_id], "r") as nwb:
+    event_detection = nwb["processing/ophys/event_detection"]
+    timestamps = event_detection["timestamps"][:]
+    aggregated = _interval_sums(timestamps, event_detection["data"], starts)
 ```
 
-iii. The trajectory calls use of SDK-provided inferred calcium events a key modeling choice based on the paper and methods, instead of raw dF/F.
+iii. The trajectory explicitly justified this choice: the AI said a “key modeling choice” was to use inferred calcium events rather than raw `ΔF/F`.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Event magnitudes are summed over each half-open 750 ms presentation interval with prefix sums. Time-by-cell results from simultaneous planes are concatenated across cells, then each trial is transposed to neuron-by-time.
+i. Neural event magnitudes are summed within each 750 ms presentation interval using prefix sums, separately for each plane. The per-plane interval matrices are then concatenated across neurons so one session contains all neurons from all planes.
 
 ii.
 ```python
+prefix = np.empty((len(event_data) + 1, event_data.shape[1]), dtype=np.float32)
+prefix[0] = 0.0
 np.cumsum(event_data, axis=0, dtype=np.float32, out=prefix[1:])
-return prefix[right] - prefix[left]
-activity = np.concatenate(plane_activity, axis=1)
-session_neural.append(np.ascontiguousarray(activity[rows].T, dtype=np.float32))
-```
-
-iii. The agent says aggregation at the native task cadence follows the paper and materially reduces the otherwise large frame-level output.
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. There is no explicit cell-level filtering beyond using the NWB event-detection arrays. Sessions with unusable pupil streams or fewer than two eligible trials are excluded, but sparse or all-zero trial matrices remain.
-
-ii.
-```python
-aggregated = _interval_sums(timestamps, event_detection["data"], starts)
-plane_activity.append(aggregated)
-```
-
-iii. The agent relied on released event-detection data. After validation, it characterized all-zero trial warnings as expected for sparse inferred events rather than grounds for filtering.
-
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
-
-i. Every neural sample is aligned to the start of an active image presentation belonging to the trial; plane-specific ophys timestamps delimit `[start, start + 0.75 s)`.
-
-ii.
-```python
 left = np.searchsorted(timestamps, starts, side="left") - first
 right = np.searchsorted(timestamps, starts + BIN_SECONDS, side="left") - first
 return prefix[right] - prefix[left]
 ```
 
-iii. The trajectory justifies presentation-start alignment as the paper's analysis unit and as a common ophys-timestamp alignment for all streams.
+```python
+plane_activity.append(aggregated)
+...
+activity = np.concatenate(plane_activity, axis=1)
+...
+session_neural.append(np.ascontiguousarray(activity[rows].T, dtype=np.float32))
+```
+
+iii. The AI justified this by saying calcium-event magnitudes should be aggregated over the native 750 ms image-presentation interval, matching the cadence it inferred from the paper.
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. There is no explicit neuron-level or trace-level quality filtering in the script. All cells present in `event_detection/data` for retained experiments are included. Quality control is applied only at the session/trial level.
+
+ii.
+```python
+for experiment_id, region in zip(
+    experiment_ids, experiments["targeted_structure"].astype(str)
+):
+    with h5py.File(files[experiment_id], "r") as nwb:
+        event_detection = nwb["processing/ophys/event_detection"]
+        ...
+    plane_activity.append(aggregated)
+```
+
+iii. The trajectory did not give a separate neuron-QC justification beyond reporting that all-zero intervals were expected for sparse event traces and were not treated as a formatting failure.
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Neural data is aligned to the start of each 750 ms active stimulus-presentation interval, not to trial start and not kept at per-frame resolution. The interval starts come from the natural-image presentation table.
+
+ii.
+```python
+starts_source = presentations["start_time"][:]
+...
+left = np.searchsorted(timestamps, starts, side="left") - first
+right = np.searchsorted(timestamps, starts + BIN_SECONDS, side="left") - first
+```
+
+iii. The AI explicitly justified this as aligning all streams to the “start of each 750 ms image-presentation interval.”
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The converted resolution is 750 ms. Native event samples are explicitly rebinned by summing them within each presentation-plus-gray interval.
+i. The converted data uses 750 ms bins. The code rebins neural and behavioral streams from their native timestamps into one value per 750 ms presentation interval.
 
 ii.
 ```python
 BIN_SECONDS = 0.750
+...
 "time_bin_size": BIN_SECONDS * 1000.0,
 ```
 
-iii. The agent says 750 ms represents a 250 ms image plus 500 ms gray interval and matches the paper's native task cadence, including omissions.
+```python
+aggregated = _interval_sums(timestamps, event_detection["data"], starts)
+running_values = _interval_means(reference_ts, running_at_ophys, starts)
+pupil_values = _interval_means(reference_ts, pupil_at_ophys, starts)
+```
+
+iii. The trajectory repeatedly justified this as adopting the “native task cadence” of one 250 ms image plus 500 ms gray period.
 
 ## 3-a. What variables in the raw data is `output` *Image identity* derived from?
 
-i. It is derived directly from `image_name` in the detected natural-image presentation table, restricted by that table's `active` and `trials_id` fields.
+i. `Image identity` is derived from the natural-image presentation table’s `image_name` field, not from `initial_image_name` and `change_image_name` in the trials table.
 
 ii.
 ```python
+presentations = _presentation_group(nwb)
+...
 names_source = np.asarray(_decode_strings(presentations["image_name"][:]), dtype=object)
-idx = np.flatnonzero((source_trial_ids == trial_id) & active)
-names.append(names_source[idx])
 ```
 
-iii. The agent chose the presentation table because it supplies direct stimulus labels at the selected analysis cadence.
+iii. The AI justified this by saying stimulus labels should come directly from the presentation table at the same 750 ms cadence used for neural aggregation.
 
 ## 3-b. What processing is involved in computing `output` *Image identity*?
 
-i. Unique real image names are sorted globally and omissions, if present, are appended as a separate category. Names are then mapped to integer codes.
+i. The script decodes NWB string values, gathers all presentation `image_name` values across retained sessions, sorts real image labels, optionally appends `"omitted"` as a separate final category, and maps each presentation label to an integer code.
 
 ii.
 ```python
 real_images = sorted(name for name in image_names if name != "omitted")
 image_values = real_images + (["omitted"] if "omitted" in image_names else [])
 image_to_code = {name: idx for idx, name in enumerate(image_values)}
+...
+image_codes = np.asarray([image_to_code[name] for name in names], dtype=np.int16)
 ```
 
-iii. The trajectory says omissions are genuine 750 ms task intervals, and the code comment emphasizes stable global string identifiers and a dedicated omission class.
+iii. The AI explicitly justified treating omissions as their own image-identity category and said this matched the 750 ms omission intervals in the paper’s analysis cadence.
 
 ## 3-c. How is `output` *Image identity* aligned with the neural data?
 
-i. The same concatenated presentation rows index image codes and aggregated neural activity within each trial.
+i. Image identity is aligned one-to-one with the same presentation intervals used for neural aggregation. Each saved neural time bin has one corresponding image code from the same `rows` slice.
 
 ii.
 ```python
-image_codes = np.asarray([image_to_code[name] for name in names], dtype=np.int16)
-session_neural.append(activity[rows].T)
-session_output.append(np.vstack([image_codes[rows], ...]))
+for rows, outcome in zip(row_groups, trial_outcomes):
+    ...
+    session_neural.append(np.ascontiguousarray(activity[rows].T, dtype=np.float32))
+    session_output.append(np.vstack([
+        image_codes[rows],
+        changes[rows],
+        ...
+    ]).astype(np.int16, copy=False))
 ```
 
-iii. The shared presentation-row indexing was intended to guarantee exact alignment.
+iii. The AI justified this as avoiding any mismatch between neural bins and stimulus labels by using the same presentation intervals for both.
 
 ## 4-a. What variables in the raw data is `output` *Image change* derived from?
 
-i. Image change is taken directly from the presentation table's boolean `is_change` column.
-
-ii.
-```python
-changes_source = presentations["is_change"][:].astype(bool)
-changes.append(changes_source[idx])
-```
-
-iii. The agent preferred the SDK presentation label over reconstructing changes from trial timing.
-
-## 4-b. What processing is involved in computing `output` *Image change*?
-
-i. The boolean labels are concatenated and cast to 0/1 `int16`; no additional temporal expansion is performed.
-
-ii.
-```python
-np.concatenate(changes).astype(np.int16)
-```
-
-iii. At 750 ms resolution, one presentation row already represents the flash and following gray interval, so the agent considered a separate window construction unnecessary.
-
-## 4-c. How is `output` *Image change* thresholded into categories?
-
-i. No numeric threshold is estimated. The source boolean is encoded directly as `0 = no_change`, `1 = change`.
+i. `Image change` is derived from the presentation table’s `is_change` flag, which marks whether each active presentation is a true image change.
 
 ii.
 ```python
 changes_source = presentations["is_change"][:].astype(bool)
 ...
-["no_change", "change"],
+np.concatenate(changes).astype(np.int16)
 ```
 
-iii. The NWB already provides the categorical change flag.
+iii. The AI said “stimulus/change labels come directly from the SDK’s presentation table,” which is the recorded justification for using presentation-level change annotations.
 
-## 4-d. How is `output` *Image change* aligned with the neural data?
+## 4-b. What processing is involved in computing `output` *Image change*?
 
-i. Change flags and neural sums use the same presentation starts and `rows` for each trial.
+i. The code does almost no additional processing: it casts the presentation-table `is_change` values to integers, concatenates them in retained-trial order, and slices them by each trial’s presentation indices.
 
 ii.
 ```python
-session_output.append(np.vstack([image_codes[rows], changes[rows], ...]))
+changes.append(changes_source[idx])
+...
+return (
+    np.concatenate(starts).astype(np.float64),
+    row_groups,
+    np.concatenate(names),
+    np.concatenate(changes).astype(np.int16),
+)
 ```
 
-iii. This follows directly from adopting presentation intervals as shared time bins.
+iii. The trajectory indicates the AI wanted change labels “directly” from the presentation table at the same cadence as the saved samples.
+
+## 4-c. How is `output` *Image change* thresholded into categories?
+
+i. It is treated as an already-binary variable with categories `0 = no_change` and `1 = change`. No further thresholding is applied.
+
+ii.
+```python
+"output_values": [
+    image_values,
+    ["no_change", "change"],
+    ...
+]
+```
+
+iii. The trajectory did not add any separate thresholding justification beyond treating `is_change` as the native binary label.
+
+## 4-d. How is `output` *Image change* aligned with the neural data?
+
+i. Image change uses the same presentation-interval indexing as the neural data. Each neural interval bin receives the corresponding `is_change` value for that presentation.
+
+ii.
+```python
+session_neural.append(np.ascontiguousarray(activity[rows].T, dtype=np.float32))
+session_output.append(np.vstack([
+    image_codes[rows],
+    changes[rows],
+    running_codes[rows],
+    pupil_codes[rows],
+    ...
+]))
+```
+
+iii. The AI justified this through the same presentation-interval alignment argument it used for image identity and neural activity.
 
 ## 5-a. What variables in the raw data is `output` *Running speed* derived from?
 
-i. It uses processed running-wheel speed and timestamps from `processing/running/speed/{data,timestamps}`.
+i. Running speed is derived directly from NWB `processing/running/speed/data` and `processing/running/speed/timestamps`.
 
 ii.
 ```python
@@ -231,48 +312,58 @@ running_ts = nwb["processing/running/speed/timestamps"][:]
 running_raw = nwb["processing/running/speed/data"][:]
 ```
 
-iii. No specific rationale beyond using the released processed behavioral stream was recorded.
+iii. The trajectory did not add a separate running-specific justification beyond aligning behavioral streams to ophys timestamps.
 
 ## 5-b. What processing is involved in computing `output` *Running speed*?
 
-i. Finite speed samples are linearly interpolated to reference ophys timestamps, averaged over each 750 ms presentation interval using prefix sums, and discretized using within-session quintile boundaries.
+i. Running speed is linearly interpolated to the ophys event timestamp grid, averaged over each 750 ms presentation interval, and then converted to discrete quintile codes.
 
 ii.
 ```python
 running_at_ophys = _interpolate_finite(running_ts, running_raw, reference_ts)
 running_values = _interval_means(reference_ts, running_at_ophys, starts)
+...
 running_codes, running_edges = _quintile_codes(running_values)
 ```
 
-iii. The agent sought a common ophys clock and categorical labels at the same 750 ms resolution. The metadata explicitly records within-session 20/40/60/80 percentiles.
+iii. The metadata and trajectory justify this as aligning behavior to the same ophys-timestamp presentation intervals used everywhere else.
 
 ## 5-c. How is `output` *Running speed* thresholded into categories?
 
-i. Four within-session quantiles (20%, 40%, 60%, 80%) define five categories; `searchsorted(..., side="right")` assigns codes 0–4.
+i. Running speed is thresholded into five within-session quintile bins using the 20th, 40th, 60th, and 80th percentiles of the retained interval-mean running values from that session.
 
 ii.
 ```python
-edges = np.quantile(values, [0.2, 0.4, 0.6, 0.8])
-codes = np.searchsorted(edges, values, side="right").astype(np.int16)
+def _quintile_codes(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    edges = np.quantile(values, [0.2, 0.4, 0.6, 0.8])
+    codes = np.searchsorted(edges, values, side="right").astype(np.int16)
+    return codes, edges
 ```
 
-iii. Quintiles satisfy the requested five equal-percentile bins; no rationale was given for choosing per-session rather than global thresholds.
+iii. The only explicit justification appears in metadata, which says running speed uses within-session percentile boundaries over retained intervals.
 
 ## 5-d. How is `output` *Running speed* aligned with the neural data?
 
-i. Speed is interpolated to the representative experiment's ophys timestamps and averaged over the exact presentation starts used for neural event aggregation.
+i. Running speed is first interpolated to the ophys timestamp reference used for the session, then averaged over the same presentation intervals used to aggregate neural events. The resulting interval values are sliced with the same `rows` indices as the neural data.
 
 ii.
 ```python
 running_at_ophys = _interpolate_finite(running_ts, running_raw, reference_ts)
 running_values = _interval_means(reference_ts, running_at_ophys, starts)
+...
+session_output.append(np.vstack([
+    image_codes[rows],
+    changes[rows],
+    running_codes[rows],
+    ...
+]))
 ```
 
-iii. The trajectory states that all streams are aligned through ophys timestamps.
+iii. The metadata states that behavioral streams were “linearly interpolated to ophys timestamps, then averaged per interval.”
 
 ## 6-a. What variables in the raw data is `output` *Pupil diameter* derived from?
 
-i. It uses eye-tracking pupil ellipse `width` and its timestamps at `acquisition/EyeTracking/pupil_tracking`.
+i. Pupil diameter is derived from NWB `acquisition/EyeTracking/pupil_tracking/width` and its `timestamps`.
 
 ii.
 ```python
@@ -280,138 +371,201 @@ pupil = nwb["acquisition/EyeTracking/pupil_tracking"]
 pupil["timestamps"][:], pupil["width"][:]
 ```
 
-iii. The code identifies width as the pupil-diameter proxy; NaNs are understood as blink-marked frames from the Allen pipeline.
+iii. The trajectory justified excluding sessions without this stream because pupil diameter was a required decoder output.
 
 ## 6-b. What processing is involved in computing `output` *Pupil diameter*?
 
-i. Nonfinite samples are excluded, the remaining widths are linearly interpolated to ophys timestamps (thereby bridging blinks), averaged per 750 ms interval, and categorized by within-session quintiles.
+i. The script uses only finite pupil samples, linearly interpolates pupil width to the ophys event timestamp grid, averages it over each 750 ms presentation interval, and discretizes the resulting interval means into quintile codes.
 
 ii.
 ```python
 pupil_at_ophys = _interpolate_finite(
-    pupil["timestamps"][:], pupil["width"][:], reference_ts)
+    pupil["timestamps"][:], pupil["width"][:], reference_ts
+)
 pupil_values = _interval_means(reference_ts, pupil_at_ophys, starts)
+...
 pupil_codes, pupil_edges = _quintile_codes(pupil_values)
 ```
 
-iii. The helper docstring says interpolation over finite samples supplies labels without treating blink frames as real measurements.
+iii. The metadata says pupil diameter was “blink-filtered pupil ellipse width linearly interpolated to ophys timestamps, then averaged per interval,” although the actual code only filters to finite values rather than reading a separate blink flag.
 
 ## 6-c. How is `output` *Pupil diameter* thresholded into categories?
 
-i. Four within-session quantiles define five percentile categories, assigned with right-sided `searchsorted`.
+i. Pupil diameter is thresholded into five within-session quintile bins using the 20th, 40th, 60th, and 80th percentiles of retained interval-mean pupil width values.
 
 ii.
 ```python
-edges = np.quantile(values, [0.2, 0.4, 0.6, 0.8])
-codes = np.searchsorted(edges, values, side="right").astype(np.int16)
+running_codes, running_edges = _quintile_codes(running_values)
+pupil_codes, pupil_edges = _quintile_codes(pupil_values)
 ```
 
-iii. Quintiles implement the requested five equal-percentile bins; the session-local scope is recorded in metadata but not otherwise defended.
+iii. The explicit justification is only in metadata, which says pupil diameter uses within-session percentile boundaries over retained intervals.
 
 ## 6-d. How is `output` *Pupil diameter* aligned with the neural data?
 
-i. Pupil width is interpolated onto reference ophys timestamps and averaged over the same presentation intervals used for neural activity.
+i. Pupil diameter is aligned exactly like running speed: interpolate to the ophys reference timestamps, average within the same 750 ms presentation intervals, then index those interval-level codes with the same `rows` used for neural bins.
 
 ii.
 ```python
-pupil_at_ophys = _interpolate_finite(..., reference_ts)
+pupil_at_ophys = _interpolate_finite(
+    pupil["timestamps"][:], pupil["width"][:], reference_ts
+)
 pupil_values = _interval_means(reference_ts, pupil_at_ophys, starts)
+...
+session_output.append(np.vstack([
+    ...,
+    pupil_codes[rows],
+    ...
+]))
 ```
 
-iii. The agent intended the common ophys timebase and interval starts to guarantee alignment.
+iii. The AI used the same interval-alignment rationale for all behavioral outputs.
 
 ## 7-a. What variables in the raw data is `output` *Trial outcome* derived from?
 
-i. It is derived from the trial-table booleans `hit`, `miss`, `false_alarm`, and `correct_reject`.
+i. Trial outcome is derived from the boolean NWB trial columns `hit`, `miss`, `false_alarm`, and `correct_reject`.
 
 ii.
 ```python
 OUTCOME_COLUMNS = ("hit", "miss", "false_alarm", "correct_reject")
+...
 outcomes = np.column_stack([trials[name][:][keep] for name in OUTCOME_COLUMNS])
 ```
 
-iii. These are the canonical mutually exclusive outcomes; the code verifies exactly one is set for every retained trial.
+iii. The trajectory did not add a separate justification, but the code assumes these four columns are the canonical mutually exclusive trial outcomes.
 
 ## 7-b. What processing is involved in computing `output` *Trial outcome*?
 
-i. `argmax` converts the verified one-hot row to codes 0–3, and that static trial code is repeated across all presentation bins in the trial.
+i. The four booleans are stacked per retained trial, checked to ensure exactly one is true, converted to integer class labels by `argmax`, and then repeated across all saved presentation bins within that trial.
 
 ii.
 ```python
-trial_outcomes = outcomes.argmax(axis=1).astype(np.int16)
-np.full(timepoints, outcome, dtype=np.int16)
+outcomes = np.column_stack([trials[name][:][keep] for name in OUTCOME_COLUMNS])
+if not np.all(outcomes.sum(axis=1) == 1):
+    raise RuntimeError("Every retained trial must have exactly one trial outcome")
+return trial_ids, outcomes.argmax(axis=1).astype(np.int16)
 ```
 
-iii. Repetition makes the static target compatible with the output matrix's common time dimension; the trajectory's custom validation checks it remains constant.
+```python
+for rows, outcome in zip(row_groups, trial_outcomes):
+    ...
+    np.full(timepoints, outcome, dtype=np.int16),
+```
+
+iii. The recorded justification is implicit: the AI treated trial outcome as a static per-trial label that should be copied across the saved bins of that trial.
 
 ## 8. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Sessions lacking pupil width, with fewer than two finite pupil samples, or fewer than two eligible trials are excluded and logged. Behavioral nonfinite values are removed before interpolation, and streams with fewer than two finite samples raise an error. Missing active presentations, ambiguous presentation tables, empty intervals, and invalid outcome rows also raise errors. Output is written atomically through a temporary file.
+i. Missing pupil data is handled by excluding the session entirely if pupil tracking is absent or has fewer than two finite samples. Within usable sessions, missing samples are handled by interpolating only over finite values with `np.interp`, which also extrapolates boundary values. The code raises runtime errors if a retained trial has no active presentations or if an interval would contain zero ophys timestamps.
 
 ii.
 ```python
-if pupil_path not in nwb: excluded.append(...); continue
-if np.isfinite(nwb[pupil_path][:]).sum() < 2: excluded.append(...); continue
-finite = np.isfinite(source_timestamps) & np.isfinite(source_values)
-if finite.sum() < 2: raise RuntimeError(...)
-os.replace(temporary, output_path)
+if pupil_path not in nwb:
+    excluded.append({...})
+    continue
+if np.isfinite(nwb[pupil_path][:]).sum() < 2:
+    excluded.append({...})
+    continue
 ```
 
-iii. The trajectory explicitly says missing eye tracking makes a required target undefined, so those sessions are omitted. It otherwise favors failing loudly on structural inconsistencies rather than silently inventing labels.
+```python
+finite = np.isfinite(source_timestamps) & np.isfinite(source_values)
+if finite.sum() < 2:
+    raise RuntimeError("Behavioral stream has fewer than two finite samples")
+return np.interp(
+    target_timestamps,
+    source_timestamps[finite],
+    source_values[finite],
+)
+```
+
+iii. The trajectory explicitly justified dropping three sessions with no eye-tracking stream because otherwise the required pupil-diameter target would be undefined.
 
 ## 9-a. What are the most time-consuming steps of the code?
 
-i. Reading large event-detection slices from every NWB and aggregating them is the principal I/O/computation cost; serially iterating 171 sessions and their planes dominates conversion.
+i. The most time-consuming steps are the repeated large NWB reads and the per-session aggregation work: scanning session metadata, opening representative NWBs to test inclusion and collect presentation labels, reopening them for running/pupil streams, and opening every plane’s event-detection matrix to aggregate interval sums.
 
 ii.
 ```python
-values.read_direct(event_data, source_sel=np.s_[first:last, :])
-np.cumsum(event_data, axis=0, dtype=np.float32, out=prefix[1:])
+for session_id, experiments in table.groupby("ophys_session_id", sort=True):
+    representative = files[int(experiments.iloc[0]["ophys_experiment_id"])]
+    with h5py.File(representative, "r") as nwb:
+        ...
 ```
 
-iii. The trajectory inspected the 247 GB local bundle and estimated output size before choosing interval aggregation, indicating that full neural-array I/O and volume were the main performance concerns.
+```python
+for experiment_id, region in zip(
+    experiment_ids, experiments["targeted_structure"].astype(str)
+):
+    with h5py.File(files[experiment_id], "r") as nwb:
+        event_detection = nwb["processing/ophys/event_detection"]
+        ...
+```
+
+iii. In the trajectory, the AI highlighted the very large local bundle size and tracked long-running conversion over many sessions, which supports the interpretation that file I/O and interval aggregation dominated runtime.
 
 ## 9-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. `_session_presentations` scans the full presentation arrays once per trial with `np.flatnonzero`; grouping/sorting once by trial ID would avoid repeated scans. The image-name list comprehension and some metadata loops could also be vectorized, though they are minor. Plane/session loops are appropriate because they involve separate files.
+i. The code already vectorizes interval aggregation with prefix sums, but several loops remain: iterating over `trial_ids` in `_session_presentations`, iterating over planes in each session, mapping image names to codes with a Python list comprehension, and the final per-trial loop that builds `session_neural` and `session_output`.
 
 ii.
 ```python
 for trial_id in trial_ids:
     idx = np.flatnonzero((source_trial_ids == trial_id) & active)
-image_codes = np.asarray([image_to_code[name] for name in names], dtype=np.int16)
+    ...
 ```
 
-iii. The agent did not explicitly discuss vectorization. It did implement prefix sums specifically to vectorize interval aggregation and avoid a costly interval-by-cell loop.
+```python
+for rows, outcome in zip(row_groups, trial_outcomes):
+    ...
+    session_neural.append(...)
+    session_output.append(...)
+```
+
+iii. The trajectory does not discuss these loops explicitly, but the presence of prefix-sum helpers suggests the AI was already trying to vectorize the heaviest interval computations.
 
 ## 9-c. What processing does the code repeat multiple times?
 
-i. Each retained representative NWB is opened and its trials/presentations are parsed during the screening pass and again during conversion. Files are also reopened per plane for neural data. The screening pass decodes presentation names once to build the global vocabulary and the conversion pass decodes them again.
+i. The script repeats some work across passes. It opens a representative NWB once during session pre-screening and again during the main conversion pass. It also computes presentation-level labels once in the pre-screening pass to collect global image names and again in the main pass to build the actual outputs.
 
 ii.
 ```python
-with h5py.File(representative, "r") as nwb:
-    trial_ids, _ = _eligible_trial_ids(nwb)
-    _, _, names, _ = _session_presentations(nwb, trial_ids)
-...
+for session_id, experiments in table.groupby("ophys_session_id", sort=True):
+    representative = files[int(experiments.iloc[0]["ophys_experiment_id"])]
+    with h5py.File(representative, "r") as nwb:
+        ...
+        _, _, names, _ = _session_presentations(nwb, trial_ids)
+        image_names.update(names.tolist())
+```
+
+```python
 with h5py.File(representative, "r") as nwb:
     trial_ids, trial_outcomes = _eligible_trial_ids(nwb)
     starts, row_groups, names, changes = _session_presentations(nwb, trial_ids)
 ```
 
-iii. No explicit justification was recorded. The first pass establishes exclusions and global category mappings before final allocation, trading repeated lightweight metadata reads for simpler assembly and lower retained memory.
+iii. The trajectory does not explicitly justify this repetition; it appears to be a consequence of doing one pass for dataset discovery/category collection and a second pass for full conversion.
 
 ## 9-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. The first-pass presentation arrays other than unique image names are discarded. `omitted` is required only to identify the presentation group, not read as a value. Several detailed metadata fields and saved bin edges are not used by the decoder itself, though they aid provenance. The empty decoder-input arrays are required by the target schema rather than analytically useful.
+i. The code does extra pre-pass processing and metadata construction that the downstream decoder does not use directly. Examples include reading sessions just to build the global image-name set, collecting detailed `session_info`, storing per-session quintile edges, and assembling `excluded_sessions` explanations.
 
 ii.
 ```python
-_, _, names, _ = _session_presentations(nwb, trial_ids)
-image_names.update(names.tolist())
-...
-"neurons_per_experiment": neuron_counts,
-"running_quintile_edges_cm_per_s": running_edges.tolist(),
+session_info.append({
+    "ophys_session_id": session_id,
+    ...
+    "running_quintile_edges_cm_per_s": running_edges.tolist(),
+    "pupil_diameter_quintile_edges_pixels": pupil_edges.tolist(),
+})
 ```
 
-iii. The trajectory does not identify discarded work. Most extra metadata appears intended for interpretability and validation rather than downstream model features.
+```python
+"metadata": {
+    ...
+    "excluded_sessions": excluded,
+    "session_info": session_info,
+},
+```
+
+iii. The trajectory does not present this as a deliberate optimization target; it mostly reflects a converter written to preserve explanatory metadata even though the decoder only consumes the main arrays and label vocabularies.

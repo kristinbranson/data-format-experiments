@@ -2,161 +2,231 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent reads the BWM release CSV, optionally restricts it with `DATALIMIT_SUBSET.csv`, groups probe rows into sessions, and uses an offline ONE client. `SessionLoader` loads trials, wheel, and camera motion energy; `SpikeSortingLoader` loads each probe's spikes and clusters. Sessions may be processed in parallel.
+i. The agent enumerates sessions from the release freeze CSV `/app/code/code_zhang2025/data/bwm_release.csv`, optionally restricts them with `/app/data/DATALIMIT_SUBSET.csv`, then loads each session's trials and behavior with `SessionLoader` and each probe's spikes with `SpikeSortingLoader` through a local ONE cache. This differs from the human reference, which discovers sessions from the ONE release index via `one.search`.
 
 ii.
+```python
+BWM_RELEASE_CSV = '/app/code/code_zhang2025/data/bwm_release.csv'
+DATALIMIT_SUBSET = '/app/data/DATALIMIT_SUBSET.csv'
+```
+
 ```python
 bwm_df = pd.read_csv(BWM_RELEASE_CSV, index_col=0)
 if os.path.exists(DATALIMIT_SUBSET):
     subset = pd.read_csv(DATALIMIT_SUBSET)
+    col = 'eid' if 'eid' in subset.columns else subset.columns[0]
     bwm_df = bwm_df[bwm_df.eid.isin(subset[col].astype(str))]
-...
-sess_loader = SessionLoader(one=one, eid=eid)
-spikes, clusters, channels = loader.load_spike_sorting()
 ```
 
-iii. The trajectory says the release freeze supplies the intended session/probe IDs, while ONE resolves staged cached data without forcing network authentication. It also says probes in one session should be merged as in the methods code.
-
-## 1-b. How are the data split into subjects?
-
-i. Subject IDs come from the `subject` column of the release CSV. At assembly, unique successful-session subjects are sorted, and each session gets an integer `subject_idx`.
-
-ii.
 ```python
-sessions.append((eid, rows.subject.iloc[0], rows.lab.iloc[0], ...))
-subjects = sorted({r['subject'] for r in results})
-subject_idx = np.array([subject_lookup[r['subject']] for r in results])
+sess_loader = SessionLoader(one=one, eid=eid)
+spikes, clusters = load_spikes_and_clusters(one, eid, pids, probe_names)
 ```
 
-iii. The trajectory treats the release metadata as the authoritative subject identity; no filename parsing is needed.
+iii. In the trajectory summary, the agent says it chose offline ONE access plus `bwm_release.csv` because probe IDs come from the BWM release freeze and because it wanted to avoid forcing network re-authentication. It also says all 459 released sessions were attempted and probes within a session were merged.
 
-## 1-c. How are the data split into sessions?
+## 1-b. How are the data split into subjects (mice)?
 
-i. Rows of the BWM release CSV are grouped by `eid`; all probe IDs and names sharing an `eid` form one session. Results are sorted by `eid` before assembly.
+i. Subjects are taken directly from the `subject` column of `bwm_release.csv`. Sessions are grouped by `eid`, and after conversion the output `subjects` list is the sorted set of subject names while `subject_idx` maps each session to its subject.
 
 ii.
 ```python
 for eid, rows in bwm_df.groupby('eid', sort=False):
-    sessions.append((eid, ..., list(rows.pid), list(rows.probe_name)))
-...
-results.sort(key=lambda r: r['eid'])
+    sessions.append((eid, rows.subject.iloc[0], rows.lab.iloc[0],
+                     list(rows.pid), list(rows.probe_name)))
 ```
 
-iii. The trajectory identifies `eid` as the unique session identifier and merges probes because they share behavior and are not independent sessions.
+```python
+subjects = sorted({r['subject'] for r in results})
+subject_lookup = {s: i for i, s in enumerate(subjects)}
+```
+
+iii. The trajectory justification is minimal here. The agent's final summary says the converted dataset contains 136 mice, which implies it trusted the release metadata and did not derive subjects from paths or filenames.
+
+## 1-c. How are the data split into sessions?
+
+i. The agent treats one `eid` as one session. It groups the release CSV by `eid`, keeps the associated subject, lab, probe IDs, and probe names, and processes each grouped tuple as one session.
+
+ii.
+```python
+for eid, rows in bwm_df.groupby('eid', sort=False):
+    sessions.append((eid, rows.subject.iloc[0], rows.lab.iloc[0],
+                     list(rows.pid), list(rows.probe_name)))
+```
+
+```python
+for i, sess in enumerate(sessions):
+    _report(i, len(sessions), _safe_process_session(sess), results, failures)
+```
+
+iii. The trajectory summary explicitly says "All 459 released sessions were attempted", so the agent's justification was that the release freeze already defines the session set.
 
 ## 1-d. How are the data split into trials?
 
-i. The trials table supplies one row per trial. Stimulus-centered interval starts/ends are computed per row, and per-trial neural, input, and output arrays are appended in a loop after masking.
+i. The agent uses the IBL trials table as the source of trial boundaries. Each row of `sess_loader.trials` is treated as one trial, and per-trial time windows are constructed around that row's `stimOn_times`.
 
 ii.
+```python
+if sess_loader.trials.empty:
+    sess_loader.load_trials()
+trials = sess_loader.trials
+```
+
 ```python
 align_times = trials[ALIGN_TIME].to_numpy(dtype=np.float64)
 interval_begs = align_times_filled + TIME_WINDOW[0]
 interval_ends = align_times_filled + TIME_WINDOW[1]
-for i in range(n_trials):
-    neural.append(binned[i].astype(np.float32))
 ```
 
-iii. The trajectory regards the trials table as already defining trial boundaries and uses the requested stimulus-onset alignment window.
+iii. The agent did not give a separate justification beyond saying it was reproducing the methods-paper preprocessing and aligning trials to stimulus onset.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials are retained when reaction time is 0.08–2 s, trial length is at most 10 s, none of six named fields is null, and choice is nonzero. The agent additionally requires wheel and whisker traces to cover the full window without nonfinite interpolated values; sessions with fewer than two retained trials fail.
+i. Trials are first filtered by a `load_trials_and_mask` reimplementation: reaction time must be between `0.08` and `2.0` s, `feedback_times - goCue_times` must be at most `10` s, specified trial fields cannot be NaN, and `choice == 0` is excluded. The agent then further requires both wheel and whisker traces to cover the full trial window and contain no NaNs. Sessions with fewer than two surviving trials are dropped.
 
 ii.
 ```python
 query = f'(firstMovement_times - stimOn_times < {MIN_RT})'
 query += f' | (firstMovement_times - stimOn_times > {MAX_RT})'
 query += f' | (feedback_times - goCue_times > {MAX_TRIAL_LEN})'
-for event in NAN_EXCLUDE: query += f' | {event}.isnull()'
+for event in NAN_EXCLUDE:
+    query += f' | {event}.isnull()'
 query += ' | (choice == 0)'
-keep = trials_mask & wheel_ok & whisker_ok
 ```
 
-iii. The agent says these are the methods pipeline's `load_trials_and_mask` criteria. It deliberately drops missing behavioral windows because the target decoder format should not contain NaNs, noting this differs from the reference pipeline's `allow_nans=True` behavior.
+```python
+wheel, wheel_ok = bin_behavior(wheel_times, wheel_vals, interval_begs, interval_ends)
+whisker, whisker_ok = bin_behavior(whisker_times, whisker_vals, interval_begs, interval_ends)
+keep = trials_mask & wheel_ok & whisker_ok
+if keep.sum() < MIN_TRIALS_PER_SESSION:
+    raise RuntimeError(f'only {keep.sum()} trials left after filtering')
+```
+
+iii. The trajectory summary says the agent intentionally followed `prepare_data` and `load_trials_and_mask` from the methods-paper code, then added behavior-coverage filtering because the target decoder format cannot contain NaNs.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural values derive from each probe's `spikes.times` and `spikes.clusters`; merged cluster/channel data supplies cluster indexing and anatomical acronyms.
+i. The neural data are derived from the spike sorting outputs `spikes['times']` and `spikes['clusters']` from every probe of a session. Cluster metadata are also loaded to attach region labels, but the neural matrix itself is built from spike times and cluster assignments.
 
 ii.
 ```python
 spikes, clusters, channels = loader.load_spike_sorting()
-clusters_labeled = SpikeSortingLoader.merge_clusters(
-    spikes, clusters, channels, compute_metrics=False).to_df()
 ```
 
-iii. The trajectory states spike times and Kilosort cluster assignments are the methods pipeline's neural source, with cluster metadata needed for region labels.
+```python
+spikes = {k: np.concatenate([s[k] for s in merged_spikes])
+          for k in ('times', 'clusters')}
+```
+
+iii. The trajectory summary says the agent followed the methods-paper path that bins "all neurons, sorted by Kilosort, from each session", so spike times and cluster IDs were treated as the defining neural inputs.
 
 ## 2-b. How is the `neural` data processed?
 
-i. Probes are merged, cluster IDs reindexed, spikes sorted by time, and spikes counted in 20 ms bins for each two-second trial. The saved values are raw spike counts cast to `float32`; they are not divided by bin width or smoothed.
+i. The agent merges all probes within a session, renumbers cluster IDs across probes, sorts spikes by time, and bins spike counts into 100 non-overlapping 20 ms bins per trial. It keeps the result as spike counts rather than dividing by the bin width to convert to Hz.
 
 ii.
 ```python
-counts = np.bincount(rows * N_BINS + bin_idx[keep],
-                     minlength=n_units * N_BINS)
+spikes['clusters'] = spikes['clusters'] + cluster_max
+sort_idx = np.argsort(spikes['times'], kind='stable')
+spikes = {k: v[sort_idx] for k, v in spikes.items()}
+```
+
+```python
+bin_idx = np.floor((spike_times[sl] - interval_begs[trial]) / BINSIZE).astype(np.int64)
+counts = np.bincount(rows * N_BINS + bin_idx[keep], minlength=n_units * N_BINS)
 binned[trial] = counts.reshape(n_units, N_BINS)
-...
+```
+
+```python
 neural.append(binned[i].astype(np.float32))
 ```
 
-iii. The agent explicitly chose spike counts because it interpreted the methods pipeline as binning counts without smoothing and reported that its binning matched that implementation.
+iii. The trajectory summary explicitly says the output contains a per-trial "spike-count matrix" and that this followed the methods-paper code path using all spike-sorted units.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. No cluster-quality or in-brain filter is applied. All cluster IDs that fired at least once anywhere in the session are retained, including possible `void` regions.
+i. The agent does not apply single-unit QC such as `label >= 1` and does not exclude `void` regions. It keeps all spike-sorted units that appear in `spike_clusters`, which effectively drops only units that fired zero spikes in the session because `unit_ids = np.unique(spike_clusters)`.
 
 ii.
 ```python
-unit_ids = np.unique(spike_clusters)
-...
-acronyms = clusters['acronym'].to_numpy()[unit_ids]
-beryl = BrainRegions().acronym2acronym(acronyms, mapping='Beryl')
+"""Mirrors `load_spiking_data` (with qc=None, i.e. all units) followed by
+`merge_probes` in the reference code."""
 ```
 
-iii. The trajectory says `prepare_data` calls `load_spiking_data(qc=None)` and the methods paper uses all Kilosort neurons. It acknowledges the data paper instead uses stringent well-isolated-unit QC, but prioritizes the decoding pipeline.
+```python
+unit_ids = np.unique(spike_clusters)
+n_units = len(unit_ids)
+```
+
+iii. The trajectory summary says the agent deliberately chose "all spike-sorted units, no QC selection" because `prepare_data -> load_spiking_data` uses `qc=None`, and it justified this by citing the methods paper's use of all Kilosort-sorted neurons.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Each trial covers `[stimOn_times - 0.5, stimOn_times + 1.5)`. Search-sorted spikes in that absolute interval are assigned bins relative to the interval start.
+i. Neural data are aligned to `stimOn_times`. For each trial, the binning window is `[stimOn_times - 0.5, stimOn_times + 1.5)`, so the 100 spike-count bins are defined relative to stimulus onset.
 
 ii.
 ```python
-interval_begs = align_times_filled + TIME_WINDOW[0]
-interval_ends = align_times_filled + TIME_WINDOW[1]
-bin_idx = np.floor((spike_times[sl] - interval_begs[trial]) / BINSIZE)
+ALIGN_TIME = 'stimOn_times'
+TIME_WINDOW = (-0.5, 1.5)
 ```
 
-iii. The agent chose visual stimulus onset and the −0.5-to-1.5 s window because these are the caching code's parameters and all streams share the synchronized session clock.
+```python
+align_times = trials[ALIGN_TIME].to_numpy(dtype=np.float64)
+interval_begs = align_times_filled + TIME_WINDOW[0]
+interval_ends = align_times_filled + TIME_WINDOW[1]
+```
+
+```python
+bin_idx = np.floor((spike_times[sl] - interval_begs[trial]) / BINSIZE).astype(np.int64)
+```
+
+iii. The trajectory summary says alignment was set to stimulus onset because that is exactly the `params` configuration in `src/0_data_caching.py`.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. Resolution is 20 ms, with 100 nonoverlapping bins in a 2 s window. Spikes are binned once; no later temporal rebinning or interpolation of neural values occurs.
+i. The converted neural data use 20 ms bins over a 2 s window, giving 100 bins per trial. The agent does no temporal smoothing or rebinning beyond the initial binning.
 
 ii.
 ```python
+TIME_WINDOW = (-0.5, 1.5)
 BINSIZE = 0.02
 N_BINS = int(np.ceil((TIME_WINDOW[1] - TIME_WINDOW[0]) / BINSIZE))
 ```
 
-iii. The trajectory cites the reference caching parameters and selects 20 ms because the time-varying behavioral outputs require that resolution.
+iii. The trajectory summary says this 20 ms, 100-bin configuration was chosen because it matches the methods-paper caching code and is needed for the time-varying decoder outputs.
 
 ## 3-a. What variables in the raw data is `input` *Time since stimulus onset* derived from?
 
-i. It is defined from the `stimOn_times` alignment event plus the fixed window and bin size; its values are relative bin centers and therefore identical across trials.
+i. This input is derived from the trial alignment event `stimOn_times`. The actual value sequence is then defined from the fixed bin centers of the chosen window.
 
 ii.
 ```python
+ALIGN_TIME = 'stimOn_times'
 align_times = trials[ALIGN_TIME].to_numpy(dtype=np.float64)
+```
+
+```python
 bin_centres = TIME_WINDOW[0] + BINSIZE * (np.arange(N_BINS) + 0.5)
 ```
 
-iii. The agent says stimulus onset is the mandated alignment event and bin centers are the natural time coordinate for neural bins.
+iii. The trajectory summary states that the first input is "time from stimulus onset (bin centres, -0.49…1.49 s)", so the agent viewed this as directly induced by the alignment event.
 
 ## 3-b. What processing is involved in computing `input` *Time since stimulus onset*?
 
-i. It constructs 100 evenly spaced centers, −0.49 through 1.49 s, and copies this row into every retained trial's input matrix.
+i. No raw signal is transformed. The agent simply constructs a fixed vector of 100 bin centers from `-0.49` to `1.49` seconds and reuses it for every trial.
+
+ii.
+```python
+bin_centres = TIME_WINDOW[0] + BINSIZE * (np.arange(N_BINS) + 0.5)
+inp = np.empty((2, N_BINS), dtype=np.float32)
+inp[0] = bin_centres
+```
+
+iii. The trajectory summary explicitly describes this input as "bin centres", with no additional justification beyond matching the chosen decoding grid.
+
+## 3-c. How is `input` *Time since stimulus onset* aligned with the neural data?
+
+i. The time-since-stimulus input uses the same 100-bin trial grid as the neural data. The neural counts are binned over the same `TIME_WINDOW` and `BINSIZE`, and the input stores the center of those bins.
 
 ii.
 ```python
@@ -164,23 +234,16 @@ bin_centres = TIME_WINDOW[0] + BINSIZE * (np.arange(N_BINS) + 0.5)
 inp[0] = bin_centres
 ```
 
-iii. The trajectory describes this as the centers of the configured 20 ms stimulus-relative bins.
-
-## 3-c. How is the `input` *Time since stimulus onset* aligned with the neural data?
-
-i. Input element `t` is the center of neural bin `t`; both use the same `TIME_WINDOW`, `BINSIZE`, and `N_BINS`.
-
-ii.
 ```python
-bin_idx = np.floor((spike_times[sl] - interval_begs[trial]) / BINSIZE)
-inp[0] = bin_centres
+binned, unit_ids = bin_spikes(spikes['times'], spikes['clusters'],
+                              interval_begs[keep], interval_ends[keep])
 ```
 
-iii. The agent intended a one-to-one temporal coordinate for the neural bins.
+iii. The agent's stated justification is that the dataset is aligned to stimulus onset with 20 ms bins, so the first input is just the shared time axis of the neural representation.
 
 ## 4-a. What variables in the raw data is `input` *Trial number in block* derived from?
 
-i. It is derived solely from consecutive values of the trials-table `probabilityLeft` column.
+i. It is derived from `trials['probabilityLeft']`. A new block starts whenever `probabilityLeft` changes value.
 
 ii.
 ```python
@@ -188,97 +251,122 @@ pleft = trials['probabilityLeft'].to_numpy()
 new_block[1:] = pleft[1:] != pleft[:-1]
 ```
 
-iii. The trajectory notes there is no explicit block ID, while `probabilityLeft` is constant within a block.
+iii. The trajectory summary says the block index is computed within the current `probabilityLeft` block, so the justification is that block identity is recovered from changes in `probabilityLeft`.
 
 ## 4-b. What processing is involved in computing `input` *Trial number in block*?
 
-i. Changes in `probabilityLeft` mark block starts; subtracting the corresponding block-start index produces a zero-based trial number. It is computed before filtering and broadcast across all 100 bins.
+i. The agent computes a 0-based counter within each constant-`probabilityLeft` block, using the full unfiltered trial table so later trial exclusions do not shift the count.
 
 ii.
 ```python
+new_block = np.ones(len(pleft), dtype=bool)
+new_block[1:] = pleft[1:] != pleft[:-1]
 block_id = np.cumsum(new_block) - 1
+block_starts = np.flatnonzero(new_block)
 idx_in_block = np.arange(len(pleft)) - block_starts[block_id]
-...
+```
+
+```python
+in_block = trial_number_in_block(trials)[keep]
 inp[1] = in_block[i]
 ```
 
-iii. The agent computes it on the full table so excluded trials still advance the animal's true position in the block.
+iii. The trajectory summary explicitly says the agent computed the 0-based trial index on the full trials table "so exclusions don't shift the count."
 
 ## 5-a. What variables in the raw data is `output` *Choice* derived from?
 
-i. Choice comes from the trials-table `choice` column.
+i. Choice is derived from `trials['choice']`.
 
 ii.
 ```python
-choice = np.where(trials['choice'].to_numpy()[keep] > 0, 0, 1)
+choice = np.where(trials['choice'].to_numpy()[keep] > 0, 0, 1).astype(np.int64)
 ```
 
-iii. The trajectory identifies IBL choice `+1` as left and `-1` as right; no-choice trials were already filtered.
+iii. The trajectory summary says the agent used the IBL convention that `+1` means left choice and `-1` means right choice.
 
 ## 5-b. What processing is involved in computing `output` *Choice*?
 
-i. Retained `+1` values are mapped to category 0 (left), and `-1` values to category 1 (right), then broadcast across the trial's 100 time bins.
+i. After excluding no-choice trials (`choice == 0`), the agent recodes positive choices to `0` for left and the remaining negative choices to `1` for right, then broadcasts that per-trial label across all 100 time bins.
 
 ii.
 ```python
-choice = np.where(... > 0, 0, 1).astype(np.int64)
+query += ' | (choice == 0)'
+```
+
+```python
+choice = np.where(trials['choice'].to_numpy()[keep] > 0, 0, 1).astype(np.int64)
 out[0] = choice[i]
 ```
 
-iii. This implements the category mapping required by the instructions.
+iii. The trajectory summary justifies this with the IBL sign convention for `choice`.
 
 ## 6-a. What variables in the raw data is `output` *Prior probability of left* derived from?
 
-i. It comes from the trials-table `probabilityLeft` column.
+i. Prior probability of left is derived from `trials['probabilityLeft']`.
 
 ii.
 ```python
 pleft = trials['probabilityLeft'].to_numpy()[keep]
 ```
 
-iii. The agent identifies this as the current block's left-stimulus prior.
+iii. The trajectory summary says this output is the current block's `probabilityLeft`.
 
 ## 6-b. What processing is involved in computing `output` *Prior probability of left*?
 
-i. Values close to 0.2, 0.5, and 0.8 map to classes 0, 1, and 2; unexpected values raise an error. The class is broadcast across time.
+i. The agent maps `0.2 -> 0`, `0.5 -> 1`, and `0.8 -> 2`, validates that no other values appear, and broadcasts the resulting per-trial category across time bins.
 
 ii.
 ```python
 prior = np.select([np.isclose(pleft, 0.2), np.isclose(pleft, 0.5),
-                   np.isclose(pleft, 0.8)], [0, 1, 2], default=-1)
+                   np.isclose(pleft, 0.8)], [0, 1, 2], default=-1).astype(np.int64)
+if np.any(prior < 0):
+    raise RuntimeError(f'unexpected probabilityLeft values: {np.unique(pleft)}')
+```
+
+```python
 out[1] = prior[i]
 ```
 
-iii. The mapping is explicitly required by the task.
+iii. The trajectory summary says this mapping was chosen to match the decoder task specification.
 
 ## 7-a. What variables in the raw data is `output` *Wheel speed* derived from?
 
-i. It uses the `times` and derived `velocity` columns produced by `SessionLoader.load_wheel()` from raw wheel timestamps and positions; speed is the velocity magnitude.
+i. Wheel speed is derived from the wheel trace loaded by `SessionLoader`, specifically `sess_loader.wheel['times']` and `sess_loader.wheel['velocity']`. That velocity itself comes from the wheel position/timestamp dataset handled inside the loader.
 
 ii.
 ```python
-sess_loader.load_wheel()
+if sess_loader.wheel.empty:
+    sess_loader.load_wheel()
 return (sess_loader.wheel['times'].to_numpy(),
         np.abs(sess_loader.wheel['velocity'].to_numpy()))
 ```
 
-iii. The trajectory says this matches `load_target_behavior`: absolute Gaussian-smoothed wheel velocity.
+iii. The trajectory summary says the agent followed the reference-code source for wheel speed, namely absolute wheel velocity returned by `SessionLoader`.
 
 ## 7-b. What processing is involved in computing `output` *Wheel speed*?
 
-i. The loader-derived velocity is made absolute, linearly interpolated per trial at 100 query times, checked for coverage/nonfinite values, and discretized using session-wide tertiles.
+i. The agent takes the absolute value of the loader-provided wheel velocity, interpolates it linearly onto the trial bins at the right edge of each 20 ms bin, rejects trials whose wheel trace does not cover the full window or contains NaNs, then discretizes the retained session-wide values into within-session tertiles.
 
 ii.
 ```python
+return (sess_loader.wheel['times'].to_numpy(),
+        np.abs(sess_loader.wheel['velocity'].to_numpy()))
+```
+
+```python
+x = np.linspace(interval_begs[trial] + BINSIZE, interval_ends[trial], N_BINS)
 y = interp1d(t, v, kind='linear', fill_value='extrapolate')(x)
+```
+
+```python
 wheel_class, wheel_edges = discretize(wheel[keep])
 ```
 
-iii. The agent aimed to reproduce `get_behavior_per_interval` and chose session-wise tertiles for balanced labels despite between-session scale differences.
+iii. The trajectory summary says the agent believed this exactly reproduced `get_behavior_per_interval`, and it also justified session-wise tertiles as a way to keep classes comparable and balanced across sessions.
 
 ## 7-c. How is `output` *Wheel speed* thresholded into categories?
 
-i. The 1/3 and 2/3 quantiles over all retained wheel samples in a session form two thresholds; `np.digitize` creates low/medium/high classes. Equal thresholds are not actually made strictly increasing despite the comment.
+i. Wheel speed is split into 3 classes using session-specific tertiles computed over all retained trials and time bins in that session.
 
 ii.
 ```python
@@ -287,139 +375,206 @@ edges = np.maximum.accumulate(quantiles)
 return np.digitize(values, edges, right=False).astype(np.int64), edges
 ```
 
-iii. The trajectory justifies within-session tertiles as scale-robust and approximately class-balancing; tied zero wheel speeds remain together.
+iii. The trajectory summary says within-session tertiles were chosen because absolute wheel-speed scales differ across animals and sessions, and because balanced classes help joint decoder training.
 
 ## 7-d. How is `output` *Wheel speed* aligned with the neural data?
 
-i. It is stimulus-aligned on the shared clock, but sampled at each bin's right edge (−0.48 through 1.50 s), whereas the neural input time coordinate describes bin centers (−0.49 through 1.49 s).
+i. Wheel speed is aligned to the same stimulus-locked trial window as the neural data, but the agent samples it at the right edge of each 20 ms bin rather than storing bin centers.
 
 ii.
 ```python
-x = np.linspace(interval_begs[trial] + BINSIZE, interval_ends[trial], N_BINS)
-y = interp1d(t, v, ...)(x)
+interval_begs = align_times_filled + TIME_WINDOW[0]
+interval_ends = align_times_filled + TIME_WINDOW[1]
 ```
 
-iii. The agent says right-edge evaluation reproduces `get_behavior_per_interval` exactly and considered the resulting index-wise pairing aligned.
-
-## 8-a. What variables in the raw data is `output` *Whisker motion energy* derived from?
-
-i. It uses `whiskerMotionEnergy` and `times` from left-camera motion energy, falling back to right-camera data if loading left fails.
-
-ii.
-```python
-for view, key in (('left', 'leftCamera'), ('right', 'rightCamera')):
-    sess_loader.load_motion_energy(views=[view])
-    me = sess_loader.motion_energy[key]
-    return me['times'].to_numpy(), me['whiskerMotionEnergy'].to_numpy()
-```
-
-iii. The trajectory says the reference behavior loader prefers left and falls back to right because some sessions lack left-camera data.
-
-## 8-b. What processing is involved in computing `output` *Whisker motion energy*?
-
-i. The released trace is not filtered or normalized. It is linearly interpolated per trial, subjected to coverage/nonfinite checks, and discretized using session-wide tertiles.
-
-ii.
-```python
-whisker, whisker_ok = bin_behavior(whisker_times, whisker_vals, ...)
-whisker_class, whisker_edges = discretize(whisker[keep])
-```
-
-iii. The agent says no extra preprocessing is warranted and session-specific thresholds address camera/illumination scale differences.
-
-## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
-
-i. The 1/3 and 2/3 quantiles over all retained samples in the session define low, medium, and high categories via `np.digitize`.
-
-ii.
-```python
-quantiles = np.quantile(values, np.arange(1, n_classes) / n_classes)
-return np.digitize(values, edges, right=False).astype(np.int64), edges
-```
-
-iii. The trajectory uses the same equal-frequency, within-session rationale as for wheel speed.
-
-## 8-d. How is `output` *Whisker motion energy* aligned with the neural data?
-
-i. It is aligned to the same stimulus onset and session clock but sampled at neural-bin right edges rather than centers.
-
-ii.
 ```python
 x = np.linspace(interval_begs[trial] + BINSIZE, interval_ends[trial], N_BINS)
 y = interp1d(t, v, kind='linear', fill_value='extrapolate')(x)
 ```
 
-iii. The agent considered this a faithful reproduction of the methods behavior-binning helper.
+iii. The trajectory summary says the agent did this because it believed it was matching `get_behavior_per_interval` exactly.
+
+## 8-a. What variables in the raw data is `output` *Whisker motion energy* derived from?
+
+i. Whisker motion energy is derived from the camera motion-energy stream loaded by `SessionLoader`. The agent prefers the left camera and falls back to the right camera if the left is unavailable, using each stream's `times` and `whiskerMotionEnergy`.
+
+ii.
+```python
+for view, key in (('left', 'leftCamera'), ('right', 'rightCamera')):
+    try:
+        sess_loader.load_motion_energy(views=[view])
+        me = sess_loader.motion_energy[key]
+        return (me['times'].to_numpy(),
+                me['whiskerMotionEnergy'].to_numpy())
+```
+
+iii. The trajectory summary says the left camera was preferred with right-camera fallback, following the methods-paper code path.
+
+## 8-b. What processing is involved in computing `output` *Whisker motion energy*?
+
+i. The released whisker motion-energy trace is used as-is, linearly interpolated onto the trial bins at the right edge of each 20 ms bin, trials with missing/short/NaN traces are dropped, and the retained values are discretized into within-session tertiles.
+
+ii.
+```python
+whisker, whisker_ok = bin_behavior(whisker_times, whisker_vals,
+                                   interval_begs, interval_ends)
+```
+
+```python
+x = np.linspace(interval_begs[trial] + BINSIZE, interval_ends[trial], N_BINS)
+y = interp1d(t, v, kind='linear', fill_value='extrapolate')(x)
+```
+
+```python
+whisker_class, whisker_edges = discretize(whisker[keep])
+```
+
+iii. The trajectory summary says the agent intentionally used the motion-energy trace as released, and justified the within-session tertiles on comparability and class-balance grounds.
+
+## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
+
+i. It is thresholded into 3 categories using session-specific tertiles over all retained whisker-motion-energy samples in the session.
+
+ii.
+```python
+quantiles = np.quantile(values, np.arange(1, n_classes) / n_classes)
+edges = np.maximum.accumulate(quantiles)
+return np.digitize(values, edges, right=False).astype(np.int64), edges
+```
+
+iii. The trajectory summary says session-wise thresholds were used because motion-energy units depend on camera and illumination and are not directly comparable across sessions.
+
+## 8-d. How is `output` *Whisker motion energy* aligned with the neural data?
+
+i. It is aligned to the same stimulus-locked trial window as the neural data, using the same 100 bins, but the signal is evaluated at the right edge of each bin.
+
+ii.
+```python
+interval_begs = align_times_filled + TIME_WINDOW[0]
+interval_ends = align_times_filled + TIME_WINDOW[1]
+```
+
+```python
+x = np.linspace(interval_begs[trial] + BINSIZE, interval_ends[trial], N_BINS)
+y = interp1d(t, v, kind='linear', fill_value='extrapolate')(x)
+```
+
+iii. The trajectory summary says the agent believed this matched the reference behavior-binning function.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Missing/null trial events are filtered; incomplete or nonfinite behavioral windows are filtered; missing left camera falls back to right. Any session exception is recorded and skipped, and sessions with fewer than two usable trials are rejected. NaN alignment times are temporarily replaced with zero only to keep intermediate searches defined, then excluded by the trial mask.
+i. The agent mainly handles missing data by exclusion. NaN alignment times are temporarily filled with `0.0` only so indexing code remains defined, but those trials are already excluded by the trial mask. Trials are dropped if wheel or whisker coverage is incomplete or if interpolated values are non-finite. Sessions with fewer than two good trials are dropped. Any session that raises an exception is recorded in `failed_sessions` and omitted from the final dataset.
 
 ii.
 ```python
 align_times_filled = np.where(np.isnan(align_times), 0.0, align_times)
-keep = trials_mask & wheel_ok & whisker_ok
-except Exception as exc:
-    return {'eid': args[0], 'error': ...}
 ```
 
-iii. The trajectory emphasizes that the output format cannot carry missing behavioral targets, so dropping affected trials/sessions is preferable to retaining NaNs; it reports manually checking excluded sessions.
+```python
+if len(v) == 0:
+    continue
+if np.abs(interval_begs[trial] - t[0]) > BINSIZE:
+    continue
+if np.abs(interval_ends[trial] - t[-1]) > BINSIZE:
+    continue
+if np.any(~np.isfinite(y)):
+    continue
+```
+
+```python
+def _safe_process_session(args):
+    try:
+        return process_session(args)
+    except Exception as exc:
+        return {'eid': args[0], 'error': f'{type(exc).__name__}: {exc}',
+                'traceback': traceback.format_exc()}
+```
+
+iii. The trajectory summary says the extra trial dropping was deliberate because the target format cannot contain NaNs. It also notes that 15 sessions were excluded this way because of missing or insufficient camera data.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. Loading large per-probe spike sorting arrays, binning spikes/behavior for every trial, and serializing the very large converted pickle dominate. The code parallelizes independent sessions.
+i. The most time-consuming parts are loading and merging per-probe spike sorting, then binning spikes and behavior across all trials of a session. The code structure makes spike loading the clear dominant I/O cost.
 
 ii.
 ```python
 spikes, clusters, channels = loader.load_spike_sorting()
-with ctx.Pool(processes=args.n_workers, maxtasksperchild=4) as pool:
-    for ... in pool.imap_unordered(...):
 ```
 
-iii. The trajectory's repeated full-session runs and final 107 GB artifact support I/O and conversion as the expensive work; its final summary highlights multiprocessing and cached local reads.
+```python
+binned, unit_ids = bin_spikes(spikes['times'], spikes['clusters'],
+                              interval_begs[keep], interval_ends[keep])
+wheel, wheel_ok = bin_behavior(wheel_times, wheel_vals, interval_begs, interval_ends)
+```
+
+iii. The trajectory does not contain a separate explicit performance analysis, but the agent's final summary and runtime logging focus on session conversion and large spike-count matrices, indicating that spike loading and binning were the intended heavy steps.
 
 ## 10-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The per-trial loops in `bin_spikes`, `bin_behavior`, and final list assembly could be further vectorized or batched. Probe and session loops are structurally appropriate; sessions are already parallelized.
+i. The code still loops over trials in three places: spike binning, behavior interpolation, and final packing of per-trial arrays into Python lists. The agent already vectorized some setup with `searchsorted`, but the remaining trial loops could still be reduced further.
 
 ii.
 ```python
 for trial in range(n_trials):
-    ... binned[trial] = counts.reshape(n_units, N_BINS)
-for trial in range(n_trials):
-    ... y = interp1d(...)(x)
-for i in range(n_trials):
-    neural.append(...)
+    sl = slice(i_beg[trial], i_end[trial])
+    ...
 ```
 
-iii. The trajectory claims spike and behavior binning were made substantially vectorized and verified against reference helpers, but retains trial loops because each trial slices a different time interval.
+```python
+for trial in range(n_trials):
+    t = target_times[idxs_beg[trial]:idxs_end[trial]]
+    ...
+```
+
+```python
+for i in range(n_trials):
+    neural.append(binned[i].astype(np.float32))
+    ...
+    outputs.append(out)
+```
+
+iii. The trajectory summary says the spike and behavior binning were deliberately implemented as a vectorized reimplementation of the reference path, but it does not claim the code is fully vectorized.
 
 ## 10-c. What processing does the code repeat multiple times?
 
-i. It creates a new ONE client per session, invokes interpolation separately for every trial and each of two behaviors, repeatedly casts/copies per-trial arrays, and recomputes identical behavioral query offsets per trial.
+i. There is no major redundant scientific processing, but some work is repeated per session or per output stream: a fresh ONE client is created for every session worker call, the same interpolation routine is run once for wheel and once for whisker traces, and the code separately loops over trials again when building the final lists.
 
 ii.
 ```python
 one = get_one()
-...
-for trial in range(n_trials):
-    y = interp1d(t, v, ...)(x)
-...
-for i in range(n_trials):
-    neural.append(binned[i].astype(np.float32))
 ```
 
-iii. The trajectory does not explicitly justify these repetitions; it mainly justifies per-session worker isolation and reference-equivalent interval processing.
+```python
+wheel, wheel_ok = bin_behavior(wheel_times, wheel_vals, interval_begs, interval_ends)
+whisker, whisker_ok = bin_behavior(whisker_times, whisker_vals,
+                                   interval_begs, interval_ends)
+```
+
+iii. The trajectory gives no explicit justification beyond robustness and fidelity to the reference code path.
 
 ## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. Behavior is interpolated for every original trial before the trial-QC mask is applied, so traces for already-invalid trials are discarded. Cluster metadata is merged broadly although downstream use is principally acronyms. Tracebacks and extensive metadata are retained for bookkeeping rather than decoder training.
+i. The agent does some extra bookkeeping beyond the decoder-ready arrays: it computes and stores class edges, lab names, failure records, and detailed session metadata. It also computes continuous wheel and whisker traces only to discretize them immediately, so the continuous versions are discarded once the categorical outputs are built.
 
 ii.
 ```python
-wheel, wheel_ok = bin_behavior(..., interval_begs, interval_ends)
-whisker, whisker_ok = bin_behavior(..., interval_begs, interval_ends)
-keep = trials_mask & wheel_ok & whisker_ok
+wheel_class, wheel_edges = discretize(wheel[keep])
+whisker_class, whisker_edges = discretize(whisker[keep])
 ```
 
-iii. The trajectory does not identify this waste; its focus is behavioral coverage checking and reproducibility. The ordering makes coverage masks easy to combine but performs avoidable work on trials already rejected by `trials_mask`.
+```python
+'session_info': {
+    'eid': eid,
+    'subject': subject,
+    'lab': lab,
+    ...
+    'wheel_speed_class_edges': [float(e) for e in wheel_edges],
+    'whisker_motion_energy_class_edges': [float(e) for e in whisker_edges],
+},
+```
+
+```python
+'failed_sessions': failures,
+```
+
+iii. The trajectory summary does not defend these as necessary for downstream decoding; they appear to be convenience metadata and diagnostics added by the agent.

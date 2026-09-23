@@ -1,268 +1,268 @@
 {
-  "1-a": {
-    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical strategy to the expert: `beh/Imaging_Exp_info.npy` is the master index, each `Beh_<exp_type>.npy` is read exactly once for all the sessions it holds, the session id `mname_datexp_blk` (plus `_stimtype` for swap sessions) keys the behaviour and names the spike file, and spikes/retinotopy are read per session. The one addition is that the agent merges the `UniqWalls` -> `stim_id` map over every experiment type in which a recording appears, which it justified by verifying that the behaviour arrays are byte-identical across copies while `stim_id` differs. All 89 recordings and 19 mice are loaded, matching the expert exactly.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`load_behaviour` implements the described de-duplication (`setdefault` + `if 'ft' in rec: continue`) and the wallmap merge; `load_spikes`/`select_neurons` read the per-session spk and retinotopy files. The run log confirms '89 recordings, 19 mice' and all 89 sessions were processed without failure."
-  },
-  "1-b": {
-    "question": "How are the data split into subjects (mice)?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Subjects are the `mname` field of the index entry, exactly as in the expert solution. Sessions are sorted by (mname, datexp, blk) and the subject list is built on first appearance, which is equivalent to the expert's sorted unique names. The resulting 19 subjects and the sessions-per-subject counts are identical to the reference ({'DR10': 6, 'DR15': 5, ... 'VR2': 7}).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`subjects.append(...)` / `subjects.index(...)` over keys sorted by mouse name produces an alphabetically ordered subject list and a `subject_idx` of length 89 aligned with the session order used for 'neural'/'input'/'output'. The format verifier passed with 19 subjects."
-  },
-  "1-c": {
-    "question": "How are the data split into sessions?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "A session is one recording, `mname_datexp_blk`, and recordings listed under several experiment types are collapsed into one entry, which is exactly the expert's rule. All 89 recordings are kept and none is dropped, matching the expert's 89 sessions. The agent explicitly counted the multiplicities (a recording appears under up to five experiment types) before deciding to deduplicate.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`recordings.setdefault(key, ...)` with the `if 'ft' in rec: continue` guard stores each recording's behaviour once while still recording every experiment type it appears under; the log shows exactly 89 sessions written."
-  },
-  "1-d": {
-    "question": "How are the data split into trials?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The trial split itself matches the expert: trials are the `ntrials` traversals the data declares, frames are assigned by `ft_trInd`, restricted to the textured corridor with `ft_CorrSpc`, and kept at native variable length aligned to corridor entry. The difference is that the agent additionally requires `ft_move > 0`. That extra filter is well justified and is arguably more faithful to the source than the expert's choice: the Methods state 'We only considered timepoints during running for analysis', and the paper's own code uses `corr_fr = beh['ft_CorrSpc'][:nfr] & VRmove` in every analysis function in utils.py. The cost, which the agent did not discuss, is that ~33% of in-corridor frames are removed (815,506 bins vs ~1.23M for the expert) and the removal is from the middle of traversals, so 46% of trials contain a gap of more than one frame and 24% a gap of more than 10 frames between consecutive columns; the expert explicitly preferred temporally contiguous trials for a decoder. Both positions are defensible, so this is a different but equally justified decision.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`add_frame_selection` implements exactly the stated rule (`ft_CorrSpc & (ft_move > 0) & ~isnan(ft_trInd)`, truncated to `min(nframes, len(ft))`), and the per-trial slice `f = frames[trials == t]` returns that trial's frames in increasing order. The delivered file has T median 21, min 11, max 178, consistent with the description."
-  },
-  "1-e": {
-    "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The agent drops only (a) trials with no surviving frames and (b) 309 trials (0.8%) whose wall texture has no canonical `stim_id` (`circle3`). It applies no length/stall control, unlike the expert, which removes trials above the 99th percentile of traversal length (382 trials) on the grounds that they are animals that stopped rather than ran. The running filter hides the symptom but not the cause: the pathological traversals survive with their idle frames excised, so a trial that really spans 5,607 imaging frames (~29 min of standing still) is stored as a short array whose `time_since_trial_start` reaches 1,763 s and whose `time_to_sound_cue` spans [-1762, +723] s, against a median traversal of ~7 s. That is a 2-3 order-of-magnitude outlier in two of the four decoder inputs, and stitching together neural frames separated by half an hour inside one 'trial' is something a human should check. In mitigation the agent did measure the tail (1.0% of bins beyond 60 s) and ran the real decoder with and without clipping at 60 s, finding <0.02 change in balanced accuracy, so the choice is informed and not technically wrong. Dropping 309 otherwise-valid trials for a bookkeeping reason (no canonical stimulus role) rather than a quality reason is a second, smaller deviation - the expert labels those trials by texture family instead.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The two `continue` branches in the trial loop implement exactly the two described filters, and the reported count (`dropped 309 trials with an unlabelled stimulus`) matches the metadata field `ntrials_dropped_unlabelled_stimulus`. 37,801 trials survive, consistent with the expert's 37,728 given the different filters."
-  },
-  "2-a": {
-    "question": "What variables in the raw data is the `neural` data derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same sources as the expert: `spks` from `spk/<session>_neural_data.npy` (the per-plane list, treated as one neuron axis in plane order, exactly as `utils.load_spk` concatenates it) and `iarea` from `retinotopy/<mname>_<datexp>_trans.npz` for the area of each neuron. The agent verified that the retinotopy neuron count equals the total row count of the spike planes for the sessions it checked and enforces it with an assertion for all of them.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`load_spikes` computes per-plane offsets from `cumsum(sizes)` and gathers `plane[sel[m] - offsets[p]]` into the right rows of the output, which reproduces the concatenated ordering that `iarea` indexes; the `assert len(iarea) == nneurons` passed for all 89 sessions."
-  },
-  "2-b": {
-    "question": "How is the `neural` data processed?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Like the expert, no processing at all: the deconvolved traces are sliced by the trial's frame indices with no normalisation, smoothing or re-deconvolution, and trials keep their native variable length with no padding. This follows the Methods ('All our analyses were based on deconvolved fluorescence traces'). The only difference is the storage dtype (float32 rather than the expert's float16), which is a size rather than a processing choice.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`neural_s.append(spk[:, f])` is a pure slice of the raw float32 traces; nothing else touches the values, and the metadata correctly states 'not normalised'."
-  },
-  "2-c": {
-    "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The area filter matches the expert exactly (V1=8, mHV=0/1/2/9, lHV=5/6, aHV=3/4, taken verbatim from `utils.neu_area_ID`; codes -1 and 7 dropped), and like the expert no further curation is applied because the authors already ran the Suite2p classifier. But the agent then subsamples uniformly at random to at most 2,000 neurons per session, keeping 178,000 of ~4.1M neurons (4.3%); the expert keeps all of them (mean 46,128 per session vs a flat 2,000). This is a large, deliberate reduction of the delivered dataset that directly changes the statistics the task says will be compared against the expert conversion, and it is the kind of thing a human must sign off on. It is not arbitrary - the subsample is seeded, unbiased across areas (V1 stays at 44% of neurons, as in the reference), documented in the metadata, and motivated by file size - but one of the two stated reasons is wrong: `svd_max_neurons` caps only the SVD *initialisation* of the projection (decoder.py:958-963 falls back to a random Gaussian projection above 2,000 neurons), while the trained `nn.Linear(nneurons, npcs)` still uses every neuron, so extra neurons are not discarded by the decoder. The size argument is also weaker than presented: the machine had 3.4 TB free and 1 TB RAM, and simply storing float16 instead of float32 would have doubled the affordable neuron count.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`select_neurons` maps `iarea` to the four area indices, keeps `area_idx >= 0`, and draws `rng.choice(valid, 2000, replace=False)` with a fixed seed, sorted so the plane-wise gather stays valid; `brain_region_idx` is the matching subsampled area vector, so its length always equals the number of neural rows. The log confirms exactly 2,000 neurons in every session."
-  },
-  "2-d": {
-    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same as the expert: alignment to corridor entry (trial start), trials stored at their own variable length with nothing cut or padded, `off_start = 0.0` and `off_end = None`. Each trial's columns begin at the first kept frame after `StartFr`. The only nuance is that the kept frames are the running frames, so the trial covers the traversal but not every wall-clock instant of it.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`neural_s.append(spk[:, f])` with `f` the increasing frame indices of that trial, and the metadata records the alignment event, `off_start = 0.0` and `off_end = None`. The sample-trial plots the agent inspected show position starting in bin 0 and rising monotonically, confirming trials start at corridor entry."
-  },
-  "2-e": {
-    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "No rebinning or resampling in either solution: one bin is one native two-photon frame and every behavioural stream is already on that grid. The agent measures the bin size from the timestamps (mean over sessions of the per-session median inter-frame interval = 314.85 ms) instead of using the nominal 3.17 Hz the expert quotes (315.46 ms) - a 0.2% difference, and measuring it is if anything slightly more careful. The bin width is constant across trials and sessions as the format requires; dropping non-running frames means consecutive bins are not always adjacent in absolute time, but that is a consequence of the 1-d decision, not of the binning.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`dt = median(diff(ft[:nframes])) * 86400` per session, `time_bin_size = mean(dts) * 1000` = 314.85 ms in the delivered metadata, and no resampling operation appears anywhere in the script; `frame_rate_hz` is also stored per session."
-  },
-  "3-a": {
-    "question": "What variables in the raw data is `input` *Time to sound cue* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `SoundFr` (the fractional imaging-frame index of the cue on each trial) and the frame grid, with the frame interval derived from the timestamps `ft` - the same two variables the expert uses. The expert interpolates `SoundFr` onto the `ft` axis; the agent multiplies the frame-index difference by the median frame interval, which is equivalent to within frame jitter on a regularly sampled 3.17 Hz grid.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`dt` is computed from `np.diff(rec['ft'][:nframes]) * 86400` (MATLAB datenum -> seconds) and used as `(rec['SoundFr'][t] - f) * dt`; no other source feeds this input."
-  },
-  "3-b": {
-    "question": "What processing is involved in computing `input` *Time to sound cue*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Cue time minus bin time, in seconds, positive before the cue and negative after - exactly the expert's quantity and sign convention, stored as a continuous time-varying float32 row. No clipping is applied in either solution. The extreme tail of this input on stalled trials is a consequence of the trial-filtering decision already charged in 1-e, not of the computation itself.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`time_to_cue = (rec['SoundFr'][t] - f) * dt` is placed in row 0 of the stacked input, matching `input_names[0] = 'time_to_sound_cue'` and the metadata description; the sign convention (positive before the cue) is confirmed by the measured distribution (median +0.05 s, 1st percentile -19.7 s)."
-  },
-  "3-c": {
-    "question": "How is the `input` *Time to sound cue* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Computed on exactly the frame index vector `f` that indexes the neural columns of that trial, so it is aligned by construction and has the same length - the same approach the expert takes with its `window`.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same `f` is used for `spk[:, f]` and for `(rec['SoundFr'][t] - f) * dt` within one loop iteration; the format verifier confirmed input and neural time dimensions match for every trial."
-  },
-  "4-a": {
-    "question": "What variables in the raw data is `input` *Day of training* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `datexp`, the recording date, which is the same field the expert relies on (the expert uses it only to order sessions). The agent first searched the index entries for an explicit training-day field and found none, so the date is indeed the only training-time information available.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`datetime.date(*map(int, recordings[k]['datexp'].split('_')))` parses the date directly from the session key; nothing else is used."
-  },
-  "4-b": {
-    "question": "What processing is involved in computing `input` *Day of training*?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The agent uses calendar days elapsed since the mouse's first recording (0-92), the expert uses the ordinal index of the session within the mouse (0-7). Both are proxies for 'day of training' with the same limitation - neither knows when training actually began relative to the first imaging session - and both are 0 for the first (naive / before-learning) session and monotonically increasing thereafter, so as a continuous per-trial decoder input they carry the same ordering information. The agent's version is the more literal reading of 'Day of training' and preserves the real spacing of sessions (which is very uneven: TX108 is imaged on days 0, 67, 76, 79, 86, 89, 92); the expert's is more robust to gaps of months between a naive session and the start of training. Equally justified.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`first[m]` is the minimum date per mouse and `day = (date[k] - first[mname]).days` is broadcast across the trial's bins with `np.full(len(f), rec['day'])`; the delivered range [0, 92] matches the per-mouse timelines the agent printed."
-  },
-  "5-a": {
-    "question": "What variables in the raw data is `input` *Time since trial start* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `StartFr` (the fractional frame of corridor entry) and the frame grid with `dt` from `ft`, which is exactly the expert's pair of variables.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`time_since_start = (f - rec['StartFr'][t]) * dt` uses only those two quantities."
-  },
-  "5-b": {
-    "question": "What processing is involved in computing `input` *Time since trial start*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Bin time minus corridor-entry time in seconds, positive after entry, starting just above 0 - the same quantity and sign convention as the expert, stored as a continuous float32 row. Because it is computed from real frame times rather than bin counts, it correctly reports true elapsed time even where idle frames were removed. The outlier tail it inherits from unfiltered stalled trials is charged in 1-e.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Row 2 of the stacked input matches `input_names[2] = 'time_since_trial_start'`; the measured minimum (6e-05 s) and median (3.85 s) are consistent with a value that starts at ~0 on each trial."
-  },
-  "5-c": {
-    "question": "How is the `input` *Time since trial start* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Evaluated on the same frame index vector as the neural columns, exactly as the expert does with its `window`.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Same `f` used for `spk[:, f]` and `(f - rec['StartFr'][t]) * dt`; dimensions verified by the format checker."
-  },
-  "6-a": {
-    "question": "What variables in the raw data is `input` *Reward availability* derived from?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The expert takes `isRew` directly as 'the trials run in the rewarded corridor'. The agent checked that claim and found it false for the 'Active after cue' sessions: there `isRew` marks the trials on which water was actually delivered, which requires the mouse to have licked after the cue, so in TX108_2023_03_25_1 only 109 of the 143 rewarded-corridor trials have `isRew` true, `RewTime` is non-NaN exactly on those trials, and every one of them contains a lick. Using `isRew` as a decoder *input* therefore leaks the licking *output* into the input on a substantial fraction of task trials. The agent instead identifies the rewarded corridor from `isRew` + `WallName` and marks every trial of that corridor, which is what the instructions literally ask for ('1 if in rewarded corridor, 0 if not'). It validated the assumption across all 89 sessions: the rewarded corridor is always a single wall texture, always canonical stimulus category 2, and no unsupervised or naive session has any reward. This is a genuine improvement over the reference.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`rewarded_walls = set(rec['WallName'][rec['isRew']])` with `assert len(rewarded_walls) <= 1` (which passed for all sessions), then `np.isin(rec['WallName'], list(rewarded_walls))`; for unsupervised/naive sessions the set is empty and `np.isin` yields all-False, giving 0 everywhere as described."
-  },
-  "6-b": {
-    "question": "What processing is involved in computing `input` *Reward availability*?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "A per-trial 0/1 flag broadcast over the trial's bins, same shape and semantics as the expert's, but computed as a property of the corridor rather than of the outcome, for the leakage reason given in 6-a. The agent then verified the result inside the converted file: in every task session `reward_availability == 1` holds on exactly the trials whose stimulus category is the trained one, and on no others.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`rew = np.full(len(f), 1.0 if rew_of_trial[t] else 0.0)` is row 3 of the input stack, matching `input_names[3]`; the delivered range is [0, 1] and the post-hoc check across sessions found no mismatched trial."
-  },
-  "7-a": {
-    "question": "What variables in the raw data is `output` *Visual stimulus category* derived from?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The expert derives the category from `WallName` through a hard-coded texture table; the agent derives it from `WallName` mapped through `UniqWalls` -> `stim_id`, the paper's own canonical stimulus code, merged across every experiment type in which the recording appears. Both avoid `TrialStim`, which is masked to 'stimulus_of_trial' for stimuli an experiment type does not analyse. Using the paper's own variable is a legitimate and arguably more source-faithful choice; the merge across experiment types is necessary to label the swap stimuli and was verified to produce no conflicts.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The wallmap is built from `zip(beh['UniqWalls'], beh['stim_id'])` skipping NaNs, and `stim_of_trial = [wallmap.get(w, -1) for w in rec['WallName']]`. I re-ran this mapping over all 89 recordings: no wall name ever receives two different ids within one recording, so the merge is well defined."
-  },
-  "7-b": {
-    "question": "What processing is involved in computing `output` *Visual stimulus category*?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "The agent produces 7 categories (`stim_id` 0-6) where the expert produces 4 physical texture families (circle/leaf/rock/wood), and names them ['circle1','circle2','leaf1','leaf2','leaf3','leaf1_swap1','leaf1_swap2']. The finer grain is defensible - it distinguishes crops and spatial-shuffle variants that the paper treats as distinct stimuli - but `stim_id` is a *role* code, not a texture identity, and the labels it produces are not the textures they are named after. Checking the mapping across all 89 sessions: `circle1` is id 0 in 62 sessions but id 2 in 6 (the mice for which circle was the rewarded texture), `rock1` is id 0 in 19 sessions, id 2 in 2 and id 4 in 1, `wood1` is always id 2 and `wood5` id 4. So category 2 means 'the trained/rewarded texture of this mouse' and category 4 means 'a third novel stimulus', and a decoder trained across sessions on these labels is being asked to predict experimental role, not visual appearance, while `output_values` asserts appearance. The agent documents only part of this ('mice trained on rock/brick are labelled by the matching role') and not the circle/leaf role swap or the reuse of 'leaf3' for rock1/wood5. It also drops 309 trials that carry a perfectly good stimulus (circle3) purely because it has no role code, where the expert labels them by texture family. Not wrong - the categories are internally consistent and cleanly separable within a session - but the semantics and the value names should be checked by a human, especially since this choice also changes the chance level (0.143 vs 0.25) and hence the accuracy comparison against the expert.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[0] = stim_of_trial[t]` broadcasts the trial's `stim_id` across its bins, and the delivered output range is [0, 6] with all seven values populated, which is exactly the stated decision. The caveat is in the naming of `output_values`, not in the implementation of the mapping."
-  },
-  "8-a": {
-    "question": "What variables in the raw data is `output` *Licking* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `LickFr`, the imaging-frame index of each detected lick, exactly as the expert. The agent additionally verified that licks occur only in the 28 task sessions and are zero in all 46 unsupervised and 15 naive sessions, which is consistent with the experimental design.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`licks` is built solely from `rec['LickFr']`; nothing else feeds this output."
-  },
-  "8-b": {
-    "question": "What processing is involved in computing `output` *Licking*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identical definition to the expert - a binary per-frame flag, 1 if at least one lick falls in the frame - with the trivial difference that the fractional lick frame is rounded to the nearest frame instead of truncated, which is at least as defensible (it assigns the lick to the frame whose timestamp is closest). The resulting lick fraction, 3.5% of bins, is close to the expert's 4.1%, and the agent sanity-checked the variable against the paper's behavioural result (21% of bins in the rewarded corridor vs 4.4% elsewhere, i.e. anticipatory licking).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`licks[np.round(LickFr).astype(int)] = True` after masking to `[0, nframes)` produces exactly the described per-frame flag; `out[1] = licks[f]` and `output_values[1] = ['no_lick', 'lick']` match."
-  },
-  "8-c": {
-    "question": "How is `output` *Licking* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "`LickFr` indexes imaging frames, so the flag is already on the neural grid and is sliced with the same `f` used for the neural columns - the expert's approach exactly.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[1] = licks[f]` uses the same index vector as `spk[:, f]`; output and neural time dimensions were verified to match for every trial."
-  },
-  "9-a": {
-    "question": "What variables in the raw data is `output` *Position in corridor* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `ft_Pos`, the per-frame virtual-reality position, same as the expert. The agent verified the units empirically (in-corridor positions span 0-39.99 and the grey space 40-60), which is what licenses treating 10 units as 1 m.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`pos = rec['ft_Pos']` is the only source for this output."
-  },
-  "9-b": {
-    "question": "What processing is involved in computing `output` *Position in corridor*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "No processing beyond the discretisation, identical in substance to the expert's `ft_Pos // 10`. Occupancies come out at 0.250/0.249/0.250/0.252, essentially identical to the reference's 0.254/0.242/0.247/0.257.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[2] = np.digitize(pos[f], [10., 20., 30.])` yields 0-3 for the in-corridor positions; the delivered output range is [0, 3]."
-  },
-  "9-c": {
-    "question": "How is `output` *Position in corridor* thresholded into categories?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Four equal 1 m bins with edges at 10/20/30 decimetres, labelled '0-1m'...'3-4m' - exactly the discretisation the task prescribes and the expert implements. Because trials are restricted to `ft_CorrSpc`, positions never exceed 40 and the four bins tile the trial, so no clipping is needed (the expert clips defensively).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`POSITION_EDGES = [10.0, 20.0, 30.0]` with `np.digitize` produces the four categories, and `output_values[2] = ['0-1m','1-2m','2-3m','3-4m']` matches them in order."
-  },
-  "9-d": {
-    "question": "How is `output` *Position in corridor* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "`ft_Pos` is one value per imaging frame and is indexed with the same `f` as the neural columns - the expert's approach. The agent additionally verified alignment visually, reporting that position is monotonic within trials in the sample-trial plots.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[2] = np.digitize(pos[f], ...)` shares the index vector with `spk[:, f]`."
-  },
-  "10-a": {
-    "question": "What variables in the raw data is `output` *Running speed* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "From `ft_RunSpeed`, the per-frame ball-tracking speed, same as the expert.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`speed = rec['ft_RunSpeed']` is the only source, used both for the global edges and for the per-trial values."
-  },
-  "10-b": {
-    "question": "What processing is involved in computing `output` *Running speed*?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Both solutions split speed into four bins holding ~25% of the data; they differ in scope and mechanism. The expert ranks the frames within each session and splits the ranks, guaranteeing exactly 25% per session and immunity to the large mass of exactly-zero speeds. The agent computes three value thresholds once over the pooled running frames of all sessions (12.42/25.35/40.85), so a speed bin means the same physical speed in every session - arguably preferable when one decoder readout is shared across sessions - and the tie problem largely disappears because the running filter already removed the stationary frames (the 25th percentile of in-corridor speed is 0.0 without the filter and 8.6 with it). The achieved global occupancies are 0.2505/0.2508/0.2501/0.2486, which satisfies the task's '25% of the data' requirement essentially as well as the expert's 0.2500 x 4. Equally justified.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The pre-pass concatenates `ft_RunSpeed` over the selected frames of all 89 recordings and takes `np.percentile(..., [25, 50, 75])`, then `np.digitize` applies those edges per trial. One small discrepancy with the stated decision ('computed once over all timepoints that enter the dataset'): the pre-pass uses `add_frame_selection(rec, len(rec['ft']))` rather than the spike-file frame count and runs before the 309 unlabelled-stimulus trials are dropped, so the edges are set from 821,579 frames of which 815,506 actually enter the dataset. The 0.7% superset shifts the occupancies by at most 0.2%, so the implementation still realises the decision in substance."
-  },
-  "10-c": {
-    "question": "How is `output` *Running speed* thresholded into categories?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Four quartile bins via `np.digitize` against the three global edges, named ['speed_q1'..'speed_q4'] and with the numeric edges recorded in the metadata - the task's '4 bins, each corresponding to 25% of the data' is met (0.2486-0.2508 per bin). Differs from the expert only in being a global value threshold rather than a per-session rank split, as discussed in 10-b.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[3] = np.digitize(speed[f], speed_edges)` gives 0-3, `output_values[3]` lists four ordered names, and `metadata['speed_bin_edges']` records the thresholds actually used."
-  },
-  "10-d": {
-    "question": "How is `output` *Running speed* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "`ft_RunSpeed` is one value per imaging frame and is indexed with the same `f` as the neural columns, exactly as the expert does.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "`out[3] = np.digitize(speed[f], speed_edges)` shares the index vector with `spk[:, f]`; the format verifier confirmed equal time dimensions."
-  },
-  "11": {
-    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The same central guard as the expert - the behaviour can run past the imaging, so every stream is truncated to the number of imaged frames (`min(nframes, len(ft))`, explicitly modelled on the paper's `beh[...][:nfr]` idiom) - plus a few extras: frames with NaN `ft_trInd` are excluded, licks outside the imaged range are discarded (the expert drops only those past the end; the agent also guards negatives), trials with no surviving frames are skipped, and two assertions guard the neuron/retinotopy correspondence and the single-rewarded-corridor assumption. The format verifier reports no NaN/Inf and no warnings, confirming nothing slipped through. This is a clean dataset and both solutions treat it as such.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Each described guard is present in the code (`n = min(nframes, len(rec['ft']))`, `~np.isnan(trind)`, the `(lick_fr >= 0) & (lick_fr < nframes)` mask, the two `continue` branches, and the two asserts), and the full run completed over all 89 sessions with both assertions holding."
-  },
-  "12-a": {
-    "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same bottleneck as the expert identifies: reading the 405 GB of per-session spike files, followed by the 6.6 GB of behaviour files. Everything else is negligible. The agent's structure responds to that cost sensibly - each behaviour file is unpickled exactly once for all the recordings it holds, and the neuron selection is applied plane by plane so the concatenated (nneurons x nframes) copy that `utils.load_spk` makes is never materialised, which is a modest improvement on the reference (the planes themselves are still fully unpickled, so the I/O itself is unchanged).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The per-plane gather in `load_spikes` does what its docstring claims (writes selected rows straight into a preallocated output), and the behaviour loading loop reads each `Beh_<exp_type>.npy` once. The full conversion completed in roughly 7 minutes with a warm page cache."
-  },
-  "12-b": {
-    "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The same loop the expert flags: the per-trial frame lookup rescans the whole kept-frame index once per trial (`frames[trials == t]`, O(ntrials x nframes), up to ~700 trials x ~25k frames per session) where a single `np.split`/`searchsorted` pass would group every frame by its trial at once. Two smaller ones the expert does not have: `np.digitize` is called per trial for position and speed instead of once per session (the expert bins the whole session up front and slices), and `stim_of_trial` is built with a Python-level dict lookup per trial. All are negligible next to the spike-file I/O, exactly as the expert notes for its own version.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "This is an observation about the code rather than a decision it implements; the loops described are present as written and produce correct results, just with avoidable scans."
-  },
-  "12-c": {
-    "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "`add_frame_selection` runs twice per recording - once in the speed-quartile pre-pass and once in the main loop - and the wallmap merge loop runs once per experiment type a recording appears in (up to five times). This is structurally the same pattern as the expert, which also makes a full pre-pass over the behaviour to compute its trial-length percentile, and it is unavoidable for the agent too: the global quartile edges must be known before any trial is written. The repeated work is cheap (behaviour-only) relative to the spike I/O.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The duplication is real and visible in the code (two call sites of `add_frame_selection`), and it is benign apart from the small frame-limit inconsistency already noted in 10-b."
-  },
-  "12-d": {
-    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The agent does little wasted computation, but unlike the expert it does no dtype narrowing: neural traces are stored as float32 where float16 suffices for deconvolved traces (doubling the 6.5 GB file), and outputs with values 0-6 are stored as int64 where int8 suffices (8x). That is exactly the pressure that motivated the neuron subsample in 2-c, so the two decisions work against each other. Minor extras: `Texture_Length` is copied out of every behaviour file and never used; several metadata fields (`cohort`, `experiment_types`, `reward_mode`, `frame_rate_hz`) are computed per session and ignored by the decoder, though they are reasonable documentation; and the speed pre-pass processes ~6,000 frames that never reach the dataset. Also, the `trial_definition` metadata string still says 'variable length (11-30 frames, median 21)' from an early 3-session pilot, while the delivered file ranges 11-178 - a stale description rather than wasted work. None of this is wrong, but the storage choices are a missed, cheap alternative to discarding 96% of the neurons.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The dtypes, the unused `texture_length` field and the extra metadata are all as described in the script; nothing here affects the values written, only the size of the artefact and the accuracy of one documentation string."
-  }
+    "1-a": {
+        "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both the AI and reference load data from the same three directories (beh/, spk/, retinotopy/) using the same master index (Imaging_Exp_info.npy). Both iterate over experiment types, build session keys as mname_datexp_blk, and handle duplicate recordings across experiment types. The AI merges stim_id across experiment types which is a slightly different approach but achieves the same goal of loading all recordings once.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly loads Imaging_Exp_info.npy, iterates over experiment types, loads Beh_*.npy files, constructs session keys, and reads spike and retinotopy files. The merging of stim_id is implemented correctly."
+    },
+    "1-b": {
+        "question": "How are the data split into subjects?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both use mname from the experiment info entries to identify subjects. Both result in 19 mice. The reference sorts subjects alphabetically while the AI uses encounter order, but this is a minor formatting difference that doesn't affect correctness.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly extracts mouse names and builds subject lists and indices."
+    },
+    "1-c": {
+        "question": "How are the data split into sessions?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both define a session as one recording identified by mname_datexp_blk. Both handle duplicate recordings across experiment types (reference skips duplicates, AI merges them into one entry). Both result in 89 sessions.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses recordings.setdefault() to merge duplicate entries and produces one session per unique recording key."
+    },
+    "1-d": {
+        "question": "How are the data split into trials?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI adds an additional filter on ft_move > 0 (running frames only) that the reference does not use. While the paper states 'We only considered timepoints during running for analysis', the reference solution does NOT apply this running filter, keeping all frames inside the textured corridor (ft_CorrSpc). This is a significant difference: it drops stationary frames within trials, changing trial lengths from variable (up to hundreds of frames) to consistently 11-30 frames. This fundamentally changes the data that enters the decoder. The reference solution handles long-idle trials by dropping entire outlier-length trials instead.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements its decision to filter by ft_CorrSpc AND ft_move > 0 AND ~np.isnan(trind). The frame selection logic is correctly implemented."
+    },
+    "1-e": {
+        "question": "How are trials filtered based on quality controls?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI drops trials with unlabelled stimuli (309 trials with circle3 etc.) and trials with zero frames, but does NOT apply a trial length percentile cutoff. The reference drops trials longer than the 99th percentile (382 trials) and empty trials, but does NOT drop trials based on stimulus labels. The AI's running-frame filter (1-d) serves a similar purpose to the reference's length cutoff -- both aim to remove trials where the mouse was idle -- but they achieve it differently. The AI also drops 309 trials that the reference keeps (those with unmapped stim_id), which is concerning because these are valid traversals with neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements its filtering logic: dropping trials with stim_of_trial < 0 and trials with zero frames."
+    },
+    "2-a": {
+        "question": "What variables in the raw data is the final `neural` data derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive neural data from spks in the neural_data.npy files and iarea from the retinotopy trans.npz files. The source variables are identical.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly loads spks from neural_data.npy and iarea from the retinotopy files."
+    },
+    "2-b": {
+        "question": "How is the `neural` data processed?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI randomly subsamples neurons to at most 2000 per session, while the reference keeps ALL neurons in the four visual areas (typically 20k-90k per session). This is a major difference that discards the vast majority of neural data. The AI's justification about the decoder's SVD initialization is reasonable from a practical standpoint, but the instructions say to match the reference paper and code's processing, and the reference code does not subsample. The reference stores neural data as float16 while the AI uses float32, which is a minor difference.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements the neuron subsampling with a fixed seed and plane-by-plane selection. The area filtering is also correct."
+    },
+    "2-c": {
+        "question": "How is the `neural` data filtered based on quality controls?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "Both filter by visual area (V1, mHV, lHV, aHV) using the same area codes. However, the AI adds random subsampling to 2000 neurons per session, which the reference does not do. This additional filtering step discards most of the neural data. The area-based filtering matches perfectly.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The area filtering code uses the same area codes as the reference. The subsampling is correctly implemented with np.random.default_rng(SEED) and sorted selection."
+    },
+    "2-d": {
+        "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both align to corridor entry (trial start) with off_start=0.0 and off_end=None. Both use variable-length trials starting at corridor entry. The main difference is the AI's running filter drops non-running frames within trials, creating gaps in the temporal sequence, while the reference keeps all corridor frames contiguously. However, the alignment event itself matches.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly aligns trials to corridor entry by selecting frames where ft_trInd matches the trial and ft_CorrSpc is True (plus the running filter)."
+    },
+    "2-e": {
+        "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both use the native imaging frame rate (~3.17-3.18 Hz, ~315 ms per frame) with no rebinning. The AI computes the bin size from the median inter-frame interval averaged across sessions, while the reference uses 1000/3.17. Both arrive at approximately the same value.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes dt from the median of np.diff(rec['ft']) and stores the time_bin_size in milliseconds."
+    },
+    "3-a": {
+        "question": "What variables in the raw data is `input` *Time to sound cue* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive time_to_sound_cue from SoundFr (the frame of the sound cue) and frame indices/times. The source variables are the same.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses rec['SoundFr'][t] and the frame indices f to compute the time difference."
+    },
+    "3-b": {
+        "question": "What processing is involved in computing `input` *Time to sound cue*?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "Both compute positive-before-cue, negative-after-cue time differences. The AI uses (SoundFr - frame_index) * dt with a constant dt, while the reference interpolates SoundFr onto the frame time axis using np.interp and computes cue_time - frame_time. The constant-dt approach assumes uniform frame spacing, while the reference handles non-uniform spacing. Both are reasonable approaches that yield very similar results given the near-uniform frame rate.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes (SoundFr[t] - f) * dt, producing positive values before the cue and negative after."
+    },
+    "3-c": {
+        "question": "How is `input` *Time to sound cue* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both compute time_to_sound_cue from the same frame indices used for neural data in each trial.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses the same frame array f for both neural data and time_to_sound_cue computation."
+    },
+    "4-a": {
+        "question": "What variables in the raw data is `input` *Day of training* derived from?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "Both derive day_of_training from the session ordering of each mouse. The AI uses the datexp date string parsed as a calendar date, while the reference uses the session_id sort order to count sessions. Both use the same underlying information (session dates/ordering) but interpret 'day of training' differently.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly parses datexp as a date, finds the earliest date per mouse, and computes calendar day differences."
+    },
+    "4-b": {
+        "question": "What processing is involved in computing `input` *Day of training*?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI computes calendar days since the mouse's first recording (values 0-92), while the reference counts session ordinals (values 0-7). Both are valid interpretations of 'day of training'. The calendar-day approach reflects actual elapsed time, while the session-count approach reflects how many recording sessions have occurred. The reference approach is simpler and more directly reflects training progression (each session is one day of training), while the AI's approach captures actual time gaps between sessions. Neither is clearly superior given the ambiguous instruction.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes calendar days using datetime.date arithmetic and broadcasts the value across trial frames."
+    },
+    "5-a": {
+        "question": "What variables in the raw data is `input` *Time since trial start* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive time_since_trial_start from StartFr (corridor entry frame) and frame indices/times.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses rec['StartFr'][t] and frame indices f."
+    },
+    "5-b": {
+        "question": "What processing is involved in computing `input` *Time since trial start*?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "Both compute time elapsed since corridor entry in seconds. The AI uses (frame_index - StartFr) * dt with constant dt, while the reference interpolates StartFr onto the frame time axis. Both approaches yield very similar results. The sign convention matches (positive after start).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes (f - StartFr[t]) * dt, producing values starting near zero and increasing."
+    },
+    "5-c": {
+        "question": "How is the `input` *Time since trial start* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both compute time_since_trial_start from the same frame indices used for neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses the same frame array f for both neural data and time_since_trial_start."
+    },
+    "6-a": {
+        "question": "What variables in the raw data is `input` *Reward availability* derived from?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The reference uses isRew directly (which marks trials where reward was actually delivered). The AI uses isRew combined with WallName to identify the rewarded corridor type, then marks ALL trials of that corridor as reward-available. The AI's approach is arguably better because it avoids leaking licking information into the decoder input -- isRew is True only when the mouse actually licked (in some sessions), which correlates with the licking output variable. The AI's corridor-based approach captures reward availability as a property of the corridor rather than the mouse's behavior.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly identifies rewarded wall textures from isRew, asserts at most one rewarded texture per session, and marks all trials with that texture as reward-available."
+    },
+    "6-b": {
+        "question": "What processing is involved in computing `input` *Reward availability*?",
+        "decision_correctness": "BETTER",
+        "decision_correctness_justification": "The AI's processing (find rewarded corridor type, mark all trials of that type) is more principled than the reference's direct use of isRew. The AI explicitly identified and addressed the information leakage concern. The reference simply casts isRew to int, which conflates reward availability with actual reward delivery (which depends on licking behavior).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements the corridor-based reward availability logic with proper assertions and handling of unsupervised/naive mice."
+    },
+    "7-a": {
+        "question": "What variables in the raw data is `output` *Visual stimulus category* derived from?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The reference uses WallName (the texture name on each trial's walls) mapped to 4 base categories (circle, leaf, rock, wood). The AI uses stim_id merged across experiment types, which gives the paper's canonical 7-category labelling. This is a significant difference: 4 categories vs 7 categories. The instructions say 'Visual stimulus category. e.g. circle, leaf, etc., per-trial', suggesting broad categories. The reference's 4-category approach (circle, leaf, rock, wood) is more consistent with the instructions. The AI's 7-category approach (circle1, circle2, leaf1, leaf2, leaf3, leaf1_swap1, leaf1_swap2) preserves more detail but doesn't match what the instructions describe. Furthermore, stim_id uses the paper's role-based mapping where rock/brick from some mice are mapped to leaf/circle roles, which could be confusing.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly merges stim_id across experiment types via the wallmap dictionary and uses it to assign stimulus categories. The implementation is correct for its chosen approach."
+    },
+    "7-b": {
+        "question": "What processing is involved in computing `output` *Visual stimulus category*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The reference maps 15 wall texture names to 4 base categories through a hardcoded lookup table. The AI uses the paper's canonical stim_id numbering (0-6) representing 7 sub-categories. The instructions say 'Visual stimulus category. e.g. circle, leaf, etc.' which implies broad categories (4), not the fine-grained 7-category scheme. Additionally, the AI drops 309 trials where stim_id is unmapped (e.g. circle3), while the reference keeps all trials since every WallName maps to one of the 4 categories.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements the stim_id-based categorization with proper handling of unmapped stimuli."
+    },
+    "8-a": {
+        "question": "What variables in the raw data is `output` *Licking* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive licking from LickFr, the frame number of every lick in the session.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses rec['LickFr'] to create a binary licking array."
+    },
+    "8-b": {
+        "question": "What processing is involved in computing `output` *Licking*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both create a binary per-frame array where 1 indicates at least one lick in that frame. The AI rounds LickFr to integers while the reference truncates with .astype(int). This is a minor difference -- rounding vs truncation of fractional frame numbers. Both filter out-of-range lick frames.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly creates a boolean lick array, rounds frame indices, filters to valid range, and indexes into it per trial."
+    },
+    "8-c": {
+        "question": "How is `output` *Licking* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both index the licking array with the same frame indices used for neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses out[1] = licks[f] where f is the same frame array used for neural data."
+    },
+    "9-a": {
+        "question": "What variables in the raw data is `output` *Position in corridor* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive position from ft_Pos, the position inside the corridor at each imaging frame.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses rec['ft_Pos'] indexed by trial frames."
+    },
+    "9-b": {
+        "question": "What processing is involved in computing `output` *Position in corridor*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both bin position into four 1m bins. The reference uses ft_Pos // 10 clipped to [0,3], and the AI uses np.digitize with edges [10, 20, 30]. Both produce equivalent 4-bin discretizations of the 0-40 decimeter corridor into 1m bins.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "np.digitize(pos, [10, 20, 30]) correctly produces values 0-3 for positions in [0,10), [10,20), [20,30), [30+), equivalent to the reference's // 10 approach."
+    },
+    "9-c": {
+        "question": "How is `output` *Position in corridor* thresholded into categories?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both produce 4 bins of 1m each. The AI's np.digitize and the reference's //10 with clip give equivalent results for positions in the corridor range.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly discretizes position into 4 equal-length bins using np.digitize with appropriate edges."
+    },
+    "9-d": {
+        "question": "How is `output` *Position in corridor* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both index ft_Pos with the same frame indices used for neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses pos[f] where f is the same frame array used for neural data."
+    },
+    "10-a": {
+        "question": "What variables in the raw data is `output` *Running speed* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both derive running speed from ft_RunSpeed, the running speed at each imaging frame.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses rec['ft_RunSpeed'] indexed by trial frames."
+    },
+    "10-b": {
+        "question": "What processing is involved in computing `output` *Running speed*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI computes speed quartile edges globally across all sessions using np.percentile, while the reference computes quartiles per-session using rank-based splitting. This is a meaningful difference: (1) Global edges mean the same speed threshold applies everywhere, but sessions with different speed distributions will have unequal bin counts. (2) Per-session rank-based splitting ensures each session has exactly 25% of frames in each bin, handling ties (e.g. many zero-speed frames) properly. The reference's per-session approach is more robust and matches the instruction '4 bins, each corresponding to 25% of the data' more literally. Additionally, the AI uses np.percentile which does not handle ties as well as the reference's rank-based method when many frames have the same speed. However, the AI's running filter (ft_move > 0) means there are fewer zero-speed frames, partially mitigating the tie issue.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes global percentile edges and uses np.digitize to bin speeds. The implementation matches its stated decision."
+    },
+    "10-c": {
+        "question": "How is `output` *Running speed* thresholded into categories?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI uses np.digitize with global percentile edges, while the reference uses rank-based per-session quartiles. The AI's approach may not achieve exactly 25% per bin in each session, and np.percentile-based thresholding can produce uneven bins when there are many tied values. The reference's rank-based approach guarantees equal bin sizes per session.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements np.digitize with the computed global speed_edges."
+    },
+    "10-d": {
+        "question": "How is `output` *Running speed* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both index ft_RunSpeed with the same frame indices used for neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses speed[f] where f is the same frame array used for neural data."
+    },
+    "11": {
+        "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both truncate behavior arrays to match the number of imaged frames, and both filter out-of-range lick frames. Both skip trials with no valid frames. The AI additionally handles NaN trial indices and negative lick frames, which is slightly more defensive but not problematic.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly handles frame count mismatches, out-of-range lick frames, and empty trials."
+    },
+    "12-a": {
+        "question": "What are the most time-consuming steps of the code?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both identify loading spike files as the most time-consuming step. The AI additionally notes its plane-by-plane selection optimization to avoid materializing the full matrix.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code's most time-consuming operation is indeed loading spike files from disk, which is correctly identified."
+    },
+    "12-b": {
+        "question": "What loops in the code could have been vectorized to improve efficiency?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both identify the per-trial loop as potentially vectorizable. The AI's trial loop iterates over trials to extract frame indices, similar to the reference's trial_frames function called in a list comprehension.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The identified loop (iterating over trials to extract frame indices) is correctly identified as vectorizable."
+    },
+    "12-c": {
+        "question": "What processing does the code repeat multiple times?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI's code calls add_frame_selection twice per recording (once for global speed computation, once for main conversion). The reference notes N/A for repeated processing. The AI's identification of repeated processing in its own code is accurate.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code does indeed call add_frame_selection twice, once in the speed quartile pass and once in the main conversion."
+    },
+    "12-d": {
+        "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI stores extensive metadata (cohort, experiment types, reward mode, per-session frame rates) that the decoder does not use. The reference notes N/A. Both assessments are reasonable -- the extra metadata doesn't hurt but isn't consumed downstream. Additionally, the AI loads all neurons from each plane before selecting 2000, discarding most of the loaded data, though the plane-by-plane approach mitigates peak memory.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly produces the identified extra metadata and performs the described neuron loading/discarding pattern."
+    }
 }

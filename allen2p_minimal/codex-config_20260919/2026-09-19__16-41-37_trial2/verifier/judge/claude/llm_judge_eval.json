@@ -1,226 +1,226 @@
 {
-  "1-a": {
-    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The AI reaches the same underlying data by a different route: instead of the AllenSDK's VisualBehaviorOphysProjectCache / get_behavior_ophys_experiment(), it enumerates the released NWB files on disk, joins them to project_metadata/ophys_experiment_table.csv, and reads the needed HDF5 datasets with h5py. I verified that the datasets it reads are exactly the ones the SDK exposes (processing/running/speed is the SDK-filtered running speed; acquisition/EyeTracking/pupil_tracking/area is already NaN precisely where likely_blink is True; event_detection is the SDK 'events' table), so no SDK-side processing is lost, and the direct read is much cheaper. It also enumerates all experiments in the supplied release, including quality checks (metadata row must exist for every NWB). The one substantive difference from the expert is that it applies no project_code filter, so the 45 VisualBehaviorMultiscope planes (one mouse) are converted alongside the 239 single-plane VisualBehavior experiments, whereas the expert restricted to project_code == 'VisualBehavior'. The instruction ('data under the \"Visual Behavior\" task') is ambiguous between the task and the project code, both projects run the identical change-detection task, and the provided paper actually analysed multiplane-rig sessions, so including them is defensible; the consequence for session definition is judged under 1-c.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "discover() globs every behavior_ophys_experiment_*.nwb, parses the id, fails if any file lacks a metadata row, filters ~passive, and probes each file for eye tracking; convert() then iterates the selected table and converts each file. Counts in the written metadata (284 supplied, 82 passive excluded, 3 without eye tracking, 199 converted) match what I reproduced independently from the experiment table and the NWB files."
-  },
-  "1-b": {
-    "question": "How are the data split into subjects (mice)?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Subjects are the unique mouse_id values from the Allen experiment table, sorted and stored as strings, with a per-session index into that list -- identical to the expert's approach. The resulting 38 subjects equal the expert's 37 single-plane mice plus the one multiscope mouse the AI additionally included (see 1-a/1-c).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "subjects = sorted({str(int(x)) for x in selected['mouse_id']}) and subject_idx.append(subject_to_index[str(int(row['mouse_id']))]) are appended in the same loop and order as the neural/input/output session lists, so subject_idx is aligned with the session ordering; verification_stats.json confirms 38 subjects with sessions_per_subject consistent with the metadata table."
-  },
-  "1-c": {
-    "question": "How are the data split into sessions?",
-    "decision_correctness": "CONCERNING",
-    "decision_correctness_justification": "Two sub-decisions. (1) Dropping the 82 passive-replay experiments is well justified and arguably better than the expert, whose pipeline kept them even though the animal is not performing the task (the expert's trial_outcome distribution, 69% 'miss', shows the cost of including them). (2) Defining a session as one imaging plane rather than one ophys_session_id is harmless for the 239 single-plane experiments (one plane per session, so it is identical to the expert) but is questionable for the multiscope mouse: its ~5 active multiplane recordings become 34 separate 'sessions' that share identical behaviour, identical trial timing and identical output labels, and that one mouse ends up supplying 34 of 199 sessions (17%). Because the decoder splits trials into train/validation within each session, the same physical trial can land in training for one plane and validation for another, and one animal is heavily over-weighted. The AI's stated rationale is also partly wrong ('combining planes would discard most supplied single-plane recordings' -- combining planes by ophys_session_id would not discard any single-plane recording); only the second half of its reason (asynchronous plane timestamps would need resampling) is valid, and it had already built a common 100 ms grid that would have solved that. Not technically wrong, but a human should check it.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code does exactly what it states: one selected experiment -> one entry in data['neural']/['input']/['output']/['brain_region_idx'], with ~passive filtering in discover() and session provenance (ophys_session_id, experiment id, session_type) recorded in metadata['session_info']. metadata['session_unit'] honestly documents 'One behavior_ophys_experiment / imaging plane'."
-  },
-  "1-d": {
-    "question": "How are the data split into trials?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Like the expert, the AI uses the experiment's own trials table and keeps the full trial interval start_time -> stop_time (variable length, ~7-12.5 s), rather than a fixed window around the change, so each trial contains pre-change flashes and the post-change response window and the time-varying outputs are meaningful. The only difference is that the window is tiled with whole 100 ms bins, so a remainder shorter than one bin at the trial end is dropped (<=99 ms, <1.5% of a trial); resulting trial durations (70-125 bins = 7.0-12.5 s) match the expert's 217-391 frames at 32.31 ms.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "make_trial_grids computes n_bins = floor((stop-start)/0.1) and builds edges/centers from start_time; the same grid is used for neural binning and every output row. I confirmed on a sample of experiments that no kept trial extends past the end of the ophys recording, so no trial is silently truncated by the recording boundary."
-  },
-  "1-e": {
-    "question": "How are trials filtered based on quality controls?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The retained set, (go OR catch) AND NOT aborted AND NOT auto_rewarded, is exactly what the instructions ask for and is equivalent to the expert's filter (~aborted & ~auto_rewarded & change_time notna): I verified on the data that every kept trial is either go or catch and has a finite change_time. Like the expert, the AI imposes no engagement/performance threshold, and it explicitly keeps activity-silent trials to avoid activity-based selection bias, which is the right call. It adds a useful integrity check (exactly one of hit/miss/false_alarm/correct_reject per kept trial) and a >=2-trials-per-session requirement matching the expert's minimum.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The keep mask, the unique-outcome assertion and the >=2 trial check are implemented as described. One robustness caveat rather than a mismatch: the <2-trial and no-valid-neuron cases raise from convert_experiment and are not caught in convert(), so instead of skipping such an experiment the whole conversion would abort; on this dataset no experiment triggered them, and the docstring never claims those cases are skipped."
-  },
-  "2-a": {
-    "question": "What variables in the raw data is the `neural` data derived from?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "The AI uses the Allen detected calcium events (processing/ophys/event_detection) rather than dF/F. methods.txt is explicit that this is what the reference paper does: 'For all analysis of neural data we used the detected calcium events as described in Garrett et al.' and 'We performed our analyses on discrete calcium events that were regressed from the raw fluorescence traces, thus removing the slow decay dynamics of the calcium indicator GCaMP6f.' The expert used dff_traces, which is a legitimate signal but is not the one the paper analyses; the instructions asked to use the SAME processing as the reference paper. The AI also correctly distinguishes event_detection from the SDK's smoothed filtered_events.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "It reads event_detection/data and event_detection/timestamps, applies the cell_specimen_table valid_roi mask to the neuron axis, and errors out if no neurons remain. I confirmed the array orientation (frames x ROIs) and that event_detection/timestamps are the ophys timestamps (median dt 32.31 ms for single-plane files)."
-  },
-  "2-b": {
-    "question": "How is the `neural` data processed?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Beyond selecting valid ROIs, the only processing is summation of event magnitudes into 100 ms bins -- no normalisation, smoothing or z-scoring, matching the expert's 'no additional processing' philosophy. Summation (not averaging) is the correct aggregation for sparse event magnitudes because it conserves total event mass irrespective of how many native frames fall in a bin, which matters given the mix of 31 Hz and 11 Hz recordings. The deviation from the expert is the re-binning itself (judged in 2-e). The AI does not need to stack planes because it defines a session as one plane.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The in-place float32 cumsum plus differences at searchsorted bin edges computes exactly the sum of event magnitudes whose ophys timestamps fall in [edge_i, edge_i+1). I reimplemented the binning in float64 for one experiment and the maximum discrepancy was 1.2e-05 against typical nonzero bin values of ~0.23, so the float32 cumulative-sum shortcut introduces no meaningful error."
-  },
-  "2-c": {
-    "question": "How is the `neural` data filtered based on quality controls?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Effectively the same as the expert: rely on the Allen pipeline's own QC and do no further neuron curation. The AI additionally applies the released valid_roi mask; I checked the NWBs and valid_roi is all-True in this release, so it is a no-op safeguard rather than a different filtering policy. Deliberately keeping silent (all-zero) trials -- 2-3% of trials, a consequence of using sparse events in small populations -- is the right choice to avoid activity-based selection bias.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "events = events[:, valid_roi] with a zero-neuron guard is the entirety of the filtering, matching the stated decision; no other neuron- or trial-level activity criterion appears anywhere in the file."
-  },
-  "2-d": {
-    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Alignment is to trial start on the ophys timebase, as the instructions require ('temporally align based on ophys timestamp') and as the expert did (temporal_alignment_event = 'trial_start'). The AI assigns each event frame to a bin using the frame's own ophys timestamp rather than frame index or nominal rate, and puts every other stream on the same trial-start-anchored grid; metadata records off_start = 0.0 and off_end = None (correct, since trial length varies).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "edges = start_time + k*0.1 and np.searchsorted(ophys_timestamps, edges, 'left') implement exactly the described alignment, with correct handling of the boundary cases (bin before the first frame / after the last frame contribute zero). Behavioural rows are sampled at centers from the same grid and sliced with an offset that advances in the same trial order, so all five output rows are index-aligned with the neural matrix."
-  },
-  "2-e": {
-    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The AI rebins everything to a fixed 100 ms bin, whereas the expert kept the native ophys sampling (32.31 ms) with no rebinning. Given the AI's decision to include both the 31 Hz single-plane and the ~11 Hz multiplane recordings, a common bin is actually required by the target format ('time bins should be the same size for all trials and sessions'), and 100 ms is a sensible choice relative to the 250 ms flash / 500 ms grey cycle; summing events makes the rebinning lossless in total event mass. The cost, which a reader should be aware of, is ~3x coarser temporal resolution than the expert's data and correspondingly lower resolution for the fast targets (the AI's validation balanced accuracy for image identity is 0.255 vs the expert's 0.395, though the two runs are on different data subsets and are not directly comparable). Well justified, but a real deviation.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "BIN_SECONDS = 0.1 is used to build every trial grid and is reported honestly as metadata['time_bin_size'] = 100.0; the verifier's summary confirms every trial in the pickle is on 100 ms bins."
-  },
-  "3-a": {
-    "question": "What variables in the raw data is `output` *Image identity* derived from?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The AI derives identity from the stimulus presentations table (image_name, start_time, stop_time, omitted) instead of the trials table's initial_image_name/change_image_name used by the expert. Both are valid sources of the same ground truth, but the presentations table is the authoritative per-flash record and is the only one that lets the AI represent omissions and the grey inter-stimulus interval. It also correctly disambiguates the image table from natural_movie_one_presentations / spontaneous_presentations and fails loudly if that assumption breaks.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "stimulus_group() selects the unique interval group containing image_name, and start/stop/name/omitted are read from it; I confirmed on the NWBs that only the natural-image presentation table has an image_name column, so the selection is unambiguous."
-  },
-  "3-b": {
-    "question": "What processing is involved in computing `output` *Image identity*?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The AI labels bins with the image actually on screen and introduces an explicit 'gray' class (index 0) for the inter-stimulus grey and for omitted flashes; the expert instead holds the image identity constant across the trial (initial image before the change, change image after), with no grey class. Both are coherent readings of 'Image identity (of the image presented during the non-grey screen)'. The AI's version is physically accurate and handles omissions, and its global sorted vocabulary is deterministic and shared across sessions (the same approach as the expert). The caveat a human should note is that it changes the target distribution substantially -- 66.5% of bins are 'gray' (matching the 500/750 ms duty cycle), so much of the decoding problem becomes flash detection, and per-image classes are ~2% each instead of ~6%. Defensible and clearly documented, so not concerning, but it is the main reason the image-identity statistics diverge from the expert's.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "collect_image_names builds ['gray', *sorted(images)] across all selected experiments, omitted flashes are excluded from the vocabulary and left as gray, and per-bin assignment uses centers in [stim_start, stim_stop). The realised gray fraction in verification_stats.json (0.665) matches the expected 500 ms/750 ms duty cycle, and the 17 values match output_values[0]."
-  },
-  "3-c": {
-    "question": "How is `output` *Image identity* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Identity is evaluated per bin on exactly the same trial grid as the neural matrix, using stimulus times on the same synchronised NWB clock -- the same frame-level alignment principle the expert used (both index the outputs with the same per-trial index array/grid as the neural data).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The overlap prefilter ((stim_stop > edges[0]) & (stim_start < edges[-1])) is inclusive and cannot drop a presentation that intersects the trial, and the mask (centers >= start) & (centers < stop) writes into the same n_time row that is stacked as output[0] of the (5, n_time) matrix, guaranteeing element-wise alignment with neural."
-  },
-  "4-a": {
-    "question": "What variables in the raw data is `output` *Image change* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The AI uses the stimulus table's is_change flag plus that flash's start_time; the expert used trials.change_time together with the go flag. These carry the same information: I verified on the data that is_change is set exactly once inside each go trial window and never inside a catch (sham-change) trial, so both formulations give 1 only on real image changes and 0 throughout catch trials.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "is_change is stored as float in these NWBs and the code guards with np.isfinite before the boolean cast, so NaNs are not silently treated as changes. I confirmed on a sample that exactly one change flash falls inside each kept go trial and none inside kept catch trials, so the per-trial positive count is as intended."
-  },
-  "4-b": {
-    "question": "What processing is involved in computing `output` *Image change*?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The AI marks a single 100 ms bin -- the first bin whose centre is at or after the change onset -- whereas the expert marked the 750 ms change flash plus following grey. The instruction says 'value of 1 right after a change in image identity, otherwise 0', and the AI's version is the more literal reading; the expert's is the more calcium-friendly one. The trade-off worth flagging: only 1.03% of bins are positive (vs 7.65% for the expert), and a 100 ms window is much shorter than the evoked response, so the class is very rare; in practice the AI still reached 0.565 validation balanced accuracy on this target (expert 0.587 on its own data), so the choice did not break decodability.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "image_change is initialised to zeros and set to 1 only at change_bin, bounds-checked against n_time; the realised positive fraction in verification_stats.json (0.0103) is consistent with one 100 ms bin per go trial over ~84-bin trials with ~85% go trials."
-  },
-  "4-c": {
-    "question": "How is `output` *Image change* thresholded into categories?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "No thresholding of a continuous quantity is needed -- the variable is natively binary with output_values ['no change', 'change'], as in the expert's solution. The only discretisation choice is temporal width of the positive class, which is the single-bin choice discussed in 4-b: defensible under the instruction's wording, but narrower than the expert's 750 ms and a notably imbalanced target.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "output_values[1] = ['no change', 'change'] and the stored row only ever takes values 0/1 (output_range in verification_stats.json is [0, 1]), consistent with the stated binary encoding."
-  },
-  "4-d": {
-    "question": "How is `output` *Image change* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Same grid and same clock as the neural data, located with searchsorted on the bin centres -- the same alignment logic the expert used for its change indicator (searchsorted of change_time into the trial's ophys timestamps).",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "np.searchsorted(centers, stim_start, side='left') returns the first bin whose centre is at or after the change onset (so the marked bin may begin up to 100 ms before the change, an unavoidable and symmetric consequence of 100 ms bins), and the row is stored as output[1] of the same (5, n_time) matrix."
-  },
-  "5-a": {
-    "question": "What variables in the raw data is `output` *Running speed* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "processing/running/speed is the NWB path backing the SDK's running_speed property that the expert used; the AI correctly took the filtered 'speed' stream rather than 'speed_unfiltered' or the raw encoder 'dx'.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Both data and timestamps are read from processing/running/speed, and I confirmed against the NWB layout that this group is the SDK-filtered running speed used by allensdk."
-  },
-  "5-b": {
-    "question": "What processing is involved in computing `output` *Running speed*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Linear interpolation of the running trace onto the (ophys-derived) analysis timebase followed by percentile discretisation is exactly the expert's procedure; the only differences are that the AI samples at 100 ms bin centres instead of ophys frames and that np.interp clamps at the trace endpoints instead of producing NaN. It correctly interpolates only over finite samples and hard-fails if a session has essentially no running data.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "interpolate_finite masks non-finite timestamps/values, requires >=2 valid samples, and np.interp is evaluated on the concatenated bin centres of all retained trials -- the same array later sliced per trial, so no interpolation/indexing mismatch is possible. The endpoint-clamping behaviour is explicitly documented in a comment rather than being an unnoticed side effect."
-  },
-  "5-c": {
-    "question": "How is `output` *Running speed* thresholded into categories?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Five equal-percentile bins are computed per experiment over the retained trial bins, whereas the expert computed one global set of edges across all sessions. The instructions only say 'discretized into five equal percentile bins', so both satisfy them and both yield 20% marginals. Per-session percentiles are a reasonable normalisation (they remove between-animal/rig scale differences and make each session's classes balanced), but they also make the class labels session-relative while the decoder uses a single shared readout head across sessions, and they remove the across-session variance that is often the easiest thing to decode -- the AI's validation balanced accuracy for running (0.235) is well below the expert's (0.350). Equally justifiable, with a real effect on measured accuracy that a human should be aware of.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "quintile() uses np.quantile at 0.2/0.4/0.6/0.8 with searchsorted(side='right'), applied to the per-experiment concatenation of retained-trial bin centres, exactly as metadata['percentile_scope'] = 'Within experiment over retained trial bins' claims; realised marginals are 0.200 per class."
-  },
-  "5-d": {
-    "question": "How is `output` *Running speed* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Running speed is placed on the same trial-start-anchored ophys grid as the neural data before being discretised, so it shares indices with the neural matrix -- the same guarantee the expert obtained by interpolating onto ophys_timestamps and indexing with the same idx array. The justification (all streams hardware-synced on one clock) matches methods.txt and the expert's reasoning.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The concatenate-then-slice pattern (offset += n_time inside the same loop that consumes grids in order) keeps the running/pupil rows in exact correspondence with each trial's bins; grids is iterated in the same order used for the concatenation."
-  },
-  "6-a": {
-    "question": "What variables in the raw data is `output` *Pupil diameter* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The AI uses the SDK-processed pupil area (acquisition/EyeTracking/pupil_tracking/area) converted to an equivalent circular diameter, with eye_tracking timestamps; the expert used pupil_width with likely_blink rows removed. I verified in the NWBs that area is NaN exactly on the likely_blink frames, so the AI's blink handling is equivalent to the expert's explicit blink filtering, and it verified this by reading the SDK source before relying on it. Area-derived diameter vs width is a defensible measurement choice either way.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "area is read from pupil_tracking and timestamps from eye_tracking (same length, 1:1 correspondence, confirmed on the files), and 2*sqrt(max(area,0)/pi) is a correct equivalent-diameter conversion; the np.maximum guard prevents NaN from any negative area."
-  },
-  "6-b": {
-    "question": "What processing is involved in computing `output` *Pupil diameter*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Drop NaN/blink samples, linearly interpolate onto the analysis timebase, then percentile-discretise -- the same pipeline as the expert (which likewise interpolates across removed blink frames). The AI additionally documents that the monotonic area->diameter transform leaves the percentile labels unchanged. One shared limitation worth noting: linear interpolation bridges the occasional long tracking dropout (I measured NaN runs up to ~60 s in some sessions), so a small number of trials carry fabricated pupil values; the expert's NaN->bin 0 rule has an analogous, arguably worse, failure mode.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same interpolate_finite helper is reused, so non-finite samples are excluded from the interpolation source and the result is finite everywhere; experiments with no eye tracking at all were already removed in discover(), so the <2-sample error path is effectively unreachable."
-  },
-  "6-c": {
-    "question": "How is `output` *Pupil diameter* thresholded into categories?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Same scheme as running speed: within-experiment quintiles over retained trial bins, vs the expert's global edges. The argument for per-session normalisation is strongest here because pupil area is in camera pixels and depends on rig/camera geometry, so absolute values are not comparable across experiments. As in 5-c, it is equally justifiable but removes the across-session component of the signal: the AI's pupil validation balanced accuracy is 0.229 (near the 0.2 chance level) vs the expert's 0.433. A human should decide which definition of the task is intended.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The same quintile() call is applied to the per-experiment concatenated pupil values, and the realised marginals are 20% per class, matching metadata['percentile_scope'] and output_values[3]."
-  },
-  "6-d": {
-    "question": "How is `output` *Pupil diameter* aligned with the neural data?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Interpolated at the same bin centres as the neural bins and sliced per trial with the same offsets, i.e. identical alignment guarantee to the expert's (index both with the same per-trial index array), justified by the same hardware synchronisation of the eye camera with the 2P clock.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "pupil_bins is produced from all_centers, the same array used for running speed and derived from the same grids list, then sliced with the shared offset counter into output[3]; there is no separate index path that could drift."
-  },
-  "7-a": {
-    "question": "What variables in the raw data is `output` *Trial outcome* derived from?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "The four canonical boolean columns hit / miss / false_alarm / correct_reject from the trials table, in the same order as the expert's TRIAL_OUTCOMES, giving the same 4-class variable with the same code assignment.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "OUTCOME_COLUMNS is column-stacked from the trials table and indexed by the same row index used for the trial window, so the outcome belongs to the trial it is stored with; the assertion that exactly one column is True holds for all kept trials (the conversion completed without raising)."
-  },
-  "7-b": {
-    "question": "What processing is involved in computing `output` *Trial outcome*?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Integer code 0-3 per trial, broadcast constant across the trial's bins so the static variable fits the rectangular output matrix -- exactly the expert's treatment (np.full(n_frames, outcome_code)). The AI's strict uniqueness check is a small improvement over the expert's silent 'other' -> -1 fallback, which would have produced an out-of-range class if it ever fired.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "outcome = np.flatnonzero(outcomes[trial_row])[0] followed by output[4].fill(outcome) yields a constant row, and output_values[4] lists the four names in the same order as OUTCOME_COLUMNS, so the codes are interpretable; verification_stats.json shows trial outcome values in [0, 3]."
-  },
-  "8": {
-    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "Coverage is broadly comparable to the expert's: blink/NaN pupil samples are excluded and bridged by interpolation, out-of-range behaviour is clamped rather than left NaN (documented), the float-typed is_change is NaN-guarded, ragged sub-bin trial ends are dropped, and the pickle is written atomically via a temp file. Two differences from the expert are worth a human's attention. (1) The three active experiments whose NWB has no eye tracking are dropped entirely, discarding their neural data and trials, rather than being kept with a missing-data code as the expert would; this is defensible (pupil is a required output and imputing it would be worse) and affects only 3 of 202 experiments, and the excluded ids are recorded in metadata. (2) Unlike the expert's per-session try/except, the AI fails fast: any structural anomaly (no valid ROIs, <2 trials, ambiguous outcome, unexpected interval tables) aborts the whole conversion instead of skipping one experiment. Nothing triggered on this dataset, and fail-fast is a legitimate stance, but it makes the script brittle on data the author has not inspected.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Each described behaviour is present and does what the docstring/metadata claim: the eye-tracking probe and the excluded-id list, the finite-mask interpolation, the isfinite guard on is_change, the n_bins < 1 skip, and the temp-file-then-replace write. The exclusion counts written to metadata (82 passive, 3 no-eye-tracking, 199 converted of 284 supplied) are arithmetically consistent and match the data."
-  },
-  "9-a": {
-    "question": "What are the most time-consuming steps of the code?",
-    "decision_correctness": "BETTER",
-    "decision_correctness_justification": "Like the expert, the AI is I/O-bound, but it made deliberate choices that make it far cheaper: reading only the required HDF5 datasets with h5py instead of constructing AllenSDK BehaviorOphysExperiment objects (avoiding image templates, ROI masks, raw/demixed/neuropil traces), casting during the HDF5 read to avoid a second buffer, and computing one in-place cumulative sum per experiment so that all trials' bins are obtained by differences. The whole 199-experiment conversion ran in a few minutes, versus the expert's SDK-load-dominated pipeline. Residual costs (three HDF5 passes per file, the 2.55 GiB pickle write) are acknowledged below rather than hidden.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The optimisations described in the docstring are the ones actually implemented (read_array with read_direct casting, np.cumsum(..., out=events), single pass over trials per experiment), and the reported runtime behaviour in the trajectory is consistent with an I/O-dominated few-minute run."
-  },
-  "9-b": {
-    "question": "What loops in the code could have been vectorized to improve efficiency?",
-    "decision_correctness": "MATCH",
-    "decision_correctness_justification": "Like the expert, the AI leaves a readable per-trial Python loop in place while vectorising the parts that matter (one searchsorted per trial for all bin edges, one interpolation and one quintile call per experiment for all trials at once). The remaining loops -- per trial, per overlapping stimulus presentation, make_trial_grids, the element-wise string decode, and the two per-file discovery loops -- could be vectorised or merged, but they are not the bottleneck relative to HDF5 reads, which is the same conclusion the expert reached.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The code structure matches this description: cumulative_bin_sums is fully array-based; the only scalar Python work per trial is the grid construction, the outcome lookup and the short loop over the few presentations overlapping that trial."
-  },
-  "9-c": {
-    "question": "What processing does the code repeat multiple times?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The expert claims no repeated processing; the AI does repeat some work, opening every NWB three times (eye-tracking probe in discover(), image-name scan in collect_image_names(), then the conversion itself) and decoding the ~70k-element image_name column twice per file. This is a genuine if modest inefficiency and could have been collapsed into one pass with a two-stage assembly, as the expert did for its bin edges. It is nonetheless a reasonable engineering trade-off -- the extra passes only read small datasets and they buy a globally consistent image vocabulary and a pre-validated experiment list before any heavy work starts -- and the AI's overall runtime is still much lower than the expert's.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "The three passes are plainly visible in convert(): discover(), collect_image_names(), then the convert_experiment loop; nothing hides or memoises the repeated opens, and the repetition is limited to metadata-sized datasets (the large event array is read only once per experiment)."
-  },
-  "9-d": {
-    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
-    "decision_correctness": "OK",
-    "decision_correctness_justification": "The expert answered 'N/A'; the AI's pipeline has a few small pieces of discarded work -- the cumulative sum spans the whole session although only trial windows (roughly 5-15% of it) are read out, full running/eye traces are loaded, the monotonic area->diameter transform cannot change the quintile labels (the AI itself says so), valid_roi masking plus the contiguous copy are no-ops on released data, and a per-trial empty (0, n_time) input array is materialised. None of these are wasteful enough to matter, and each has a stated reason (whole-session cumsum avoids re-reading the event dataset; the diameter conversion buys interpretability). The one consequential item is storing sparse event data densely as float32, producing a 2.55 GiB pickle where ~99.8% of entries are zero -- but the target format and the supplied decoder require dense per-trial arrays, so this is imposed by the spec rather than chosen.",
-    "code_correctness": "CORRECT",
-    "code_correctness_justification": "Each of these behaviours is exactly what the code does, and the docstring is candid about the two deliberate ones (monotonic pupil transform, whole-session cumulative sums); the resulting file size reported by the script (2.55 GiB) matches the artefact on disk."
-  }
+    "1-a": {
+        "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI reads NWB files directly with h5py rather than using the AllenSDK's Python API (VisualBehaviorOphysProjectCache). Both approaches access the same underlying data. The AI's approach is a valid alternative that avoids materializing unnecessary data structures. The reference uses the SDK's get_behavior_ophys_experiment() method. Both correctly identify and load all experiments from the VisualBehavior project.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly discovers NWB files, reads the experiment table CSV, filters to active experiments, and loads data from each NWB file using h5py."
+    },
+    "1-b": {
+        "question": "How are the data split into subjects (mice)?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both the AI and the reference use mouse_id from the experiment table to identify unique subjects. Both sort the subject list and create index mappings.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly extracts unique mouse_id values, sorts them, and maps them to indices."
+    },
+    "1-c": {
+        "question": "How are the data split into sessions?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI treats each individual behavior_ophys_experiment (one imaging plane) as a separate decoder session, while the reference groups all experiments from the same ophys_session_id into a single session with neurons merged across planes. The AI's justification that this is 'consistent with the paper's plane-wise decoding' has some merit, but the instructions say to use the SAME processing as the reference paper/code. The reference SDK code groups experiments by ophys_session_id, and the instruction says to align based on ophys timestamps which implies a multi-plane session. This results in many more sessions (199 vs fewer grouped sessions) with fewer neurons per session, which fundamentally changes the decoding task structure. The AI's choice to not combine planes is reasonable for single-plane experiments but loses the multi-plane aggregation that the reference implements.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements its decision of treating each experiment as a separate session, iterating over selected experiments one at a time."
+    },
+    "1-d": {
+        "question": "How are the data split into trials?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both the AI and reference use the NWB/SDK trials table, filter to go/catch trials (excluding aborted and auto-rewarded), and use start_time to stop_time as the trial window. The AI explicitly checks go|catch while the reference checks ~aborted & ~auto_rewarded & change_time.notna(), but functionally these select the same trials (go and catch trials are the non-aborted, non-auto-rewarded trials with valid change times).",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads the trials table, applies the go|catch filter, excludes aborted and auto-rewarded, and segments by start_time/stop_time."
+    },
+    "1-e": {
+        "question": "How are trials filtered based on quality controls?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions exclude aborted and auto-rewarded trials, require a minimum of 2 trials per session, and handle edge cases (empty trials, truncated trials). The AI additionally excludes passive sessions and sessions without eye tracking at the experiment level, which is a reasonable additional quality control. The reference also excludes sessions with <2 trials.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements all described filters: go|catch, not aborted, not auto-rewarded, n_bins >= 1, >= 2 trials per session, active-only experiments, and eye tracking availability."
+    },
+    "2-a": {
+        "question": "What variables in the raw data is the `neural` data derived from?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI uses event_detection (calcium event magnitudes) while the reference uses dff_traces (dF/F fluorescence traces). The AI justifies this by saying 'The source paper uses detected calcium events (not dF/F)'. While the paper does use calcium events for some analyses, dF/F is the standard neural activity measure for calcium imaging and is what the reference solution uses. The choice of calcium events vs dF/F fundamentally changes the nature of the neural signal — events are sparse and represent detected transients, while dF/F is the continuous fluorescence signal. This is a significant divergence that affects decoder performance and data interpretation. The AI's justification from the paper is partially valid but the reference code explicitly uses dff_traces.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads event_detection data from the NWB file and processes it as described."
+    },
+    "2-b": {
+        "question": "How is the `neural` data processed?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI sums calcium event magnitudes into 100ms bins using a cumulative sum approach, while the reference simply extracts raw dF/F traces at native frame rate. The binning and summing of events is a fundamentally different processing pipeline. The reference does no temporal rebinning — it uses dF/F at native ophys frame rate. The AI's approach of summing events in bins is appropriate for event data but represents a different neural representation entirely. Additionally, the AI applies valid_roi filtering while the reference does not.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements cumulative bin sums of event magnitudes within 100ms time bins, and correctly applies valid_roi filtering."
+    },
+    "2-c": {
+        "question": "How is the `neural` data filtered based on quality controls?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI applies valid_roi filtering to exclude neurons that failed quality control, while the reference includes all neurons from dff_traces without additional filtering. The AI's approach is arguably more careful — applying valid_roi is a reasonable quality control. However, the reference explicitly chose not to apply additional filtering, noting that the Allen SDK pipeline already handles QC. The difference could affect the number of neurons per session.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads valid_roi from the cell specimen table and filters neurons accordingly."
+    },
+    "2-d": {
+        "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions align to trial start using ophys timestamps. The reference uses np.searchsorted on ophys_timestamps to find frame indices for start_time and stop_time. The AI creates 100ms bins anchored at trial start_time. Both use the ophys timestamp clock for alignment, as instructed.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly creates time bins anchored at trial start_time and uses ophys_timestamps for alignment via searchsorted."
+    },
+    "2-e": {
+        "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI rebins to 100ms bins while the reference keeps the native ophys frame rate (~11Hz, ~93ms bins). The AI's 100ms bin size is close to the native frame rate but represents an explicit rebinning choice. The reference computes the time bin size from the median inter-frame interval, preserving the native resolution. The 100ms choice is reasonable for event data but is a departure from the reference approach. The instructions say 'Time bins should be the same size for all trials and sessions' — the native frame rate satisfies this for single-plane experiments, but the AI's fixed 100ms bins also satisfy it.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements 100ms binning with BIN_SECONDS = 0.100 and reports time_bin_size as 100.0 ms."
+    },
+    "3-a": {
+        "question": "What variables in the raw data is `output` *Image identity* derived from?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI derives image identity from the stimulus presentations table (start_time, stop_time, image_name, omitted fields), while the reference uses initial_image_name and change_image_name from the trials table with change_time. The AI's approach provides finer-grained tracking including explicit gray periods between flashes and during omissions. The reference approach is simpler but both capture the essential information. The AI's inclusion of a 'gray' class for inter-stimulus intervals is a reasonable and arguably more detailed representation.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads stimulus presentation data, handles omitted presentations, and assigns gray/image indices based on bin center timing."
+    },
+    "3-b": {
+        "question": "What processing is involved in computing `output` *Image identity*?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI maps image names to integer indices with a global mapping that includes 'gray' as index 0. The reference also uses a global mapping but without a gray class. The AI's approach assigns gray to bins between stimulus presentations and during omissions, while the reference assigns initial_image_name before change_time and change_image_name after. The AI's representation is more detailed but different from the reference.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly builds a global image-to-index mapping, defaults to gray, and assigns image indices based on stimulus presentation times."
+    },
+    "3-c": {
+        "question": "How is `output` *Image identity* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions align image identity to the same time grid as neural data. The AI uses 100ms bin centers; the reference uses ophys frame indices. Both ensure temporal alignment between neural and output data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly uses the same bin centers for image identity as for neural data alignment."
+    },
+    "4-a": {
+        "question": "What variables in the raw data is `output` *Image change* derived from?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI derives image change from is_change in the stimulus presentations table, while the reference uses the go column and change_time from the trials table. Both identify true image changes, but through different mechanisms. The AI's approach using is_change from stimulus presentations is a valid alternative that directly identifies which stimulus flash was the change.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads is_change from the stimulus table and uses it to identify change events."
+    },
+    "4-b": {
+        "question": "What processing is involved in computing `output` *Image change*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI marks only a single time bin at the change onset, while the reference marks a 750ms window (one flash + gray period) starting at change_time. The instructions say 'Have value of 1 right after a change in image identity, otherwise 0', which is ambiguous — it could mean a point indicator or a sustained period. The reference's 750ms window covers the stimulus flash and subsequent gray period, which is more physiologically meaningful. The AI's single-bin approach is a minimal interpretation. This difference affects the decoder's ability to detect changes.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly implements a single-bin change indicator at the first bin at or after the change onset."
+    },
+    "4-c": {
+        "question": "How is `output` *Image change* thresholded into categories?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions treat image change as inherently binary (0/1) with no additional thresholding needed.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly produces a binary 0/1 output."
+    },
+    "4-d": {
+        "question": "How is `output` *Image change* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions compute image change at the same time points as neural data, ensuring alignment.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code uses the same bin centers/grid as neural data for image change computation."
+    },
+    "5-a": {
+        "question": "What variables in the raw data is `output` *Running speed* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions derive running speed from the running speed data in the NWB/SDK (processing/running/speed). The reference uses dataset.running_speed; the AI reads from nwb['processing/running/speed']. Same underlying data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads running speed timestamps and values from the NWB file."
+    },
+    "5-b": {
+        "question": "What processing is involved in computing `output` *Running speed*?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "The AI discretizes running speed into quintiles within each experiment, while the reference computes percentile bin edges globally across all sessions. The instructions say 'discretized into five equal percentile bins' without specifying the scope. Within-experiment quintiling produces different bin edges for each session, meaning the same absolute running speed could be in different bins across sessions. The reference's global approach ensures consistent bin definitions. The AI's choice has some justification (removes between-animal scale differences) but creates inconsistent category definitions across sessions.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly computes quintiles within each experiment using np.quantile and np.searchsorted."
+    },
+    "5-c": {
+        "question": "How is `output` *Running speed* thresholded into categories?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "Same concern as 5-b: within-experiment quintiling vs global percentile binning. The AI uses 4 quantile edges (0.2, 0.4, 0.6, 0.8) producing 5 bins labeled 0-4. The reference uses np.linspace(0,100,6) percentiles producing bin edges, then np.digitize. Both produce 5 bins but with different scope.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The quintile function correctly computes 4 edges at 20th/40th/60th/80th percentiles and assigns bins 0-4 using searchsorted."
+    },
+    "5-d": {
+        "question": "How is `output` *Running speed* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions interpolate running speed to the same time base as neural data. The reference interpolates to ophys timestamps; the AI interpolates to 100ms bin centers. Both ensure alignment between running speed and neural data.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly interpolates running speed to bin centers using interpolate_finite (which wraps np.interp)."
+    },
+    "6-a": {
+        "question": "What variables in the raw data is `output` *Pupil diameter* derived from?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI derives pupil diameter from pupil_area (from pupil_tracking/area) and converts to equivalent circular diameter via 2*sqrt(area/pi). The reference uses pupil_width directly from eye_tracking. Both are valid measures of pupil size. The AI's conversion from area to diameter is a reasonable approach since the NWB stores area. The reference's use of pupil_width is more direct. Since 2*sqrt(area/pi) is monotonically related to area, the quintile labels would be the same as quintiling area directly, as the agent noted.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads pupil area from the NWB file and converts to diameter using the circular area formula."
+    },
+    "6-b": {
+        "question": "What processing is involved in computing `output` *Pupil diameter*?",
+        "decision_correctness": "OK",
+        "decision_correctness_justification": "The AI converts pupil area to diameter, relies on the SDK's pre-processing (NaN for blinks), interpolates finite values to bin centers, and quintile-bins within each experiment. The reference removes blink frames using likely_blink, interpolates pupil_width to ophys timestamps, and bins globally. Both handle blinks (AI via SDK NaN values, reference via likely_blink flag) and interpolate. The within-experiment vs global binning difference is the same concern as running speed.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly handles the area-to-diameter conversion, uses interpolate_finite which filters NaN/non-finite values, and applies within-experiment quintiling."
+    },
+    "6-c": {
+        "question": "How is `output` *Pupil diameter* thresholded into categories?",
+        "decision_correctness": "CONCERNING",
+        "decision_correctness_justification": "Same concern as running speed: within-experiment quintiling vs global percentile binning. The categories may not be consistent across experiments.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The quintile function is correctly applied to pupil diameter values."
+    },
+    "6-d": {
+        "question": "How is `output` *Pupil diameter* aligned with the neural data?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions interpolate pupil data to the same time base as neural data, ensuring alignment.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly interpolates pupil diameter to bin centers using interpolate_finite."
+    },
+    "7-a": {
+        "question": "What variables in the raw data is `output` *Trial outcome* derived from?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions derive trial outcome from the same four boolean columns: hit, miss, false_alarm, and correct_reject in the trials table.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly reads the four outcome columns from the NWB trials table and validates mutual exclusivity."
+    },
+    "7-b": {
+        "question": "What processing is involved in computing `output` *Trial outcome*?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions map the four outcomes to integer codes (0-3) and repeat the code across all time bins within a trial. The mapping order is the same: hit=0, miss=1, false_alarm=2, correct_reject=3.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly identifies the outcome via np.flatnonzero, maps to an index, and fills the output row with the outcome code."
+    },
+    "8": {
+        "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions handle missing data appropriately: the AI excludes sessions without eye tracking, handles NaN pupil values through interpolation of finite values only, validates trial outcomes, and requires minimum trial counts. The reference handles NaN by mapping to bin 0, clips truncated trials, and uses try/except for failed sessions. Both approaches are reasonable and handle edge cases.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code correctly excludes experiments without eye tracking, uses interpolate_finite to handle NaN values, validates outcome uniqueness, and enforces minimum trial counts."
+    },
+    "9-a": {
+        "question": "What are the most time-consuming steps of the code?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions identify file I/O as the main bottleneck. The AI notes that discover() and convert_experiment() involve extensive NWB reading. The reference identifies get_behavior_ophys_experiment() as the bottleneck. Both are correct that data loading dominates runtime.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "N/A - this is an analysis question, not a code implementation question."
+    },
+    "9-b": {
+        "question": "What loops in the code could have been vectorized to improve efficiency?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "Both solutions identify the per-trial processing loop as potentially vectorizable but note it's not a bottleneck compared to I/O. The AI specifically mentions the per-stimulus-presentation inner loop. Both correctly identify that vectorization would yield minimal speedup.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "N/A - this is an analysis question."
+    },
+    "9-c": {
+        "question": "What processing does the code repeat multiple times?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI correctly identifies that NWB files are opened 3 times: in discover(), collect_image_names(), and convert_experiment(). The reference notes no processing is repeated due to its two-pass architecture. The AI's code does repeat file I/O, which is a valid observation about its own code's inefficiency.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code does indeed open each NWB file 3 times across the three functions."
+    },
+    "9-d": {
+        "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+        "decision_correctness": "MATCH",
+        "decision_correctness_justification": "The AI notes that extensive session_info metadata is collected and stored but not used by the decoder. The reference says N/A. The AI's observation about its own code is valid — the metadata collection adds I/O overhead for information not used in decoding.",
+        "code_correctness": "CORRECT",
+        "code_correctness_justification": "The code does collect detailed session_info metadata that is not used by the decoder."
+    }
 }

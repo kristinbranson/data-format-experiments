@@ -2,256 +2,580 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent reads the BWM dataset/session parquet indexes directly, selects a deterministic ten-session subset from `bwm_release.csv`, and downloads the required ALF payloads from public S3 into a UUID-keyed cache. Thus `--full` means ten selected sessions, not all eligible released sessions.
+i. The AI does not load the full release through ONE. It reads local metadata tables from `datasets.pqt`, `sessions.pqt`, and `bwm_release.csv`, picks a deterministic 10-subject subset, and then downloads per-session payload files directly from the public S3 bucket into `/app/data/raw_cache`. Session contents are then loaded record-by-record with `load_record`.
 
-ii. `x=pd.read_csv(RELEASE,index_col=0); np.random.seed(42)`; `subs=np.random.choice(np.unique(x.subject),10,replace=False)`; `q=pd.read_parquet(QPATH)`; `urllib.request.urlretrieve(url,tmp)`; `n=2 if args.sample else 10`.
+ii.
+```python
+QPATH=ROOT/'data/one_cache/Brainwidemap/datasets.pqt'; SPATH=ROOT/'data/one_cache/Brainwidemap/sessions.pqt'
+RELEASE=ROOT/'code/code_zhang2025/data/bwm_release.csv'
+```
 
-iii. The notes justify ten sessions as a deterministic methods-paper/README use case and as limiting downloads to about 5.4 GB instead of hundreds of GB. They describe exact cache metadata, UUIDs, sizes, and public-S3 provenance.
+```python
+def selected_eids(n):
+ x=pd.read_csv(RELEASE,index_col=0); np.random.seed(42)
+ subs=np.random.choice(np.unique(x.subject),10,replace=False); by=x.groupby('subject').indices
+ eids=[str(x.iloc[by[s][0]].eid) for s in subs]
+ return list(zip(subs[:n],eids[:n]))
+```
 
-## 1-b. How are the data split into subjects?
+```python
+def fetch(eid,did,r,srow):
+ ext=r.rel_path.rsplit('.',1)[-1]; out=RAW/eid/(str(did)+'.'+ext)
+ ...
+ url=record_url(eid,did,r,srow)
+ ...
+ urllib.request.urlretrieve(url,tmp)
+```
 
-i. Subject labels come from `bwm_release.csv`. Ten unique subjects are randomly selected without replacement, one first listed session is chosen for each, and output `subject_idx` indexes the encounter-ordered unique subject list.
+iii. In `CONVERSION_NOTES.md` Step 5 and the trajectory, the AI justifies this as a practicality decision: the local cache only contains metadata, direct S3 access was reachable, and processing all stream-complete sessions was estimated to be too large, so it chose a deterministic 10-session subset with metadata-driven downloads.
 
-ii. `subs=np.random.choice(np.unique(x.subject),10,replace=False)`; `eids=[str(x.iloc[by[s][0]].eid) for s in subs]`; `subject_idx=np.array([subjects.index(x['subject']) for x in sessions],np.int64)`.
+## 1-b. How are the data split into subjects (mice)?
 
-iii. The notes say this seeded one-session-per-subject selection makes a reproducible, tractable ten-session subset.
+i. Subjects are taken from the `subject` column of `bwm_release.csv`. The AI samples 10 unique subjects with `np.random.seed(42)` and keeps one session per chosen subject. In the final dataset, `subjects` preserves first-seen order from the processed sessions.
+
+ii.
+```python
+subs=np.random.choice(np.unique(x.subject),10,replace=False); by=x.groupby('subject').indices
+eids=[str(x.iloc[by[s][0]].eid) for s in subs]
+return list(zip(subs[:n],eids[:n]))
+```
+
+```python
+subjects=[]
+for x in sessions:
+ if x['subject'] not in subjects: subjects.append(x['subject'])
+...
+'subject_idx':np.array([subjects.index(x['subject']) for x in sessions],np.int64),
+```
+
+iii. The notes justify this as matching the AI's chosen 10-session canonical subset, with one selected session per sampled subject.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each EID is already a session. `load_session` processes one selected EID, and its result becomes one element of each session-level output list.
+i. Sessions are defined by EIDs chosen from the release CSV. The AI does not iterate all available sessions; it processes the single selected EID for each sampled subject.
 
-ii. `for subject,eid in chosen: sessions.append(load_session(eid,subject,q,ss.loc[eid]))`; `data['neural'].append(x['neural'])`.
+ii.
+```python
+eids=[str(x.iloc[by[s][0]].eid) for s in subs]
+return list(zip(subs[:n],eids[:n]))
+```
 
-iii. The notes treat EID/session boundaries from the ONE metadata as authoritative.
+```python
+n=2 if args.sample else 10; q=pd.read_parquet(QPATH); ss=pd.read_parquet(SPATH); chosen=selected_eids(n)
+...
+for subject,eid in chosen:
+ try: sessions.append(load_session(eid,subject,q,ss.loc[eid]))
+```
+
+iii. The justification in the notes is again scope control: a deterministic 10-session subset was treated as the intended workload.
 
 ## 1-d. How are the data split into trials?
 
-i. Rows of `trials.table` define trials. For each retained row, stimulus onset defines a common window and one neural/input/output array is appended in chronological order.
+i. Trials are taken from the rows of the session's `trials.table` parquet. After a validity mask is applied, each retained row becomes one converted trial.
 
-ii. `stim=np.asarray(trials.stimOn_times,float)`; `for ti in idx:`; `times=stim[ti]+CENTERS`; `neural.append(np.concatenate(mats))`.
+ii.
+```python
+trials=load_record(eid,g,srow,'trials.table')
+```
 
-iii. The notes state that trial tables are authoritative and that chronological ordering is preserved.
+```python
+stim=np.asarray(trials.stimOn_times,float); choice=np.asarray(trials.choice,float); prior=np.asarray(trials.probabilityLeft,float)
+valid=np.isfinite(stim)&np.isin(choice,[-1,1])&np.isin(np.round(prior,1),[.2,.5,.8])
+...
+idx=np.flatnonzero(valid)
+for ti in idx:
+    ...
+    kept.append(ti)
+```
+
+iii. No separate justification is given beyond using the trial table as the natural per-trial unit.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. Trials require finite stimulus onset, choice in {-1,+1}, rounded prior in {0.2,0.5,0.8}, full wheel/camera endpoint coverage, and finite interpolated traces. Sessions must retain at least two trials. No 80 ms–2 s reaction-time filter is applied.
+i. The AI keeps only trials with finite `stimOn_times`, `choice` in `{-1, 1}`, and `probabilityLeft` rounded to one decimal in `{0.2, 0.5, 0.8}`. It also requires the full `[-0.6, 1.5]` s window to lie inside the wheel and camera time ranges, and later drops any trial whose interpolated wheel or whisker trace contains non-finite values. It does not apply a reaction-time filter.
 
-ii. `valid=np.isfinite(stim)&np.isin(choice,[-1,1])&np.isin(np.round(prior,1),[.2,.5,.8])`; `valid &= (stim+OFF0>=wtime[0])...`; `if not (np.isfinite(ww).all() and np.isfinite(mm).all()): continue`; `if len(kept)<2: raise ValueError(...)`.
+ii.
+```python
+stim=np.asarray(trials.stimOn_times,float); choice=np.asarray(trials.choice,float); prior=np.asarray(trials.probabilityLeft,float)
+valid=np.isfinite(stim)&np.isin(choice,[-1,1])&np.isin(np.round(prior,1),[.2,.5,.8])
+# ensure behavior coverage and finite interpolants
+valid &= (stim+OFF0>=wtime[0])&(stim+OFF1<=wtime[-1])&(stim+OFF0>=ct[0])&(stim+OFF1<=ct[-1])
+```
 
-iii. The notes justify a common validity mask and full stream coverage, but do not justify omitting the paper/reference reaction-time criterion.
+```python
+ww=np.interp(times,wtime,wspeed); mm=np.interp(times,ct,cm)
+if not (np.isfinite(ww).all() and np.isfinite(mm).all()): continue
+```
+
+iii. In the notes the AI justifies this as a common validity mask for all streams under the task-mandated shared stimulus-aligned tensor.
 
 ## 2-a. What variables in the raw data is the `neural` data derived from?
 
-i. Neural arrays derive from each probe's pykilosort `spikes.times`, `spikes.clusters`, `clusters.metrics`, and `clusters.channels`; channel atlas IDs supply anatomy.
+i. The neural tensor is derived from spike times and spike cluster assignments per probe, with cluster metrics and channel/atlas metadata used to filter units and assign regions.
 
-ii. `st=...spikes.times`; `sc=...spikes.clusters`; `met=...clusters.metrics`; `ch=...clusters.channels`.
+ii.
+```python
+st=np.asarray(load_record(eid,g,srow,base+'spikes.times',True),float)
+sc=np.asarray(load_record(eid,g,srow,base+'spikes.clusters',True),int)
+met=load_record(eid,g,srow,base+'clusters.metrics',True)
+ch=np.asarray(load_record(eid,g,srow,base+'clusters.channels',True),int)
+```
 
-iii. The notes identify spike times and cluster assignments as the activity source, with metrics/anatomy used for curation and metadata.
+```python
+try: atlas=np.asarray(load_record(eid,g,srow,f'{probe}/channels.brainLocationIds_ccf_2017'))
+except Exception:
+ ...
+regs=[ID2AC.get(int(atlas[c]),'void') if 0<=c<len(atlas) else 'void' for c in ch[good]]
+```
+
+iii. The justification in the notes is that this matches the reference spike-sorting plus QC/anatomy metadata pipeline, while using direct S3 retrieval instead of ONE loaders.
 
 ## 2-b. How is the `neural` data processed?
 
-i. For every trial and probe, spikes are sliced to the stimulus-relative window, assigned to 20 ms bins, counted by good cluster, and probe matrices are concatenated. Values remain spike counts (`float32`), not firing rates.
+i. For each retained trial, spikes are sliced from `-0.6` to `+1.5` s around stimulus onset, assigned to 20 ms bins by `floor`, counted into per-neuron matrices, and concatenated across probes. The saved values are spike counts, not firing rates.
 
-ii. `bins=np.floor((rel-OFF0)/DT).astype(int)`; `M=np.zeros((len(good),len(CENTERS)),np.float32)`; `M[j,b]+=1`; `neural.append(np.concatenate(mats))`.
+ii.
+```python
+OFF0,OFF1,DT=-.6,1.5,.02
+EDGES=np.arange(OFF0,OFF1+DT/2,DT); CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
 
-iii. The notes claim fixed-bin spike counting matches reference `bincount2D` semantics and explicitly describe the representation as spike counts.
+```python
+lo=np.searchsorted(st,stim[ti]+OFF0); hi=np.searchsorted(st,stim[ti]+OFF1)
+rel=st[lo:hi]-stim[ti]; cid=sc[lo:hi]
+M=np.zeros((len(good),len(CENTERS)),np.float32); lut={int(c):j for j,c in enumerate(good)}
+bins=np.floor((rel-OFF0)/DT).astype(int)
+for c,b in zip(cid,bins):
+    j=lut.get(int(c));
+    if j is not None and 0<=b<M.shape[1]: M[j,b]+=1
+```
+
+iii. The notes explicitly justify the `[-0.6, 1.5]` window as the union of the AI's reading of the prior and choice windows, and justify 20 ms bins as preserving the dynamic-behavior resolution while staying stimulus-aligned.
 
 ## 2-c. How is the `neural` data filtered based on quality controls?
 
-i. Clusters with `metrics.label >= 1` are retained. All such clusters are kept even when anatomy falls back to or maps to `void`; no explicit in-brain/void exclusion is made.
+i. Units are filtered by `clusters.metrics.label >= 1`. Region labels are assigned from `channels.brainLocationIds_ccf_2017`; if anatomy lookup fails, the code falls back to zeros or `'void'`, but it does not explicitly remove `'void'` units.
 
-ii. `labels=np.asarray(met['label'],float); good=np.flatnonzero(labels>=1)`; `ID2AC.get(...,'void')`.
+ii.
+```python
+labels=np.asarray(met['label'],float); good=np.flatnonzero(labels>=1)
+```
 
-iii. The notes justify the threshold as the reference `good_clusters` criterion and report that the final selected data happened to contain zero `void` neurons.
+```python
+try: atlas=np.asarray(load_record(eid,g,srow,f'{probe}/channels.brainLocationIds_ccf_2017'))
+except Exception:
+ try: atlas=np.asarray(load_record(eid,g,srow,f'{probe}/pykilosort/channels.brainLocationIds_ccf_2017',True))
+ except Exception: atlas=np.zeros(max(ch.max()+1,1),int)
+regs=[ID2AC.get(int(atlas[c]),'void') if 0<=c<len(atlas) else 'void' for c in ch[good]]
+```
+
+iii. In `CONVERSION_NOTES.md` the AI says it wanted to match the reference `good_clusters = (label >= 1)` rule and preserve per-neuron anatomy.
 
 ## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
 
-i. Absolute spike times are shifted by `stimOn_times` and binned from −0.6 through +1.5 s relative to visual stimulus onset.
+i. Each trial is aligned to `trials.stimOn_times`. Spike times within the trial window are converted to time-relative-to-stimulus by subtraction of that trial's stimulus onset.
 
-ii. `OFF0,OFF1,DT=-.6,1.5,.02`; `lo=np.searchsorted(st,stim[ti]+OFF0)`; `rel=st[lo:hi]-stim[ti]`.
+ii.
+```python
+stim=np.asarray(trials.stimOn_times,float)
+```
 
-iii. The notes say stimulus onset is explicitly required and use the union of target-specific IBL choice and prior windows to make one shared tensor.
+```python
+lo=np.searchsorted(st,stim[ti]+OFF0); hi=np.searchsorted(st,stim[ti]+OFF1)
+rel=st[lo:hi]-stim[ti]
+```
+
+iii. The notes repeatedly justify stimulus-onset alignment as required by the task and consistent with the reference choice/prior analysis.
 
 ## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
 
-i. The final bin size is 20 ms, yielding 105 bins over −0.6 to +1.5 s. Spikes are directly counted in those bins; there is no later rebinning.
+i. The converted neural data use 20 ms bins. There is no later temporal rebinning; the spike counts are formed directly on that grid.
 
-ii. `DT=.02`; `EDGES=np.arange(OFF0,OFF1+DT/2,DT)`; metadata stores `'time_bin_size':20.0`.
+ii.
+```python
+OFF0,OFF1,DT=-.6,1.5,.02
+EDGES=np.arange(OFF0,OFF1+DT/2,DT); CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
 
-iii. The notes choose 20 ms to support shared dynamic outputs, while acknowledging that target-specific paper analyses used differing windows/bin sizes.
+```python
+bins=np.floor((rel-OFF0)/DT).astype(int)
+```
+
+iii. The AI's notes justify 20 ms bins as the chosen compromise between the stimulus-aligned static targets and the paper's dynamic behavioral outputs.
 
 ## 3-a. What variables in the raw data is `input` *Time since stimulus onset* derived from?
 
-i. It is constructed from the chosen offset, bin width, and the trials' `stimOn_times` alignment event; the same relative centers are used for every trial.
+i. It is derived from `trials.stimOn_times` plus the hard-coded bin grid `CENTERS`.
 
-ii. `CENTERS=(EDGES[:-1]+EDGES[1:])/2`; `times=stim[ti]+CENTERS`.
+ii.
+```python
+OFF0,OFF1,DT=-.6,1.5,.02
+EDGES=np.arange(OFF0,OFF1+DT/2,DT); CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
 
-iii. The notes describe this as the fixed stimulus-relative grid required by the decoder task.
+```python
+stim=np.asarray(trials.stimOn_times,float)
+...
+times=stim[ti]+CENTERS
+```
+
+iii. The notes justify this as the shared stimulus-relative time axis required by the decoder format.
 
 ## 3-b. What processing is involved in computing `input` *Time since stimulus onset*?
 
-i. Adjacent bin edges are averaged to form centers from −0.59 to +1.49 s, then copied into every trial input.
+i. No raw signal is transformed. The input is simply the fixed vector of bin centers from `-0.59` to `1.49` s, repeated for every retained trial.
 
-ii. `CENTERS=(EDGES[:-1]+EDGES[1:])/2`; `np.vstack([CENTERS,np.full(len(CENTERS),b)])`.
+ii.
+```python
+EDGES=np.arange(OFF0,OFF1+DT/2,DT); CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
 
-iii. The notes emphasize bin centers to avoid boundary ambiguity.
+```python
+ins.append(np.vstack([CENTERS,np.full(len(CENTERS),b)]).astype(np.float32))
+```
 
-## 3-c. How is the `input` *Time since stimulus onset* aligned with the neural data?
+iii. The AI's notes treat this as a task-defined decoder input rather than a variable that needs further preprocessing.
 
-i. The time input uses the centers of the exact same edges used to bin stimulus-relative spikes, so columns align one-to-one.
+## 3-c. How is `input` *Time since stimulus onset* aligned with the neural data?
 
-ii. `bins=np.floor((rel-OFF0)/DT).astype(int)` and `ins.append(np.vstack([CENTERS,...]))`.
+i. The same `CENTERS` vector is used both to define the neural bins and to evaluate the continuous wheel and whisker traces, so the time input is on the exact same per-bin axis as the neural matrix.
 
-iii. The notes report independent reconstruction and exact comparison of the time grid.
+ii.
+```python
+EDGES=np.arange(OFF0,OFF1+DT/2,DT); CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
+
+```python
+times=stim[ti]+CENTERS
+ww=np.interp(times,wtime,wspeed); mm=np.interp(times,ct,cm)
+```
+
+iii. The notes justify this as a common stimulus-centered tensor for all modalities.
 
 ## 4-a. What variables in the raw data is `input` *Trial number in block* derived from?
 
-i. It is derived from ordered `trials.probabilityLeft`, rounded to one decimal place; a change denotes a new block.
+i. It is derived from `trials.probabilityLeft`, after rounding to one decimal place.
 
-ii. `pr=np.round(prior,1)`; `blocknum[i]=0 if pr[i]!=pr[i-1] else blocknum[i-1]+1`.
+ii.
+```python
+prior=np.asarray(trials.probabilityLeft,float)
+...
+pr=np.round(prior,1); blocknum=np.zeros(len(trials),np.float32)
+```
 
-iii. The notes identify block-local trial count as a task-required derived input.
+iii. The justification is implicit: the prior value is treated as the block identity signal.
 
 ## 4-b. What processing is involved in computing `input` *Trial number in block*?
 
-i. Before trial filtering, the first trial is zero; subsequent trials reset to zero when the rounded prior changes and otherwise increment. The retained value is broadcast across time.
+i. The AI walks through the raw trial order and increments a counter while the rounded prior stays the same; the counter resets to zero when `probabilityLeft` changes. The count is computed before filtering and then indexed by retained trials.
 
-ii. `blocknum=np.zeros(len(trials),np.float32)`; `for i in range(1,len(trials))...`; `np.full(len(CENTERS),b)`.
+ii.
+```python
+pr=np.round(prior,1); blocknum=np.zeros(len(trials),np.float32)
+for i in range(1,len(trials)): blocknum[i]=0 if pr[i]!=pr[i-1] else blocknum[i-1]+1
+```
 
-iii. Computing before filtering preserves the true position in the original behavioral block.
+```python
+return dict(..., blocknum=blocknum[kept], ...)
+```
+
+iii. The notes justify preserving chronological order because block structure is part of the decoder inputs.
 
 ## 5-a. What variables in the raw data is `output` *Choice* derived from?
 
-i. It comes from `trials.choice`, restricted to −1 and +1.
+i. It is derived from `trials.choice`.
 
-ii. `choice=np.asarray(trials.choice,float)`; `np.isin(choice,[-1,1])`.
+ii.
+```python
+choice=np.asarray(trials.choice,float)
+```
 
-iii. The notes describe raw −1/+1 as the reference task variable.
+```python
+return dict(..., choice=choice[kept], ...)
+```
+
+iii. The notes state that raw IBL choice values are taken from the trial table and remapped to the task's binary coding.
 
 ## 5-b. What processing is involved in computing `output` *Choice*?
 
-i. The agent maps −1 to 0 and +1 to 1, then broadcasts the category across all time bins. This is opposite the required/reference left=0, right=1 mapping because IBL uses +1 for left and −1 for right.
+i. Trials with choice not equal to `-1` or `1` are dropped. The retained values are then recoded as `-1 -> 0` and `+1 -> 1`, and the categorical label is broadcast across all time bins in the trial.
 
-ii. `cc=0 if c==-1 else 1`; `np.full(len(CENTERS),cc)`.
+ii.
+```python
+valid=np.isfinite(stim)&np.isin(choice,[-1,1])&np.isin(np.round(prior,1),[.2,.5,.8])
+```
 
-iii. The notes say labels were checked and static outputs were broadcast for a uniform tensor, but they do not recognize the direction reversal.
+```python
+cc=0 if c==-1 else 1
+outs.append(np.vstack([np.full(len(CENTERS),cc), ... ]).astype(np.int64))
+```
+
+iii. In the notes, the AI explicitly justified this as satisfying the task's left/right coding requirement, although that interpretation differs from the human reference.
 
 ## 6-a. What variables in the raw data is `output` *Prior probability of left* derived from?
 
-i. It comes from `trials.probabilityLeft`.
+i. It is derived from `trials.probabilityLeft`.
 
-ii. `prior=np.asarray(trials.probabilityLeft,float)`; `pr=np.round(prior,1)`.
+ii.
+```python
+prior=np.asarray(trials.probabilityLeft,float)
+```
 
-iii. The notes identify the raw block prior as the required target.
+```python
+return dict(..., prior=pr[kept], ...)
+```
+
+iii. The notes say this is the task's block prior variable and should be mapped directly from the trial table.
 
 ## 6-b. What processing is involved in computing `output` *Prior probability of left*?
 
-i. Values are rounded to one decimal, mapped 0.2→0, 0.5→1, 0.8→2, and broadcast across time.
+i. The AI rounds `probabilityLeft` to one decimal place, filters to `{0.2, 0.5, 0.8}`, maps those values to `{0, 1, 2}`, and broadcasts the resulting label across all bins of the trial.
 
-ii. `pp={.2:0,.5:1,.8:2}[float(p)]`; `np.full(len(CENTERS),pp)`.
+ii.
+```python
+valid=np.isfinite(stim)&np.isin(choice,[-1,1])&np.isin(np.round(prior,1),[.2,.5,.8])
+...
+pr=np.round(prior,1)
+```
 
-iii. The notes say static outputs are broadcast to meet the decoder's uniform time-varying tensor format.
+```python
+pp={.2:0,.5:1,.8:2}[float(p)]
+outs.append(np.vstack([np.full(len(CENTERS),cc),np.full(len(CENTERS),pp), ... ]).astype(np.int64))
+```
+
+iii. The notes justify this as the exact categorical mapping requested in the task description.
 
 ## 7-a. What variables in the raw data is `output` *Wheel speed* derived from?
 
-i. It derives from `_ibl_wheel.timestamps` and `_ibl_wheel.position`.
+i. It is derived from `wheel.timestamps` and `wheel.position`.
 
-ii. `wt=...wheel.timestamps`; `wp=...wheel.position`; `wpos,wtime=interpolate_position(wt,wp,freq=1000)`.
+ii.
+```python
+wt=load_record(eid,g,srow,'wheel.timestamps'); wp=load_record(eid,g,srow,'wheel.position')
+wpos,wtime=interpolate_position(wt,wp,freq=1000); wvel,_=velocity_filtered(wpos,fs=1000)
+wspeed=np.abs(wvel)
+```
 
-iii. The notes explicitly choose the official IBL wheel processing path.
+iii. The notes justify this as matching the official IBL wheel-processing functions.
 
 ## 7-b. What processing is involved in computing `output` *Wheel speed*?
 
-i. Position is interpolated to 1 kHz, filtered velocity is calculated with IBL utilities, absolute value gives speed, and `np.interp` samples it at neural-bin centers.
+i. The code resamples wheel position to 1000 Hz with `interpolate_position`, computes filtered velocity with `velocity_filtered`, takes the absolute value as speed, and interpolates that continuous trace onto the stimulus-centered `CENTERS` grid for each retained trial.
 
-ii. `wvel,_=velocity_filtered(wpos,fs=1000)`; `wspeed=np.abs(wvel)`; `ww=np.interp(times,wtime,wspeed)`.
+ii.
+```python
+wpos,wtime=interpolate_position(wt,wp,freq=1000); wvel,_=velocity_filtered(wpos,fs=1000)
+wspeed=np.abs(wvel)
+```
 
-iii. The notes state that this matches `SessionLoader`/IBL's recommended velocity computation.
+```python
+times=stim[ti]+CENTERS
+ww=np.interp(times,wtime,wspeed)
+```
+
+iii. The notes explicitly cite the IBL wheel utilities as the intended reference behavior.
 
 ## 7-c. How is `output` *Wheel speed* thresholded into categories?
 
-i. One pair of 1/3 and 2/3 quantiles is computed after pooling every aligned wheel value from all selected sessions; `np.digitize` creates low/medium/high classes.
+i. After all sessions are loaded, the AI pools every aligned continuous wheel-speed value across the converted sessions, computes the global `1/3` and `2/3` quantiles, and discretizes each trial's wheel-speed trace with `np.digitize`.
 
-ii. `wheel=np.concatenate([np.concatenate(x['wheel']) for x in sessions])`; `wq=np.quantile(wheel,[1/3,2/3])`; `np.digitize(w,wq)`.
+ii.
+```python
+wheel=np.concatenate([np.concatenate(x['wheel']) for x in sessions])
+wq=np.quantile(wheel,[1/3,2/3])
+```
 
-iii. The notes prefer fixed pooled thresholds so categories are dataset-wide comparable and globally balanced.
+```python
+outs.append(np.vstack([..., np.digitize(w,wq), ...]).astype(np.int64))
+```
+
+iii. In `CONVERSION_NOTES.md` Step 5, the AI justifies pooled tertiles as producing comparable low/medium/high categories across sessions.
 
 ## 7-d. How is `output` *Wheel speed* aligned with the neural data?
 
-i. Wheel speed is interpolated at `stimOn_times + CENTERS`, the same centers represented by neural columns.
+i. The wheel-speed trace is interpolated at `stimOn_times + CENTERS`, so it shares the same stimulus-centered bin grid as the neural counts.
 
-ii. `times=stim[ti]+CENTERS`; `ww=np.interp(times,wtime,wspeed)`.
+ii.
+```python
+times=stim[ti]+CENTERS
+ww=np.interp(times,wtime,wspeed)
+```
 
-iii. The notes describe common-clock, bin-center alignment and independently validate it.
+iii. The notes justify this as the required common time axis for all decoder inputs and outputs.
 
 ## 8-a. What variables in the raw data is `output` *Whisker motion energy* derived from?
 
-i. It derives from left-camera times and `leftCamera.ROIMotionEnergy`, with right-camera fallback if left is absent or insufficiently finite.
+i. It is derived from `<side>Camera.times` and `<side>Camera.ROIMotionEnergy`, preferring the left camera and falling back to the right camera.
 
-ii. `for v in ('left','right'):`; `ct=...f'{v}Camera.times'`; `cm=...f'{v}Camera.ROIMotionEnergy'`.
+ii.
+```python
+for v in ('left','right'):
+ try:
+  ct=load_record(eid,g,srow,f'{v}Camera.times'); cm=load_record(eid,g,srow,f'{v}Camera.ROIMotionEnergy')
+  ...
+  if n>10 and np.isfinite(cm).mean()>.95: side=v; break
+```
 
-iii. The notes say this follows reference left preference and uses released ROI motion energy rather than recomputing video features.
+iii. The notes justify this as following the reference code's left-camera preference with right-camera fallback.
 
 ## 8-b. What processing is involved in computing `output` *Whisker motion energy*?
 
-i. Timestamp and motion arrays are truncated to their common length, checked for >95% finite data, and linearly interpolated at neural-bin centers; no filtering or normalization is applied.
+i. The released motion-energy trace is used directly. After choosing the camera side, the code truncates times and values to a common length, checks that most samples are finite, and interpolates the trace onto the stimulus-centered `CENTERS` grid for each retained trial.
 
-ii. `n=min(len(ct),len(cm))`; `cm=np.asarray(cm[:n],float)`; `np.isfinite(cm).mean()>.95`; `mm=np.interp(times,ct,cm)`.
+ii.
+```python
+ct=load_record(eid,g,srow,f'{v}Camera.times'); cm=load_record(eid,g,srow,f'{v}Camera.ROIMotionEnergy')
+n=min(len(ct),len(cm)); ct=np.asarray(ct[:n],float); cm=np.asarray(cm[:n],float)
+if n>10 and np.isfinite(cm).mean()>.95: side=v; break
+```
 
-iii. The notes state that official motion energy is already processed and should be used directly.
+```python
+times=stim[ti]+CENTERS
+mm=np.interp(times,ct,cm)
+```
+
+iii. The notes say motion energy is already produced by the IBL pipeline and should not be recomputed from video.
 
 ## 8-c. How is `output` *Whisker motion energy* thresholded into categories?
 
-i. One pair of pooled 1/3 and 2/3 quantiles across all selected sessions is used with `np.digitize`.
+i. As with wheel speed, the AI pools all aligned whisker-motion-energy samples across the converted sessions, computes global tertile thresholds, and discretizes each per-trial whisker trace with `np.digitize`.
 
-ii. `whisk=np.concatenate([np.concatenate(x['whisk']) for x in sessions])`; `mq=np.quantile(whisk,[1/3,2/3])`; `np.digitize(m,mq)`.
+ii.
+```python
+whisk=np.concatenate([np.concatenate(x['whisk']) for x in sessions])
+mq=np.quantile(whisk,[1/3,2/3])
+```
 
-iii. The notes justify pooled fixed thresholds as dataset-wide comparable and globally balanced.
+```python
+outs.append(np.vstack([..., np.digitize(m,mq)]).astype(np.int64))
+```
+
+iii. The notes justify global pooled tertiles as creating dataset-wide categories rather than per-session categories.
 
 ## 8-d. How is `output` *Whisker motion energy* aligned with the neural data?
 
-i. Camera motion energy is interpolated at stimulus onset plus the same bin centers as the neural data.
+i. The trace is interpolated at `stimOn_times + CENTERS`, so it shares the neural time axis exactly.
 
-ii. `times=stim[ti]+CENTERS`; `mm=np.interp(times,ct,cm)`.
+ii.
+```python
+times=stim[ti]+CENTERS
+mm=np.interp(times,ct,cm)
+```
 
-iii. The notes rely on synchronized IBL timestamps and report an independent alignment check.
+iii. The justification is the same common-grid argument used for neural and wheel data.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. Downloads retry and validate expected byte size; camera length mismatches are truncated; right camera is a fallback; absent probe records are skipped; anatomy can fall back to `void`; invalid trials are omitted. Conversely, no valid camera, no good neurons, fewer than two trials, or any selected-session exception aborts the whole conversion.
+i. The AI handles missingness by retrying downloads, skipping missing probe datasets via `except KeyError`, falling back from left to right camera, using fallback atlas arrays when anatomy files are missing, dropping trials with invalid labels or uncovered behavior windows, and raising an error if a session ends up with no good neurons or fewer than two valid trials.
 
-ii. `for attempt in range(5)`; `n=min(len(ct),len(cm))`; `except KeyError: continue`; `except Exception: atlas=np.zeros(...)`; `except Exception as e: ... raise`.
+ii.
+```python
+for attempt in range(5):
+ try:
+  urllib.request.urlretrieve(url,tmp)
+  ...
+ except Exception as e:
+  tmp.unlink(missing_ok=True)
+  if attempt==4: raise RuntimeError(f'download failed {url}: {e}')
+```
 
-iii. The notes emphasize exact source validation, caching, fallbacks, and common masking, but claim no unresolved issue after the chosen ten sessions succeeded.
+```python
+for v in ('left','right'):
+ try:
+  ...
+ except Exception as e:
+  print(f'Camera {v} unavailable for {eid}: {e}', flush=True)
+  continue
+if side is None: raise ValueError('no valid whisker motion stream')
+```
+
+```python
+except Exception:
+ try: atlas=np.asarray(load_record(eid,g,srow,f'{probe}/pykilosort/channels.brainLocationIds_ccf_2017',True))
+ except Exception: atlas=np.zeros(max(ch.max()+1,1),int)
+...
+if len(kept)<2: raise ValueError('fewer than two valid trials')
+```
+
+iii. The notes justify this as conservative exclusion rather than imputation, with extra download/anatomy fallbacks needed because the AI chose direct S3 access instead of ONE.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. Initial multi-gigabyte S3 downloads dominate uncached execution; loading and trial-binning large spike arrays is the main cached processing cost.
+i. Based on the code and notes, the AI's slowest steps are downloading the raw payloads from S3 and then looping through every retained trial, probe, and spike to build binned neural matrices. The notes also discuss the potential cost of processing the full release and motivate the 10-session subset partly on that basis.
 
-ii. `urllib.request.urlretrieve(url,tmp)`; per trial/probe `np.searchsorted`, followed by the per-spike loop.
+ii.
+```python
+urllib.request.urlretrieve(url,tmp)
+```
 
-iii. The notes estimate ~5.4 GB canonical downloads and 5–7 seconds cached processing per session.
+```python
+for ti in idx:
+ ...
+ for st,sc,good in probe_data:
+  ...
+  for c,b in zip(cid,bins):
+   ...
+```
+
+iii. `CONVERSION_NOTES.md` Step 6 says full-release conversion would require hundreds of GB and highlights per-spike Python work as a major cost, so the AI intentionally limited scope.
 
 ## 10-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The trial loop, probe loop, per-spike `(cluster, bin)` counting loop, trial-number loop, and final trial assembly loop could be partly vectorized. The per-spike dictionary loop is the clearest hotspot and could use remapped IDs plus `np.add.at`/`bincount`.
+i. The main vectorization opportunities are the trial loop, the probe-within-trial loop, and especially the inner spike loop that updates `M[j, b]` one spike at a time. Trial-wise interpolation of wheel and whisker traces could also be vectorized further.
 
-ii. `for ti in idx:`; `for st,sc,good in probe_data:`; `for c,b in zip(cid,bins): ... M[j,b]+=1`; `for i in range(1,len(trials))`; `for c,p,b,w,m in zip(...)`.
+ii.
+```python
+for ti in idx:
+  times=stim[ti]+CENTERS
+  ww=np.interp(times,wtime,wspeed); mm=np.interp(times,ct,cm)
+```
 
-iii. The notes say binary-search slicing limits Python work to each trial window and call behavior interpolation/masks vectorized, but the implementation still loops over individual spikes.
+```python
+for st,sc,good in probe_data:
+ ...
+ bins=np.floor((rel-OFF0)/DT).astype(int)
+ for c,b in zip(cid,bins):
+  j=lut.get(int(c));
+  if j is not None and 0<=b<M.shape[1]: M[j,b]+=1
+```
+
+iii. The notes mention "per-spike Python work" and binary-search slicing, implying the AI was aware of this efficiency tradeoff but accepted it for the smaller chosen subset.
 
 ## 10-c. What processing does the code repeat multiple times?
 
-i. Dataset-record filtering and download/loading occur separately for every requested object; every trial repeats time-vector construction, interpolation, spike slicing, cluster lookup construction per probe, and matrix allocation. Final assembly loops over all trials again.
+i. The code repeatedly rebuilds the `lut` cluster-to-row dictionary for every trial and every probe, repeatedly interpolates wheel and whisker traces one trial at a time, and repeatedly computes `stim[ti] + CENTERS` inside the loop.
 
-ii. Repeated calls to `load_record(...)`; inside `for ti in idx`, `times=stim[ti]+CENTERS`, `lut={...}`, and `M=np.zeros(...)`.
+ii.
+```python
+for ti in idx:
+  times=stim[ti]+CENTERS
+  ww=np.interp(times,wtime,wspeed); mm=np.interp(times,ct,cm)
+  ...
+  for st,sc,good in probe_data:
+   ...
+   M=np.zeros((len(good),len(CENTERS)),np.float32); lut={int(c):j for j,c in enumerate(good)}
+```
 
-iii. The notes justify caching downloads and slicing windows, but do not discuss rebuilding the identical cluster LUT for every trial.
+iii. This is not directly justified in the notes; it appears to be a simplicity tradeoff in the implementation.
 
 ## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. It retains `labels`, `trial_idx`, raw continuous wheel/whisker traces, and camera side in intermediate session objects; most are discarded after thresholds/metadata are built. It also hashes imports and creates `ThreadPoolExecutor` imports that are unused, and downloads/loads anatomy metadata needed only for labels, not decoding.
+i. The code stores `labels` and `trial_idx` in each session dictionary but never uses them in the final saved dataset. It also keeps continuous `wheel` and `whisk` traces for every retained trial only to compute global thresholds and then discards them after converting outputs to categories. Optional plotting is likewise outside the downstream decoder input.
 
-ii. `return dict(...labels=np.array(labels_all),trial_idx=kept,...wheel=rawwheel,whisk=rawwhisk...)`; only selected fields are copied into `data`.
+ii.
+```python
+return dict(eid=eid,subject=str(subject),neural=neural,regions=regions,labels=np.array(labels_all),trial_idx=kept,
+            choice=choice[kept],prior=pr[kept],blocknum=blocknum[kept],wheel=rawwheel,whisk=rawwhisk,camera=side)
+```
 
-iii. The notes use these intermediates for sanity checks, plotting, provenance, and threshold construction, so some are diagnostically useful even though they are absent from the final decoder arrays.
+```python
+wheel=np.concatenate([np.concatenate(x['wheel']) for x in sessions]); whisk=np.concatenate([np.concatenate(x['whisk']) for x in sessions])
+wq=np.quantile(wheel,[1/3,2/3]); mq=np.quantile(whisk,[1/3,2/3])
+```
+
+```python
+if args.show_processing:
+ for x in sessions[:2]: plot_session(x,ROOT/f"processing_{x['eid']}.png")
+```
+
+iii. The notes justify pooled thresholds and diagnostic plots, but the extra retained fields themselves are not explicitly justified.

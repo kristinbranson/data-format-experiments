@@ -2,131 +2,136 @@
 
 ## 1-a. How are **all the data** for all subjects, sessions, and trials loaded in?
 
-i. The agent globs every `sub-*/*.nwb` file, sorts the paths, opens each with `NWBHDF5IO`, and reads the subject, trials, units, acquisitions, and spike data. It skips only a file having no classifier-good units.
+i. The AI loads the dataset by globbing every `*.nwb` file under `/app/data/sub-*`, then opens each file with `pynwb.NWBHDF5IO`. Inside each file it reads the NWB root object, then uses `n.trials`, `n.units`, and the acquisition time-series groups for behavioral events and tongue tracking.
 
 ii.
 ```python
 files=sorted(glob.glob(os.path.join(ROOT,'sub-*','*.nwb')))
-result=one_file(path)
 ```
+
 ```python
 with NWBHDF5IO(path,'r',load_namespaces=True) as io:
     n=io.read(); tr=n.trials; u=n.units
 ```
 
-iii. The trajectory identified NWB as the canonical synchronized release and one file as one session. It reports finding 174 files and retaining the 173 paper-qualified sessions.
+```python
+ev=n.acquisition['BehavioralEvents'].time_series
+tongue=n.acquisition['BehavioralTimeSeries'].time_series['Camera0_side_TongueTracking']
+```
+
+iii. In the trajectory, the AI first inspected the data layout and concluded the release consisted of one NWB file per session. It explicitly decided to use PyNWB as the canonical loader for the curated NWB release and to process all sorted files in one pass.
 
 ## 1-b. How are the data split into subjects?
 
-i. Subject identity is read from each NWB's `n.subject.subject_id`. Unique subjects are accumulated in first-seen file order, and each retained session gets the corresponding integer index.
+i. Subjects are split by `n.subject.subject_id` from each NWB file. The output `subjects` list is built incrementally in first-seen order, and `subject_idx` stores the index of each session's subject in that list.
 
 ii.
 ```python
 subject=s(n.subject.subject_id)
+```
+
+```python
 if sub not in data['subjects']: data['subjects'].append(sub)
 data['subject_idx'].append(data['subjects'].index(sub))
 ```
 
-iii. The agent considered the NWB subject field the canonical mouse identifier. Sorted file traversal makes the first-seen ordering deterministic.
+iii. The trajectory states that the NWB subject field was taken as the canonical subject identifier, and that this numeric subject id was sufficient without additional regrouping logic.
 
 ## 1-c. How are the data split into sessions?
 
-i. Each NWB file is treated as one session. Its trial lists and neuron-region vector are appended once to the top-level session lists; the file basename is saved in session metadata.
+i. The AI treats each NWB file as one session. The output session order follows the sorted file list. Session metadata is tracked by file basename inside `metadata['session_info']`.
 
 ii.
 ```python
-data['neural'].append(neu); data['input'].append(inp); data['output'].append(out)
-info={'file':os.path.basename(path),'subject':subject,'n_trials':ntr,
-      'n_good_units':len(keep), ...}
+files=sorted(glob.glob(os.path.join(ROOT,'sub-*','*.nwb')))
 ```
 
-iii. The trajectory concluded that the release's file boundaries are session boundaries and that 173 analyzed sessions are expected.
+```python
+info={'file':os.path.basename(path),'subject':subject,'n_trials':ntr,
+      'n_good_units':len(keep),'tongue_y_percentiles':[float(q40),float(q60)],
+      'dlc_visibility_threshold':DLC_VISIBLE}
+```
+
+```python
+data['metadata']['session_info'].append(info)
+```
+
+iii. In the trajectory, the AI repeatedly states that one NWB file corresponds to one session in the release, so no extra within-file session splitting is needed.
 
 ## 1-d. How are the data split into trials?
 
-i. Trial rows come directly from `n.trials`. The agent requires one go-cue timestamp per row and builds one neural/input/output array for every row.
+i. Trials are split using the NWB trials table directly. The code sets `ntr = len(tr)`, reads one go-cue timestamp per trial, checks that the go-cue count matches the trial count, and then iterates over trial index `j` to build per-trial neural, input, and output arrays.
 
 ii.
 ```python
+n=io.read(); tr=n.trials; u=n.units
+subject=s(n.subject.subject_id)
 ntr=len(tr)
-go=np.asarray(ev['go_start_times'].timestamps[:],dtype=float)
-if len(go)!=ntr:
-    raise RuntimeError(...)
-for j,g in enumerate(go):
-    ...
-    neural.append(fr); inputs.append(...); outputs.append(out)
 ```
 
-iii. It found that go cues uniquely map trials, while sample events may repeat after early licking, so it used rows/go cues as the trial definition.
+```python
+go=np.asarray(ev['go_start_times'].timestamps[:],dtype=float)
+if len(go)!=ntr:
+    raise RuntimeError(f'{path}: {len(go)} go events != {ntr} trials')
+```
+
+```python
+for j,g in enumerate(go):
+    fr=frcube[:,j,:].copy()
+    ...
+    neural.append(fr)
+    inputs.append(np.vstack((tone_elapsed,photo)).astype(np.float32))
+    outputs.append(out)
+```
+
+iii. The trajectory explains that the trials table is the behavioral trial structure and that each trial has a unique go cue, so trial rows were used as the per-trial split.
 
 ## 1-e. How are trials filtered based on quality controls?
 
-i. They are not filtered. Every trials-table row is retained, including free-water trials and behavioral trials outside unit observation intervals. Only a session with no good units is skipped.
-
-ii.
-```python
-ntr=len(tr)
-...
-for j,g in enumerate(go):
-```
-
-iii. The agent reasoned that the sessions were already behaviorally curated. Although it noticed `is_good_trials`, it did not implement trial-level QC and did not investigate `obs_intervals` or `free_water`.
-
-## 2-a. What variables in the raw data is the `neural` data derived from?
-
-i. Neural data comes from `units['spike_times']` for units whose `classification` is `good`, with `go_start_times` supplying each trial's absolute bin edges.
+i. The AI does not filter individual trials by `obs_intervals` or `free_water`. It assumes the release is already behaviorally curated and keeps all trials for sessions that have at least one classifier-good unit. The only exclusion is dropping whole sessions with zero units satisfying `classification == 'good'`.
 
 ii.
 ```python
 cls=np.asarray([s(x).lower() for x in u['classification'][:]])
 keep=np.flatnonzero(cls=='good')
-spikes=[np.asarray(u['spike_times'][int(i)],float) for i in keep]
-all_edges=go[:,None]+EDGES[None,:]
-```
-
-iii. The trajectory tied `classification == 'good'` to the newer classifier QC described in the supplied methods and treated spike times as the canonical neural stream.
-
-## 2-b. How is the `neural` data processed?
-
-i. Sorted spike timestamps are counted in half-open bins using `searchsorted` differences and divided by 0.05 s to produce firing rates in spikes/s. There is no smoothing or normalization.
-
-ii.
-```python
-frcube=np.empty((len(keep),ntr,len(CENTERS)),dtype=np.float32)
-for k,st in enumerate(spikes):
-    frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
-```
-
-iii. The agent explicitly replaced a slow unit-by-trial histogram with one search over all trial edges per unit, reasoning that it preserves the same half-open counts.
-
-## 2-c. How is the `neural` data filtered based on quality controls?
-
-i. Only `classification == 'good'` units are retained. A session with no such units is omitted. Other unit metrics and per-trial unit validity are not used.
-
-ii.
-```python
-keep=np.flatnonzero(cls=='good')
 if not len(keep):
     return None
 ```
 
-iii. The agent selected this field because it represents the supplied classifier-based QC. It inspected the excluded file and found all classifier/anatomy labels missing, consistent with 174 source files versus 173 analyzed sessions.
+```python
+for z,path in enumerate(files,1):
+    result=one_file(path)
+    if result is None:
+        print(f'[{z}/{len(files)}] SKIP {os.path.basename(path)}: no classifier-good units',flush=True)
+        continue
+```
 
-## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+iii. The trajectory explicitly says the sessions are "already behaviorally curated" and that the one dropped file should be excluded because it has no classifier-good units. It never adds the reference trial-level filtering; instead it validates the dataset even though the final pickle retains 94,370 trials, including 3,511 all-zero neural trials.
 
-i. A fixed relative edge grid is added to every absolute go-cue timestamp, and spikes are counted within those absolute intervals.
+## 2-a. What variables in the raw data is the `neural` data derived from?
+
+i. Neural data is derived from `units['spike_times']` for units whose `classification` is `'good'`. Go-cue timestamps are used to construct the per-trial bin edges.
 
 ii.
 ```python
-EDGES=np.arange(OFF0, OFF1+DT/2, DT, dtype=np.float64)
+cls=np.asarray([s(x).lower() for x in u['classification'][:]])
+keep=np.flatnonzero(cls=='good')
+```
+
+```python
+go=np.asarray(ev['go_start_times'].timestamps[:],dtype=float)
+```
+
+```python
+spikes=[np.asarray(u['spike_times'][int(i)],float) for i in keep]
 all_edges=go[:,None]+EDGES[None,:]
 ```
 
-iii. The agent determined that spikes and behavioral events share the NWB master clock, so no offset correction or interpolation is needed.
+iii. The trajectory says the NWB files provide synchronized spike times on the master session clock, so the agent decided to derive firing rates directly from `spike_times` and align them with `go_start_times`.
 
-## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+## 2-b. How is the `neural` data processed?
 
-i. There are 80 non-overlapping 50-ms bins over `[-2.5, 1.5)` seconds relative to go cue. Raw timestamps are binned once; there is no later rebinning.
+i. For each kept unit, spike times are binned into 80 non-overlapping 50 ms bins spanning `[-2.5, 1.5)` seconds around each go cue. The code uses `np.searchsorted` over all trial edges for a unit, differences adjacent counts, and divides by `DT` to convert counts to firing rate.
 
 ii.
 ```python
@@ -135,24 +140,88 @@ EDGES=np.arange(OFF0, OFF1+DT/2, DT, dtype=np.float64)
 CENTERS=(EDGES[:-1]+EDGES[1:])/2
 ```
 
-iii. The trajectory chose 80 bins because the requested four-second window divided by 50 ms naturally yields 80 and the target requires consistent timepoints.
+```python
+spikes=[np.asarray(u['spike_times'][int(i)],float) for i in keep]
+all_edges=go[:,None]+EDGES[None,:]
+frcube=np.empty((len(keep),ntr,len(CENTERS)),dtype=np.float32)
+for k,st in enumerate(spikes):
+    frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
+```
+
+iii. The trajectory first used `np.histogram` and then explicitly optimized that into a vectorized `searchsorted` implementation, arguing that it preserved the same half-open bin counts while making the conversion much faster.
+
+## 2-c. How is the `neural` data filtered based on quality controls?
+
+i. The neural QC filter is `units['classification'] == 'good'`. Sessions with no such units are dropped entirely.
+
+ii.
+```python
+cls=np.asarray([s(x).lower() for x in u['classification'][:]])
+keep=np.flatnonzero(cls=='good')
+if not len(keep):
+    return None
+```
+
+iii. The trajectory says the AI inspected both `unit_quality` and `classification` and decided the classifier label matched the newer QC described in the supplied methods and white paper, so only classifier-good units were retained.
+
+## 2-d. How is the per-trial `neural` data aligned to the event described in the `instructions`?
+
+i. Neural data is aligned to go-cue onset. The code adds the fixed relative edges `EDGES` to each trial's absolute go time, bins spikes against those absolute edges, and stores the resulting per-trial unit-by-time matrix.
+
+ii.
+```python
+go=np.asarray(ev['go_start_times'].timestamps[:],dtype=float)
+all_edges=go[:,None]+EDGES[None,:]
+```
+
+```python
+for k,st in enumerate(spikes):
+    frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
+for j,g in enumerate(go):
+    fr=frcube[:,j,:].copy()
+```
+
+iii. The trajectory notes that spikes and behavioral streams share the same NWB master clock, so the chosen alignment was simply to center the extraction window on each trial's go cue.
+
+## 2-e. What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?
+
+i. The converted data uses 50 ms bins. The code creates 80 non-overlapping bins covering 4.0 s total from -2.5 s to +1.5 s relative to go cue. No additional smoothing or rebinning is applied.
+
+ii.
+```python
+DT=.05; OFF0=-2.5; OFF1=1.5
+EDGES=np.arange(OFF0, OFF1+DT/2, DT, dtype=np.float64)
+CENTERS=(EDGES[:-1]+EDGES[1:])/2
+```
+
+```python
+'time_bin_size':50.0,'temporal_alignment_event':'go cue onset',
+'off_start':-2.5,'off_end':1.5,'n_time_bins':80,
+```
+
+iii. The trajectory explicitly says the requested decoder format naturally implies 80 non-overlapping 50 ms bins around the go cue, and that the code should use exactly that grid.
 
 ## 3-a. What variables in the raw data is `input` *Time from tone onset in seconds* derived from?
 
-i. It uses `BehavioralEvents/sample_start_times`, `go_start_times`, and the common bin centers. The last sample onset at or before each go cue is treated as that trial's tone.
+i. The time-from-tone input is derived from `BehavioralEvents/sample_start_times` together with the per-trial `go_start_times`. For each trial the code chooses the last sample-start event before the go cue.
 
 ii.
 ```python
 sample=np.asarray(ev['sample_start_times'].timestamps[:],dtype=float)
-q=sample[sample < g+1e-9]
-sample_for_trial[j]=q[-1] if len(q) else np.nan
 ```
 
-iii. The agent found that early licking can replay the sample epoch, so the last preceding sample is the relevant tone.
+```python
+sample_for_trial=np.empty(ntr,float)
+for j,g in enumerate(go):
+    q=sample[sample < g+1e-9]
+    sample_for_trial[j]=q[-1] if len(q) else np.nan
+```
+
+iii. The trajectory says extra sample events can occur because the sample epoch is replayed after an early lick, so the agent decided the correct tone for a trial is the last sample onset preceding that trial's go cue.
 
 ## 3-b. What processing is involved in computing `input` *Time from tone onset in seconds*?
 
-i. Each absolute bin-center time is subtracted from the selected tone onset, yielding elapsed seconds as `float32`.
+i. For each trial, the code computes the absolute time of each decoder bin center as `go + CENTERS`, then subtracts the selected sample onset for that trial. This produces a continuous time-varying signal in seconds since tone onset.
 
 ii.
 ```python
@@ -160,24 +229,28 @@ times=g+CENTERS
 tone_elapsed=(times-sample_for_trial[j]).astype(np.float32)
 ```
 
-iii. It regarded subtraction on the shared master clock as sufficient; no scaling beyond seconds is applied.
+iii. The trajectory frames this variable as "time from sample/tone onset at each decoder bin center" so it is built directly on the same 80-bin grid as the neural data.
 
 ## 3-c. How is the `input` *Time from tone onset in seconds* aligned with the neural data?
 
-i. Values are evaluated at the same go-relative bin centers whose surrounding edges define the neural bins.
+i. The time-from-tone signal is evaluated at exactly the same 80 bin centers used for the go-aligned neural data.
 
 ii.
 ```python
-times=g+CENTERS
-tone_elapsed=(times-sample_for_trial[j]).astype(np.float32)
-fr=frcube[:,j,:].copy()
+CENTERS=(EDGES[:-1]+EDGES[1:])/2
 ```
 
-iii. The shared center grid was chosen to synchronize every time-varying stream with the 80 neural bins.
+```python
+fr=frcube[:,j,:].copy()
+times=g+CENTERS
+tone_elapsed=(times-sample_for_trial[j]).astype(np.float32)
+```
+
+iii. The trajectory says all streams share the NWB master clock and that the decoder inputs should live on the same go-aligned bin grid as the firing rates.
 
 ## 4-a. What variables in the raw data is `input` *Photostimulation* derived from?
 
-i. It uses the acquisition event timestamps `photostim_start_times` and `photostim_stop_times`.
+i. Photostimulation is derived from the session-wide behavioral event streams `BehavioralEvents/photostim_start_times` and `BehavioralEvents/photostim_stop_times`, not from the per-trial `photostim_onset` and `photostim_duration` columns in the trials table.
 
 ii.
 ```python
@@ -185,107 +258,129 @@ pstart=np.asarray(ev['photostim_start_times'].timestamps[:],float)
 pstop=np.asarray(ev['photostim_stop_times'].timestamps[:],float)
 ```
 
-iii. The agent found explicit, synchronized stimulation intervals in the NWB and preferred them to reconstructing intervals from trial fields.
+iii. In the trajectory, the AI notes that the NWB acquisition contains explicit photostimulation start/stop events on the master clock. It chose those event streams as the direct source for time-resolved photostimulation state.
 
 ## 4-b. What processing is involved in computing `input` *Photostimulation*?
 
-i. It initializes an all-zero vector and sets a bin to one when its center is within any half-open stimulation interval.
+i. For each trial, the code creates a length-80 binary vector and sets bins to `1` when the bin center falls inside any photostimulation interval `[start, stop)`. Trials or bins not covered by any interval stay `0`.
 
 ii.
 ```python
 photo=np.zeros(len(CENTERS),dtype=np.float32)
+# State at bin centers for every stimulation interval.
 for a,b in zip(pstart,pstop): photo[(times>=a)&(times<b)]=1
 ```
 
-iii. The trajectory states that the decoder requires a time-varying binary state, so stimulation is represented at every bin center.
+iii. The trajectory describes this as converting stimulation into a time-varying on/off state at the decoder bin centers rather than a per-trial flag.
 
 ## 4-c. How is the `input` *Photostimulation* aligned with the neural data?
 
-i. Absolute stimulation intervals and absolute neural-bin centers share the NWB clock; interval membership is evaluated at each neural bin center.
+i. The photostimulation input is aligned on the same absolute bin-center timestamps used for the neural data: `times = go + CENTERS`.
 
 ii.
 ```python
 times=g+CENTERS
-photo[(times>=a)&(times<b)]=1
+for a,b in zip(pstart,pstop): photo[(times>=a)&(times<b)]=1
 ```
 
-iii. The agent relied on the synchronized NWB master clock and applied no additional correction.
+iii. The trajectory's justification is that all streams use the NWB master clock, so comparing photostim event times to the go-aligned bin centers is sufficient for alignment.
 
 ## 5-a. What variables in the raw data is `output` *Lick direction choice* derived from?
 
-i. Choice is derived from trials-table `trial_instruction` and `outcome`: hit selects the instructed side, miss selects the opposite side, and ignore means no lick.
+i. Choice is not read from a raw choice column. It is derived from trial-table `trial_instruction` and `outcome`.
 
 ii.
 ```python
 instr=np.asarray([s(x).lower() for x in tr['trial_instruction'][:]])
 outcome=np.asarray([s(x).lower() for x in tr['outcome'][:]])
+```
+
+```python
 if outcome[j]=='ignore': choice=2
 elif outcome[j]=='hit': choice=0 if instr[j]=='left' else 1
 elif outcome[j]=='miss': choice=1 if instr[j]=='left' else 0
 ```
 
-iii. The trajectory reasoned that actual response is fully determined by instructed side plus correctness, with ignore representing no response.
+iii. The trajectory explicitly states that actual choice is not stored directly and should be inferred from instructed side plus trial outcome, with `ignore` meaning no lick.
 
 ## 5-b. What processing is involved in computing `output` *Lick direction choice*?
 
-i. Choice is encoded as 0 left, 1 right, or 2 no lick, then broadcast across all 80 bins.
+i. Choice is encoded as `0=left`, `1=right`, `2=no lick`, and then repeated across all 80 bins within that trial.
 
 ii.
 ```python
-out=np.vstack((np.full(len(CENTERS),choice,np.int8), ...))
+if outcome[j]=='ignore': choice=2
+elif outcome[j]=='hit': choice=0 if instr[j]=='left' else 1
+elif outcome[j]=='miss': choice=1 if instr[j]=='left' else 0
 ```
 
-iii. The agent confirmed the decoder accepts time-varying outputs and broadcast trial-level labels so all four outputs can share one rectangular array.
+```python
+out=np.vstack((np.full(len(CENTERS),choice,np.int8),
+               np.full(len(CENTERS),omap[outcome[j]],np.int8),
+               np.full(len(CENTERS),ecat,np.int8),ycat))
+```
+
+iii. The trajectory says the decoder expects categorical outputs on the trial grid, so per-trial labels such as choice are broadcast across time to share the same `(n_output, n_timepoints)` layout as tongue position.
 
 ## 6-a. What variables in the raw data is `output` *Outcome* derived from?
 
-i. It comes directly from the trials-table `outcome` field.
+i. Outcome comes directly from the trials-table `outcome` column.
 
 ii.
 ```python
 outcome=np.asarray([s(x).lower() for x in tr['outcome'][:]])
 ```
 
-iii. The agent observed that the field directly contains the requested categories.
+iii. The trajectory treats `outcome` as already present in the NWB trials table with the required categories.
 
 ## 6-b. What processing is involved in computing `output` *Outcome*?
 
-i. `ignore`, `miss`, and `hit` map to 0, 1, and 2 and are repeated over all bins.
+i. Outcome strings are mapped to integer codes with `ignore=0`, `miss=1`, `hit=2`, then repeated across all 80 bins for that trial.
 
 ii.
 ```python
 omap={'ignore':0,'miss':1,'hit':2}
-np.full(len(CENTERS),omap[outcome[j]],np.int8)
 ```
 
-iii. The mapping follows the requested output order; broadcasting gives a common output shape.
+```python
+out=np.vstack((np.full(len(CENTERS),choice,np.int8),
+               np.full(len(CENTERS),omap[outcome[j]],np.int8),
+               np.full(len(CENTERS),ecat,np.int8),ycat))
+```
+
+iii. The trajectory says outcome is a categorical per-trial variable and therefore is broadcast across the time axis.
 
 ## 7-a. What variables in the raw data is `output` *Early lick* derived from?
 
-i. It comes from the trials-table `early_lick` field.
+i. Early lick is derived directly from the trials-table `early_lick` column.
 
 ii.
 ```python
 early=np.asarray([s(x).lower() for x in tr['early_lick'][:]])
 ```
 
-iii. The agent found this trial label directly in NWB, so it did not derive it from lick timestamps.
+iii. The trajectory identifies `early_lick` as an explicit per-trial label in the NWB trials table.
 
 ## 7-b. What processing is involved in computing `output` *Early lick*?
 
-i. Values beginning with `early` map to 1 and all others to 0; the result is repeated across all bins.
+i. The code converts `early_lick` into a binary category: `1` if the string starts with `'early'`, otherwise `0`. This value is repeated across all 80 bins.
 
 ii.
 ```python
 ecat=1 if early[j].startswith('early') else 0
-np.full(len(CENTERS),ecat,np.int8)
 ```
 
-iii. This implements the requested yes/no categories while tolerating the source string wording.
+```python
+out=np.vstack((np.full(len(CENTERS),choice,np.int8),
+               np.full(len(CENTERS),omap[outcome[j]],np.int8),
+               np.full(len(CENTERS),ecat,np.int8),ycat))
+```
+
+iii. The trajectory says early lick is a per-trial output, so it is encoded categorically and broadcast over the common time axis.
 
 ## 8-a. What variables in the raw data is `output` *Tongue y-position* derived from?
 
-i. It uses `Camera0_side_TongueTracking` timestamps and data, with column 1 as y-position and column 2 as tracking confidence.
+i. Tongue y-position is derived from `BehavioralTimeSeries/Camera0_side_TongueTracking`: the code uses `timestamps`, the second data column as tongue `y`, and the third data column as a visibility/confidence value.
 
 ii.
 ```python
@@ -294,28 +389,47 @@ tt=np.asarray(tongue.timestamps[:],float)
 td=np.asarray(tongue.data[:],dtype=np.float32)
 ```
 
-iii. The trajectory identified the three tracking columns as x, y, and DeepLabCut confidence and regarded this as the synchronized tongue stream.
+```python
+visible=np.isfinite(td[:,1]) & np.isfinite(td[:,2]) & (td[:,2]>=DLC_VISIBLE)
+```
+
+iii. The trajectory says the NWB acquisition contains synchronized tongue tracking with three columns interpreted as x, y, and DeepLabCut confidence, and it uses that as the sole tongue source.
 
 ## 8-b. What processing is involved in computing `output` *Tongue y-position*?
 
-i. Frames with finite y and confidence at least 0.9 define the session percentile population. For each neural bin center, the nearest camera frame is selected; its y is used only if visible, otherwise category 3 is emitted. There is no within-bin averaging.
+i. The AI marks frames as visible when confidence is at least `0.9`, then computes the session's 40th and 60th percentiles from all visible raw `y` samples. For each decoder time bin, it chooses the nearest camera frame to the bin center and assigns a category from that single frame's `y` value, or class `3` if the frame is not visible.
 
 ii.
 ```python
+DLC_VISIBLE=.9
+...
 visible=np.isfinite(td[:,1]) & np.isfinite(td[:,2]) & (td[:,2]>=DLC_VISIBLE)
-q40,q60=np.percentile(td[visible,1],[40,60])
+if visible.any(): q40,q60=np.percentile(td[visible,1],[40,60])
+else: q40,q60=np.nan,np.nan
+```
+
+```python
 ix=np.searchsorted(tt,times); ix=np.clip(ix,1,len(tt)-1)
 ix-=((times-tt[ix-1]) <= (tt[ix]-times))
 vis=(td[ix,2]>=DLC_VISIBLE)&np.isfinite(td[ix,1])
+ycat=np.full(len(CENTERS),3,dtype=np.int8)
+ycat[vis & (td[ix,1]<q40)]=0
+ycat[vis & (td[ix,1]>=q40) & (td[ix,1]<=q60)]=1
+ycat[vis & (td[ix,1]>q60)]=2
 ```
 
-iii. The agent selected 0.9 as a conventional confidence threshold and interpreted the requested percentiles as percentiles of all confident session samples. It chose nearest-frame sampling to synchronize video to bin centers.
+iii. The trajectory explicitly justifies two non-reference choices: using a "conventional" `0.9` DeepLabCut threshold for visibility and assigning tongue state from the nearest video frame at each bin center rather than averaging frames over the 50 ms bin.
 
 ## 8-c. How is `output` *Tongue y-position* thresholded into categories?
 
-i. Session-wide raw visible-frame y values provide the 40th and 60th percentiles. Visible values below q40 are 0, values from q40 through q60 are 1, values above q60 are 2, and invisible values are 3.
+i. The code uses session-wide percentiles of visible raw `tongue_y` values: `< q40` maps to class `0`, `q40 <= y <= q60` to class `1`, `> q60` to class `2`, and non-visible frames to class `3`.
 
 ii.
+```python
+if visible.any(): q40,q60=np.percentile(td[visible,1],[40,60])
+else: q40,q60=np.nan,np.nan
+```
+
 ```python
 ycat=np.full(len(CENTERS),3,dtype=np.int8)
 ycat[vis & (td[ix,1]<q40)]=0
@@ -323,96 +437,133 @@ ycat[vis & (td[ix,1]>=q40) & (td[ix,1]<=q60)]=1
 ycat[vis & (td[ix,1]>q60)]=2
 ```
 
-iii. The 40/60 boundaries and per-session scope come directly from the task. The agent used confidence to operationalize “not visible.”
+iii. The trajectory says it used session-wide 40th/60th percentile thresholds from visible samples because that matched its reading of the instructions, while treating low-confidence frames as "not visible."
 
 ## 8-d. How is `output` *Tongue y-position* aligned with the neural data?
 
-i. The closest video frame to each absolute neural-bin center is selected using timestamp search.
+i. Tongue y-position is aligned by sampling the nearest camera frame at each of the same go-aligned bin centers used for neural data. It does not average all video frames inside each 50 ms bin.
 
 ii.
 ```python
 times=g+CENTERS
-ix=np.searchsorted(tt,times); ix=np.clip(ix,1,len(tt)-1)
-ix-=((times-tt[ix-1]) <= (tt[ix]-times))
 ```
 
-iii. The agent reasoned that both streams share the NWB clock and chose center sampling rather than aggregating all frames falling inside each 50-ms neural interval.
+```python
+ix=np.searchsorted(tt,times); ix=np.clip(ix,1,len(tt)-1)
+ix-=((times-tt[ix-1]) <= (tt[ix]-times))
+vis=(td[ix,2]>=DLC_VISIBLE)&np.isfinite(td[ix,1])
+```
+
+iii. The trajectory justifies this by saying there is no need to extrapolate beyond the video stream and that nearest-frame sampling is a practical way to synchronize tongue labels to the neural bin centers.
 
 ## 9. How are minor mistakes in the data, e.g. missing data, handled?
 
-i. A session with no good unit is skipped; absent tone history becomes NaN; an entirely non-visible tongue session gets NaN percentile edges; non-finite/invisible tongue samples map to category 3. A go/trial count mismatch raises an error. Missing spike coverage and free-water trials are not handled.
+i. The AI handles one missing-data case by dropping sessions with no classifier-good units. Missing or low-confidence tongue observations are assigned to the `'not visible'` class. It does not remove trials lacking spike observations, so such trials remain in the output as all-zero neural matrices.
 
 ii.
 ```python
-if not len(keep): return None
-if len(go)!=ntr: raise RuntimeError(...)
-sample_for_trial[j]=q[-1] if len(q) else np.nan
-if visible.any(): q40,q60=np.percentile(...)
-else: q40,q60=np.nan,np.nan
+keep=np.flatnonzero(cls=='good')
+if not len(keep):
+    return None
+```
+
+```python
+visible=np.isfinite(td[:,1]) & np.isfinite(td[:,2]) & (td[:,2]>=DLC_VISIBLE)
+...
+vis=(td[ix,2]>=DLC_VISIBLE)&np.isfinite(td[ix,1])
 ycat=np.full(len(CENTERS),3,dtype=np.int8)
 ```
 
-iii. The agent investigated the all-unlabelled session and deliberately omitted it. It otherwise relied on the release being curated and did not inspect observation intervals, leaving some trials with fabricated all-zero neural activity.
+```python
+sample_for_trial[j]=q[-1] if len(q) else np.nan
+```
+
+iii. The trajectory explicitly mentions dropping the one session whose classifier labels are all missing, and treating low-confidence tongue frames as not visible. It does not add the reference trial-level missing-spike filtering, and the final output retains 3,511 all-zero neural trials.
 
 ## 10-a. What are the most time-consuming steps of the code?
 
-i. Reading large NWBs and dense tongue arrays, loading ragged spike trains, per-unit spike binning, retaining a large in-memory result, and serializing the 12.31-GB pickle dominate. The initial nested histogram implementation was especially slow.
+i. The AI identifies full-session NWB reading, dense tongue/video loading, spike-time materialization, and neural binning as the dominant costs. It also notes that serializing the final `converted_data.pkl` is substantial because the file is about 12.31 GB.
 
 ii.
 ```python
+with NWBHDF5IO(path,'r',load_namespaces=True) as io:
+    n=io.read(); tr=n.trials; u=n.units
+...
+tt=np.asarray(tongue.timestamps[:],float)
 td=np.asarray(tongue.data[:],dtype=np.float32)
 spikes=[np.asarray(u['spike_times'][int(i)],float) for i in keep]
-for k,st in enumerate(spikes):
-    frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
-pickle.dump(data,f,protocol=pickle.HIGHEST_PROTOCOL)
 ```
 
-iii. The trajectory measured only about four sessions/minute with nested histograms, then reported a major speedup after vectorizing across trials; final conversion still produced a 12.31-GB object.
+```python
+frcube=np.empty((len(keep),ntr,len(CENTERS)),dtype=np.float32)
+for k,st in enumerate(spikes):
+    frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
+```
+
+iii. The trajectory explicitly calls out the initial per-unit/per-trial histogram loop as too slow, then says the optimized run is dominated by reading large NWB arrays and by per-unit spike binning, with the final pickle size also called out after completion.
 
 ## 10-b. What loops in the code could have been vectorized to improve efficiency?
 
-i. The original unit-by-trial histogram loop was vectorized across trials. Remaining loops include per-unit ragged spike searches, per-trial stream/output construction, scanning every stimulation interval for every trial, and repeated Python loops for subject/region indexing. The photostimulation work could especially be restricted or vectorized.
+i. In the trajectory, the AI itself identified the original nested unit-by-trial histogram loop as the main vectorization target and replaced it with one `searchsorted` per unit over all trials at once. In the final code, remaining vectorizable loops include the per-trial search for the last sample event and the per-trial scan over all photostimulation intervals.
 
 ii.
+```python
+sample_for_trial=np.empty(ntr,float)
+for j,g in enumerate(go):
+    q=sample[sample < g+1e-9]
+    sample_for_trial[j]=q[-1] if len(q) else np.nan
+```
+
 ```python
 for k,st in enumerate(spikes):
     frcube[k]=np.diff(np.searchsorted(st,all_edges,side='left'),axis=1)/DT
-for j,g in enumerate(go):
-    ...
-    for a,b in zip(pstart,pstop): photo[(times>=a)&(times<b)]=1
 ```
 
-iii. The agent explicitly recognized and fixed the costly unit-by-trial histogram loop. It left the per-unit loop because spike vectors are ragged and did not discuss the quadratic trial-by-all-stimulation-interval scan.
+```python
+for a,b in zip(pstart,pstop): photo[(times>=a)&(times<b)]=1
+```
+
+iii. The trajectory explicitly says the first version was too slow because it histogrammed every unit on every trial. It then patches that loop away, but leaves the smaller per-trial loops in place.
 
 ## 10-c. What processing does the code repeat multiple times?
 
-i. For every trial it scans all session photostimulation intervals, performs nearest-frame timestamp searches, allocates/broadcasts categorical vectors, and copies the trial's firing-rate slice. Subject and region membership/index searches are also repeated linearly during assembly.
+i. The code repeatedly rescans the full `sample` event vector once per trial to find the last sample event before `go`, and it rescans every photostimulation interval for every trial to build the binary photostim trace. It also recreates the outcome-code dictionary `omap` inside each trial loop.
 
 ii.
 ```python
 for j,g in enumerate(go):
-    fr=frcube[:,j,:].copy()
-    ...
-    for a,b in zip(pstart,pstop): ...
-    ix=np.searchsorted(tt,times)
-```
-```python
-if r not in data['brain_regions']: data['brain_regions'].append(r)
-rid.append(data['brain_regions'].index(r))
+    q=sample[sample < g+1e-9]
+    sample_for_trial[j]=q[-1] if len(q) else np.nan
 ```
 
-iii. The trajectory focused on removing repeated spike histograms but gave no explicit justification for these remaining repeated operations.
+```python
+for j,g in enumerate(go):
+    ...
+    photo=np.zeros(len(CENTERS),dtype=np.float32)
+    for a,b in zip(pstart,pstop): photo[(times>=a)&(times<b)]=1
+```
+
+```python
+omap={'ignore':0,'miss':1,'hit':2}
+```
+
+iii. The trajectory focuses on one repeated computation, the original per-unit/per-trial spike histogramming, and then removes it. The final script still repeats smaller full-vector scans inside the per-trial loop.
 
 ## 10-d. What unnecessary processing does the code do that is discarded in downstream analyses?
 
-i. It loads and bins trials that the reference later excludes for absent spike observations/free water, producing neural/input/output arrays that should not be in the dataset. It also computes and stores metadata percentiles and repeatedly copies matrices, though those are minor compared with the invalid retained trials.
+i. The code does not compute a large derived data product and then discard it from the saved dataset. Its temporary arrays (`frcube`, `times`, `photo`, `ycat`) are intermediate values used to build outputs, and the per-session `info` dictionary is retained in metadata.
 
 ii.
 ```python
-for j,g in enumerate(go):
-    fr=frcube[:,j,:].copy()
-    ...
-info={...,'tongue_y_percentiles':[float(q40),float(q60)],...}
+frcube=np.empty((len(keep),ntr,len(CENTERS)),dtype=np.float32)
+...
+info={'file':os.path.basename(path),'subject':subject,'n_trials':ntr,
+      'n_good_units':len(keep),'tongue_y_percentiles':[float(q40),float(q60)],
+      'dlc_visibility_threshold':DLC_VISIBLE}
 ```
 
-iii. The agent believed sessions were already curated, so it did not recognize the discarded/invalid trial processing. It did not identify any unnecessary downstream work in its final rationale.
+```python
+data['metadata']['session_info'].append(info)
+```
+
+iii. The trajectory does not describe any knowingly discarded computation. Its optimization effort was aimed at speeding up computations that still feed the saved output.
