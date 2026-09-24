@@ -1,0 +1,275 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI globs `/app/data/sub-*/sub-*_behavior+ophys.nwb` and opens each file with pynwb, which is functionally identical to the reference's get_subjects/get_sessions directory walk plus NWBHDF5IO read. Both find all 152 sessions across 11 subjects and keep every pulse-defined trial (12,216). The AI additionally cross-checked the counts against the paper (11 switch mice, 14 days, m11 starting on day 3) in Steps 2/4/9.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The glob pattern matches the actual file layout (verified: 152 files, 11 subject directories), sorting makes the order deterministic, and the full run reported 152 sessions / 12,216 trials / 138,678 curated neurons, matching an independent raw-data audit I ran over the NWB files."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Subject identity is taken from the `sub-<id>` parent directory name, exactly the reference's rule, and `subject_idx` indexes sessions into the subject list. 11 subjects with 12 (m11) / 14 (others) sessions, matching the paper.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`file_path.parent.name.replace('sub-', '')` yields the subject id; subjects are appended in first-encounter order and `subject_idx` is appended per session in the same loop, so the index array is aligned with the session lists. Verification output shows the expected 11 subjects and per-subject session counts."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "One NWB file = one session, with the session number parsed from the filename, identical to the reference. Like the reference, the AI does not attempt the paper's cross-day cell alignment, which is not needed for this decoder task.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The `_ses-(\\d+)_` regex matches every filename in the dataset; sorted globbing keeps each subject's sessions contiguous and in day order, and scene/date metadata parsed from `nwb.identifier` is stored per session in `metadata['session_info']`."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Trials run from each `trial_start` pulse to the next `teleport` pulse, slice `[start, stop)`, i.e. the lap excluding the teleport/tunnel period — the same definition as the reference (rising edge of teleport) and the reference code's trial_start_inds/teleport_inds. The AI explicitly rejected the stored `trial number` stream for boundary definition and documented why (the extra trailing tunnel segment in sub-m11_ses-03), which is the same conclusion the reference reached.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The pairing loop reproduces the reference boundaries exactly: I recomputed trial bounds independently from the raw pulses and got 12,216 trials with min length 96 frames, and the AI's trial-length statistics (T mean 216.78, median 197.49, min 96, max 3359) are identical to the reference solution's, so the two implementations select the same samples."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI applies no duration-based trial rejection (only degenerate-trial guards: stop<=start, no valid environment sample, >=2 trials per session), whereas the reference nominally drops trials with <50 timepoints. The outcome is identical: no trial in the dataset is shorter than 96 frames (I checked all 12,216), and both solutions keep 12,216 trials. The AI explicitly reviewed trial lengths and justified keeping the long laps; the paper describes no trial-duration exclusion. Equally justified, though a documented minimum-length guard would have been slightly more defensive.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements exactly the guards described, and no trial is in fact excluded — the converted trial count equals the raw pulse-defined count of 12,216 in every session."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The AI uses the NWB `processing/ophys/Deconvolved` series (suite2p's own deconvolution) and never reads `Fluorescence` or `Neuropil`. The paper's `events` — the signal every analysis, including the Fig. 3 decoder, uses — are not that array: the reference code computes them itself with `preprocessing.dff(F, Fneu, ..., deconvolve=True)` from the raw suite2p F and Fneu traces, which is exactly what the reference solution does. The AI reasoned 'the reference notebook decodes from events, and Deconvolved is events' without ever testing that identification, despite the task explicitly prompting 'For neural imaging data, does delta F over F need to be computed?'. The consequence is measurable: with behavioral labels essentially identical to the reference (output class fractions agree to 3 decimals), validation balanced accuracy is lower on every single output (distance 0.408 vs 0.562, position 0.508 vs 0.661, speed 0.348 vs 0.559, lick 0.606 vs 0.742, reward zone 0.801 vs 0.845, reward outcome 0.507 vs 0.575), isolating the neural stream as the cause.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code faithfully implements the stated decision: it reads the Deconvolved ROI response series per plane, keeps `iscell[:,0]==1` columns, concatenates planes in plane order, and the AI verified the extraction against raw NWB samples for both a single-plane (sub-m11_ses-03) and a multi-plane (sub-m17_ses-04) session."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "No processing at all is applied — the stored deconvolved traces are sliced, nan_to_num'd and cast to float16. This omits the entire pipeline the Methods describe and the reference implements: neuropil subtraction (F - 0.7*Fneu with the trial-mean neuropil added back), a per-trial maximin baseline over a 20 s sliding window, (F-baseline)/|baseline| dF/F, a 2-sample Gaussian smoothing, and OASIS deconvolution at tau=0.7 using the per-plane frame rate (and the per-mouse/per-day keep_teleports distinction). The AI's own Step 3 notes record this pipeline correctly, then Step 5 assumes the NWB field already is it. The instructions demand matching the reference processing of the neural stream, and the uniformly lower decoder accuracy shows the substitute signal carries less information. The float16 cast is a separate, documented and low-impact storage choice.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does what the notes say it does: no transformation beyond the single-frame trim, nan_to_num (a no-op — the stored arrays have no NaNs) and the float16 cast, which the AI validated with a float16 round-trip spot check against the raw NWB values."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI applies the suite2p/manual `iscell[:,0]==1` curation (same as the reference) but deliberately skips the paper's additional exclusion of putative interneurons (dF/F vs running-speed correlation r>0.5), which the reference does apply. The AI identified this step in Step 4, including the correct 0.5 threshold, and documented its reason for skipping it (the decoder uses the whole population rather than place-cell subsets). The deviation is small — the reference keeps 138,298 cells vs the AI's 138,678, a 0.27% difference — and for a decoding task retaining speed-correlated cells is defensible (it can only add information, particularly for the speed output). It is a documented, low-impact departure rather than an error, though it is also partly forced by 2-b: without dF/F the AI had no natural signal on which to compute the correlation.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`keep = iscell[:,0] == 1` is applied per plane at read time via a plane-local mask, and the resulting counts (138,678 total; mean 912.4; range 155-2341) match an independent audit of `iscell` in the raw files."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: alignment to trial start requires nothing beyond slicing at the trial_start sample, because the neural and behavioral streams share the imaging frame grid. The AI also records `temporal_alignment_event = 'trial start'` and `off_start = 0.0`, which is a slightly more informative metadata choice than the reference's null.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`deconv[start:stop]` and all behavioral slices use the identical index range, and a per-session check enforces equal neural/behavior sample counts (with the documented 1-frame trim) before any trial is cut."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "No rebinning; the native 15.5078125 Hz frame grid is kept, giving 64.4836 ms bins — identical to the reference, which derives the same number as nplanes/rate. The AI also correctly diagnosed the multi-plane trap (the series `rate` is the 31 Hz scanner rate, the per-plane rate is 15.5 Hz) and resolved it using the behavior timestamps, which is the same conclusion the reference reached by dividing by nplanes.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`frame_dt_s` is the median behavior-frame interval and every session is asserted equal to 1/15.5078125 s within 1e-9, so the single `time_bin_size` (64.483627 ms) written from the first session is valid for all 152 sessions; the value matches the reference solution's metadata exactly."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time from start of trial in seconds* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI uses the `position` stream's timestamps where the reference uses the `trial number` stream's timestamps; these are the same shared frame-time vector (the reference even asserts equality across streams), so the choice is equivalent.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`frame_times` is read once per session and used consistently for the time input, the reward rasterization and the bin-size check; the AI verified trial 0 of sub-m11_ses-03 against raw timestamps with np.allclose(atol=1e-6)."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time from start of trial in seconds*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Subtract the trial's first frame time — identical to the reference (`timestamps_curr - timestamps_curr[0]`).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The computed row starts at exactly 0 for every trial and the full-data range [0.0, 216.5] s equals the reference solution's reported range."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time from start of trial in seconds* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both solutions rely on the streams already being co-sampled and add a length-consistency guard. The reference crops to the shorter of the two with a warning; the AI trims exactly one trailing neural frame in the 10 affected multi-plane sessions and raises otherwise. Raising on unexpected mismatches is a reasonable, arguably stricter, variant.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The trim happens before any trial slicing, so input and neural rows always have the same length; the full conversion completed with no mismatch errors, and the resulting per-trial shapes were verified (e.g. neural (155,290) / input (4,290) / output (6,290))."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `input` *Environment type* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The `environment` behavioral time series, the same source as the reference. The AI explicitly chose the aligned stream over the scene-name prefix so that environment-switch sessions (e.g. Env1_B_to_Env2_C) are handled correctly, which is the right call.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Read directly from `beh.time_series['environment']`; the converted range is [0,1] as expected, matching the reference solution."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `input` *Environment type*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI takes the mode of the non-sentinel environment samples in the trial and broadcasts it; the reference copies the per-timepoint values. I verified the environment stream is constant and non-negative within every one of the 12,216 trials, so the two are numerically identical here and the AI's sentinel/mode handling is only a defensive wrapper.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`mode_int` on `env_trial[env_trial >= 0]` implements the described rule. One wording mismatch: the Step 5 mapping table says 'use first valid value in trial' while the code takes the mode — the two agree on all data here, so the converted values are unaffected."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `input` *Trial number* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI reads the stored `trial number` stream at the trial-start sample (falling back to the loop index if negative), whereas the reference deliberately uses the loop index because it judged the stored variable inconsistent with `trial_start`. I checked all 152 sessions: `trial number` at the trial-start sample equals the 0-indexed pulse order for every one of the 12,216 trials, so the two decisions produce identical values. The AI's approach is well justified (it keeps boundaries from the pulses and uses the stored stream only as a label) and it explicitly analysed the one anomalous session.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The value is read at `trial_number[start]`, rounded to int, and the negative fallback never triggers (no trial starts on a sentinel sample). Converted range [0, 99] matches the reference."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `input` *Trial number*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "No processing beyond broadcasting the 0-indexed per-trial constant across timepoints, exactly as the reference does.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`np.full(trial_time_s.shape, float(trial_num_native))` produces a constant row of the correct length in the input matrix."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `input` *Previous trial outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Derived from the `Reward` event series timestamps rasterized onto the frame grid with searchsorted — the same source and the same mechanism as the reference. The AI verified beforehand that reward timestamps coincide exactly with frame timestamps.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`rasterize_reward_events` marks the matching frame and raises if any reward time fails to coincide within 1e-9 s (stricter than the reference's half-bin tolerance); the full conversion ran without triggering it, so all reward events landed on exact frames."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `input` *Previous trial outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Per-trial reward presence shifted by one trial, 0 for the first trial of a session, broadcast across timepoints — identical to the reference's rule and boundary convention.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`prev_reward_outcomes[1:] = reward_outcomes[:-1]` with a zero first element implements the shift, and the AI spot-checked trial 41 against trial 40's outcome in sub-m11_ses-03. The shift is over the pulse-defined trial list rather than the kept-trial list, which is harmless because no trials are dropped."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Distance to reward zone* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Both solutions use `position` plus a per-trial reward-zone interval taken from the paper's coordinates (A 80-130, B 200-250, C 320-370). They differ in how the active zone is identified: the AI ports the reference code's scene-string rule (see 10-a) while the reference solution infers it empirically from the `reward_zone` stream via Viterbi. I validated the AI's labels against the empirical reward-zone entry positions for all 12,216 trials and found zero disagreements, and its distance-class distribution matches the reference solution's to 3 decimals, so the two are equally justified.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The zone interval is looked up per trial from the label array and passed to `signed_distance_to_interval` on the trial's position slice; the AI recomputed trial 40 of sub-m11_ses-03 from raw position and got an exact match."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Distance to reward zone*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Signed distance to the nearest edge of the zone interval, 0 inside the zone, negative before, positive after — the same definition as the reference's compute_distance_to_reward_zone, and the correct reading of 'distance to any location in the reward zone'. Correctly avoids the reference code's circular reward-relative coordinate, which is not what the instructions ask for.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The masked assignment is algebraically identical to the reference implementation, and the resulting 7-class distribution [0.253, 0.102, 0.074, 0.237, 0.021, 0.072, 0.242] is identical to the reference solution's at printed precision."
+  },
+  "7-c": {
+    "question": "How is `output` *Distance to reward zone* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The seven bins follow the instruction's edges, with class 3 reserved for exactly 0 (in zone). The only difference from the reference is which side the +/-10 and +/-50 edges close on (the AI is right-closed above zero, the reference left-closed throughout); the instructions are ambiguous there and the class fractions come out the same.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The boolean-mask assignments are ordered so that later, more specific masks overwrite earlier ones correctly, covering the whole real line with no gaps or overlaps; output range is [0,6] with all seven classes populated."
+  },
+  "7-d": {
+    "question": "How is `output` *Distance to reward zone* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical index slicing on the shared frame grid, no extra alignment — the same as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`position[start:stop]` uses the same `[start, stop)` range as `deconv[start:stop]`; the show-processing plots were inspected for temporal misalignment and none was found."
+  },
+  "8-a": {
+    "question": "What variables in the raw data is `output` *Absolute position* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The `position` behavioral time series in cm, same as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Read once per session and sliced per trial; pre-sync sentinel values (-500) fall outside all trial windows so they never enter the output."
+  },
+  "8-b": {
+    "question": "What processing is involved in computing `output` *Absolute position*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "None beyond the per-trial slice and discretization, exactly as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Raw cm values go straight into `discretize_position`; the converted class distribution [0.211, 0.178, 0.231, 0.227, 0.154] equals the reference solution's."
+  },
+  "8-c": {
+    "question": "How is `output` *Absolute position* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Five 90 cm bins with open first and last edges ([-inf,90), [90,180), [180,270), [270,360), [360,inf)) — identical to the reference's digitize edges, and the open ends correctly absorb the handful of samples marginally outside the 450 cm track rather than creating spurious classes.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The mask cascade implements exactly the documented rule; output range [0,4] with all five classes populated."
+  },
+  "8-d": {
+    "question": "How is `output` *Absolute position* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same-index slicing on the shared frame grid, as in the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Position and neural slices use the same index range, guarded by the per-session length check."
+  },
+  "9-a": {
+    "question": "What variables in the raw data is `output` *Lick* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The `lick` behavioral time series (per-frame cumulative lick count), same as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Read directly from `beh.time_series['lick']` and sliced per trial."
+  },
+  "9-b": {
+    "question": "What processing is involved in computing `output` *Lick*?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "Like the reference, the AI binarizes any positive count to 1; unlike the reference, it first implements the paper's lick-sensor artifact rule (>35% of a trial's frames with cumulative count >2 => the trial's licks are discarded), with thresholds taken verbatim from the reference code's `get_timeseries_data` (`sum(licks>2)/len > 0.35`) and consistent with the Methods ('>30% of the 0.0645 s imaging frame samples in the trial containing a cumulative lick count >2'). I reproduced the rule on the raw data: it flags 69 of 12,216 trials (0.56%), closely matching the paper's reported 81/12,376 (~0.65%). This is a genuine fidelity improvement over the reference solution. The one caveat is that, because the output must be categorical, artifact trials are labelled 'no lick' (0) rather than excluded as the reference code's NaN does, which injects a small amount of label noise into ~0.6% of trials; dropping those trials would have been the cleaner analogue. The net effect is negligible: the converted lick distribution (0.770/0.230) is identical to the reference solution's at printed precision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`correct_lick_trial` computes the bad-trial fraction on the trial slice, zeroes the trial if it trips, then binarizes — matching the documented rule and the metadata `lick_sensor_rule`. The AI verified two flagged trials (sub-m11_ses-06 trial 60 at 42.0%, sub-m12_ses-10 trial 73 at 38.7%) against raw data."
+  },
+  "9-c": {
+    "question": "How is `output` *Lick* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same-index slicing on the shared frame grid; the artifact rule operates inside the same window so it cannot introduce a shift.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`correct_lick_trial(lick_counts[start:stop])` returns an array of the same length as the neural slice, stacked into the output matrix at row 3."
+  },
+  "10-a": {
+    "question": "What variables in the raw data is `output` *Reward zone location* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI infers the zone from the scene string in `nwb.identifier` plus a switch after trial 30, a direct port of the reference code's `behavior.get_reward_zones(sess, change_trial=30)`; the reference solution instead segments the empirical `reward_zone`/`position` data with a Viterbi HMM. The AI's route is simpler, deterministic, and arguably closer to the reference code, and I independently validated it: comparing the scene-derived label to the zone implied by the animal's position at every reward-zone entry gives 0 mismatches across all 12,216 trials, and the class fractions [0.329, 0.337, 0.335] equal the reference solution's. Two caveats keep this from being rated better: `change_trial` is hard-coded at 30 with no data-driven check (the reference code allows `sess.change_reward_trial` to override it, and the AI's own Step 10 'verification' of zone labels was circular — it compared converted labels to the same scene rule rather than to the `reward_zone` stream), and the unused 'Training' branch maps to zone A whereas the reference code maps Training sessions to [275,325]/'T'. Neither bites on this dataset (no Training scenes; switch at 30 correct everywhere).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`scene_to_reward_labels` reproduces the reference function's branch structure for all 26 scene strings present in the data (it raises on anything unrecognized, and the full run completed), and the label list is indexed per trial when building the output."
+  },
+  "10-b": {
+    "question": "What processing is involved in computing `output` *Reward zone location*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "A/B/C is mapped to 0/1/2 and broadcast across the trial's timepoints, the same encoding and broadcasting as the reference; only the upstream label source differs (see 10-a), and it was verified to agree with the data on every trial.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`reward_label_to_code` plus `np.full(...)` gives a constant int row per trial; output range [0,2] with a near-uniform distribution as expected from the counterbalanced design."
+  },
+  "11-a": {
+    "question": "What variables in the raw data is `output` *Reward outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The `Reward` event series timestamps, rasterized to the frame grid — same as the reference. Both solutions count auto-delivered rewards as rewarded and both ignore the reference code's extra `rzone>0` conjunction in get_trial_types.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The same `reward_frames` vector feeds both the per-trial outcome and the previous-trial input, so the two are guaranteed consistent."
+  },
+  "11-b": {
+    "question": "What processing is involved in computing `output` *Reward outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "`any` reward event inside the trial window, broadcast across timepoints — identical to the reference. The resulting omission fraction of 0.157 matches the paper's ~15% and the reference solution's value exactly.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`trial_reward_outcomes` tests `np.any(reward_frames[start:stop] > 0)` on the same window used for the neural slice; the AI verified an omission trial and a rewarded trial against raw events."
+  },
+  "12": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI covers the same real issues the reference does and documents them: the neural/behavior length mismatch (trim one trailing frame in the 10 affected multi-plane sessions vs the reference's crop-to-min), pre-sync sentinel values (excluded by construction, plus explicit guards), reward-timestamp alignment (asserted), degenerate trials and sessions, and lick-sensor failures. The style is stricter — unexpected conditions raise rather than warn — which is defensible for a conversion that must be trusted, though it means an unanticipated anomaly aborts the whole run instead of degrading gracefully. The reference additionally handles missing reward-zone data, which the AI's scene-based approach makes moot.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each documented guard exists in the code and the full 152-session run completed with no errors. Two of the guards are inert on this data (`nan_to_num` — the Deconvolved arrays contain no NaNs, which I checked; and the negative-`trial number` fallback), which is harmless."
+  },
+  "13-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI correctly identifies NWB I/O as the bottleneck and instruments it per session (0.28-0.93 s/session, 102 s summed over 152 sessions in the actual run), with pickling the 4.6 GB output and the optional plotting as the other costs — the same picture the reference gives. The conversion is fast largely because it skips the dF/F + OASIS step, which is the reference's real expense; that is a consequence of the 2-b decision rather than an efficiency win.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Per-session and total timing is measured with `time.perf_counter`, printed per session, and stored as `conversion_runtime_s` in metadata; the printed times sum to the reported total."
+  },
+  "13-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, the AI keeps a per-trial Python loop, which is the natural structure for variable-length trials, and its remaining loops (`pair_trial_bounds`, `trial_reward_outcomes`, the per-plane loop) are all O(trials) and negligible against I/O. Vectorizable opportunities do exist — searchsorted for the pulse pairing, a cumulative sum for per-trial reward presence, and whole-session discretization before splitting — but leaving them is well justified at 102 s total. The notes list the speed-ups adopted rather than enumerating the remaining loops, which is a small documentation gap.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops described are the loops present, and the measured runtime confirms they are not the bottleneck."
+  },
+  "13-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The conversion is a single pass over the dataset. The reference needs two full passes (a survey pass to gather reward-zone positions for the Viterbi segmentation, then the conversion pass) and reads every NWB file twice; the AI avoids that entirely because the reward zone comes from session metadata. The repetition that remains is confined to `--show-processing`, where the first two sessions are reopened and their behavioral streams, trial bounds (recomputed four times in one call) and lick correction are recomputed for plotting — sloppy, but bounded to two sessions and acknowledged in the notes.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The main loop calls `convert_session` once per file; the only duplicate read is the explicitly gated `if show_processing and session_idx < 2` block."
+  },
+  "13-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference reports none; the AI's code does a small amount of discarded work: `plane_per_cell` is computed and returned but never used (brain_region_idx is filled with zeros), `nan_to_num` runs on arrays that contain no non-finite values, `full_lick` and `trial_reward` are computed and unused in the plotting branch, and per-session stats are stored but unused by the decoder. All are negligible in cost and none corrupt the output. The one substantive item is the float16 cast of the neural data: it halves the 4.6 GB file but discards precision the decoder would otherwise consume. It is documented and its numerical impact is tiny (~0.05% relative), but it is an avoidable lossy step and, unlike the others, it touches the data itself. Only the float16 choice is discussed in the notes; the dead computations are not.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The unused computations are genuinely present in the code as described, and the float16 storage is implemented and documented as stated (the AI traced a failing sanity check to it and re-verified with an explicit float16 round-trip comparison)."
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI loads exactly the same files as the expert (suite2p/plane0/F.npy, Fneu.npy, move_deve/motion_energy_glob.npy) for every subject/session, yielding the identical corpus: 6 mice, 41 sessions, 20445 neurons, 1090 trials. The only structural difference is discovery: the expert scans for directories starting with 'jm', while the AI hard-codes MICE = ['jm031','jm032','jm038','jm039','jm040','jm046']. The AI listed the directory first and the data README documents exactly these six subjects, so the hard-coded list is correct for this dataset (less general, but not a wrong decision). Both filter session folders with an isdir test, which is required because jm038/jm039/jm046 also contain a ground_truth.csv. The AI additionally loads tstamps.npy (the expert loads interframe_int.npy instead); see 4-d.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loading code implements the stated decision: MICE is iterated, sessions are sorted directory entries, and F/Fneu/motion_energy are read per session. Running the produced pickle through the verifier confirms 41 sessions with 7/7/7/7/6/7 sessions per mouse, matching what is on disk."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "One subject per jm* folder, subjects listed in sorted order and subject_idx recorded once per session — identical to the expert's decision and to the README's description ('For each subject there is a folder corresponding to the subject id'). The hard-coded list is in the same alphabetical order the expert's scandir/sorted would produce, so subjects and subject_idx are identical to the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "subjects = MICE and subject_idx.append(mouse_i) inside the per-session loop; the exported subject_idx is [0]*7+[1]*7+[2]*7+[3]*7+[4]*6+[5]*7, consistent with the session ordering of 'neural'."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Each date sub-folder (one recording day) becomes one session, sorted alphabetically (= chronologically), with non-directory entries excluded. This is exactly the expert's decision. Sessions are kept separate across days even though Track2p tracks the same neurons across days, which is correct here because the decoder is trained per session and motion-energy percentiles are session-local.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "sorted([d for d in os.listdir(mouse_dir) if os.path.isdir(...)]) plus one append to all_neural/all_input/all_output per session. The verifier reports 41 sessions with 20-min sessions (20 trials) for jm031/jm032 and 30-min sessions (30 trials) for the rest, matching the raw frame counts (36000 vs 54000)."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: the recording has no task structure, so trials are non-overlapping contiguous 60 s blocks, i.e. 180 bins of 333.33 ms, with any partial trailing trial discarded. Both AI and expert arrive at 20 trials per 36000-frame session and 30 per 54000-frame session. This follows the instruction 'Split sessions into 60-second trials' and satisfies the >=2 trials per session requirement. (No remainder actually exists, since every session length is an exact multiple of 1800 frames.)",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "TRIAL_BINS = int(60 / (10/30)) = 180 and split_trials slices [t*180, (t+1)*180) with n_trials = n_bins // trial_bins. The exported trials all have T = 180, confirmed by the verifier ('T: mean 180.00, min 180, max 180', 1090 trials total)."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Neither the AI nor the expert applies any trial/session/subject-level exclusion; the expert's reference answer for this question is N/A. The AI justified this implicitly by verifying up front that every session is complete and uniform (all 36000 or 54000 frames, motion energy present everywhere, all ROIs flagged iscell==1). The paper likewise analyses all recorded days. One could argue the two sessions with >100 dropped camera frames deserve scrutiny, but the expert keeps them too.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "There is no filtering code, consistent with the decision; the only data dropped is a partial trailing trial via floor division, which never triggers on this dataset."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "F.npy and Fneu.npy from suite2p/plane0, exactly as the expert. The AI explicitly considered and rejected spks.npy in favour of dF/F, matching the paper ('We used baseline corrected fluorescence traces as our dF/F') and the loader notebook's note that one should compute dF/F as described in the paper.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "process_session loads both arrays from suite2p/plane0 and passes them to compute_dff; nothing else feeds the neural stream. Neuron counts in the pickle (221/370/685/746/541/435) equal the row counts of F.npy."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same pipeline as the expert: neuropil subtraction with the Suite2p default coefficient 0.7, then maximin baseline subtraction (gaussian sig_baseline=10 -> minimum_filter1d -> maximum_filter1d with win_baseline=60 s at fs=30, i.e. 1800 frames), with subtraction rather than division. The expert calls suite2p.extraction.dcnv.preprocess; the AI re-implements the same three lines with scipy.ndimage. I verified numerically that the two agree on this data (r = 0.999990 over a full session; max residual ~0.03% of trace SD, attributable to edge handling in suite2p 1.1.0's torch filters). The AI also correctly resolved a genuine ambiguity: the paper's own track2p GUI code defaults to neucoeff=0.0, but the paper text says 'default Suite2p parameters', and the AI chose 0.7 with that reasoning stated — the same choice the expert made.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "compute_dff implements exactly the described steps in the described order, with win = int(60*30) = 1800, and is applied to every session before binning. The float64 promotion and float32 cast do not change the result."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "No neuron-level filtering, same as the expert — all 20445 neurons are exported. The AI's justification is in fact stronger than the reference's: it started out planning to apply the paper's iscell>0.5 criterion, then empirically checked iscell.npy for all six mice and found it is all ones (the Track2p export already contains only cells tracked across all days, as the README states), so the filter would be a no-op. Decision and outcome are identical to the expert.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "No row selection anywhere; iscell.npy is never opened by convert_data.py, and brain_region_idx has one entry per row of F.npy for every session."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: there is no stimulus or behavioural alignment event in this spontaneous-activity dataset, so trials are contiguous blocks referenced to the start of the recording session, and metadata records temporal_alignment_event = 'start of recording session'. One small difference: the AI sets off_start = 0.0, off_end = None where the expert sets both to None. Strictly, with session start as the reference, trial t begins at 60*t s, so 0.0 is literally correct only for the first trial of each session; this is a cosmetic metadata inaccuracy, not a processing difference, and the decoder does not consume those fields.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "split_trials applies the same start/end indices to the neural matrix and to the motion-energy vector, and the time input is built from the same indices, so the three streams are aligned by construction; the metadata values written are the ones described."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: rebin 30 Hz to 3 Hz by averaging non-overlapping blocks of 10 frames, giving time_bin_size = 333.33 ms, applied to both the neural and the motion-energy traces, and applied before discretisation of the output (averaging class labels would be meaningless) and before trial cutting. This follows the paper's decoding analysis ('averaging in bins of 10 consecutive timestamps'), which the AI quoted. The AI also confirmed fs = 30 from ops.npy for both the 20-min and 30-min recordings rather than assuming it, so one bin size is valid for all sessions.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "bin_data reshapes to (-1, 10) and means over the last axis for both 1-D and 2-D inputs, is called on dff and on me_aligned before split_trials/discretize_me, and metadata['time_bin_size'] = 333.333 ms matches. Exported trials are (n_neurons, 180) covering 60 s."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time from start of experiment* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the expert: time is not read from any stored variable but computed analytically from the bin index and the known constant frame rate, giving seconds since the start of the session (input_names = ['time_in_session'], one channel). The AI verified fs = 30 in ops.npy and separately determined that tstamps.npy is a camera clock in non-second units (~1.2097 for a 1200 s recording), which justifies not using it as the timebase. The instruction asks for 'time elapsed from the beginning of the session', which is what is produced.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "time_points = (np.arange(180) + t*180 + 0.5) * BIN_DUR, reshaped to (1, 180) float32; no raw array contributes. The verifier reports input range time_in_session: [0.2, 1799.8], consistent with bin centres over 30-min sessions."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time from start of experiment*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same construction as the expert (seconds, continuous across trials within a session via the t*180 offset, reset at each new session, stored as a (1, 180) time-varying ramp rather than a per-trial scalar as the instructions require). The only difference is that the AI labels each bin by its centre (+0.5 bins, first value 0.1667 s) while the expert uses the left edge (first value 0.0). For bin-averaged data the centre is at least as defensible as the edge — a constant 1/6 s offset that cannot affect decoder performance.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The +0.5 bin-centre convention and the cumulative start_bin offset are both present in the code, and the pickle confirms them: trial 0 starts at 0.1667 s and trial 1 at 60.1667 s."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time from start of experiment* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Element j of the input vector is the time of column j of the neural matrix, because both are generated from the same bin indices — the same by-construction alignment the expert uses. No resampling or offset is involved, and both arrays have exactly 180 columns per trial.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The input loop uses start_bin = t * TRIAL_BINS, the same index split_trials uses to slice the neural array; the verifier reports no dimension errors or warnings."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Motion energy* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The motion-energy signal itself comes from the same file as the expert's, move_deve/motion_energy_glob.npy (the pre-computed global motion energy from the behaviour video; the raw .avi is not distributed, so recomputation is impossible). The difference is in the auxiliary timing variable: the expert uses move_deve/interframe_int.npy to locate dropped camera frames, whereas the AI loads move_deve/tstamps.npy and then does not read it, so in effect only the motion-energy trace and the neural frame count are used. The README lists tstamps.npy and interframe_int.npy as equivalent ways of finding the missing frames, so choosing tstamps would have been fine; the substantive problem is that it is not actually used, which is rated under 4-d.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "np.load of motion_energy_glob.npy per session feeds the entire output stream, as described. The extra np.load of tstamps.npy is dead code (passed as an argument, never read in align_motion_energy), which is documented in the decision and rated in 4-d and 6-d."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Motion energy*?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Two of the three steps match the expert exactly — 10-frame bin averaging of the behaviour trace (as in the paper), then per-session 5-quantile discretisation, in that order — and neither adds smoothing, normalisation, or clipping. The first step, making the motion energy the same length as the neural trace, differs: the expert re-inserts interpolated samples at the detected drop indices, while the AI stretches the whole trace uniformly onto the neural grid with np.interp. That is a legitimate reading of the README ('they can be interpolated over') and is a no-op for the 30 of 41 sessions with no drops, so the overall processing is comparable; the accuracy cost of the uniform stretch is rated in 4-d.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "align_motion_energy -> bin_data -> split_trials -> discretize_me is the exact order described, and binning precedes discretisation as stated, so labels are derived from bin-averaged motion energy."
+  },
+  "4-c": {
+    "question": "How is `output` *Motion energy* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: five equal-percentile levels with boundaries computed within each session from that session's pooled binned motion energy, using np.percentile at 20/40/60/80 and np.digitize to levels 0-4, with output_values naming the five levels. This is exactly the instruction ('five equal-percentile bins, selected per session') and per-session edges also cancel session-to-session differences in absolute motion-energy scale. The verifier confirms a perfectly balanced 5-class problem (0.200 each) against a 0.2 chance level, matching the expert's construction.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "discretize_me pools all trials of the session, takes np.linspace(0,100,6)[1:-1] percentiles as inner boundaries and digitizes each trial, producing int64 labels 0-4 with shape (1, 180). Because every session length is an exact multiple of the trial length, pooling the trials is identical to pooling the whole binned session, so the edges equal the expert's."
+  },
+  "4-d": {
+    "question": "How is `output` *Motion energy* aligned with the neural data?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "Both solutions exploit the synchronous 30 Hz acquisition and align index-for-index, and for the 30 of 41 sessions with no dropped frames the AI's output is identical to the expert's. For the 11 sessions with dropped camera frames the AI stretches the trace uniformly (np.interp over linspace(0,1,...)), which implicitly assumes the drops are spread evenly through the session, instead of using the recorded frame times to put each sample back where it belongs. It is not technically wrong — the README sanctions interpolating over missing frames — but it is a choice a human should check, because the drop information was available (and even loaded) and unused. I quantified the cost: for the two worst sessions (jm031/2023-10-22, 116 drops; jm032/2023-10-22, 148 drops) the uniform stretch misplaces samples by up to ~12 frames (~0.4 s, i.e. more than one 333 ms bin) and mean ~4-5 frames, correlating only r = 0.72 with the expert's frame-for-frame reconstruction and agreeing with the expert's discretised labels on 86-89% of bins. The other 9 affected sessions have 1-3 drops, where the error is negligible. So ~2/41 sessions carry a real, avoidable behaviour-to-neural misalignment.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The code does not implement the decision the AI stated. align_motion_energy's docstring says 'Use tstamps to interpolate ME to the full neural frame count' and the module header and the trajectory reasoning say the same ('interpolating ME values onto the neural frame times using those timestamps to identify gaps'), but tstamps is only an unused parameter: the body builds camera_pos = np.linspace(0, 1, len(me)) — a uniform grid — and never touches tstamps. The implemented alignment is therefore a different, less accurate one than the documented alignment."
+  },
+  "5": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The only defect in this dataset is dropped camera frames, and the AI does handle it (by interpolation, see 4-d) rather than ignoring it; it verified the scale of the problem first by printing F/ME/tstamps/interframe_int shapes for all 41 sessions and seeing at most 148 missing frames out of 36000 (0.4%). Partial trailing bins and trials are truncated, as in the reference, and there are no NaNs in the source or output (I checked). The handling is weaker than the expert's in one respect: the expert asserts that the repaired motion energy has exactly the expected length, whereas the AI's fallback is silent — a session whose motion energy was longer than the neural trace, or wrong by a large margin, would be quietly resampled onto the neural grid with no warning. That is a robustness gap rather than an error on this dataset.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code matches the (minimal) decision: an early return when lengths already match, otherwise a silent np.interp, plus floor-division truncation in bin_data and split_trials. No assertions or warnings are claimed and none are present."
+  },
+  "6-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The identification agrees with the expert's: the maximin baseline estimation dominates (gaussian_filter plus 1800-frame running min and max over matrices up to 746 x 54000, for 41 sessions), with full-file I/O of F.npy/Fneu.npy (up to ~161 MB each) second. The AI's implementation runs these filters on CPU via scipy, where the expert routes dcnv.preprocess through torch (GPU when available), so the AI's version is the slower of the two in a GPU environment; neither profiled the code and the full run completed in a single call regardless.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "This reflects the code as written: compute_dff is the only step whose cost scales with n_neurons x n_frames x filter window; everything after binning operates on 10x-reduced data."
+  },
+  "6-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI's code contains only trivially cheap Python loops (the per-trial slicing in split_trials, the per-trial time-ramp construction, and the per-trial np.digitize), each iterating over at most 30 trials of 180 bins; all three could be replaced by a single reshape/digitize but the gain is negligible against compute_dff. This is equivalent in spirit to the expert's answer, which flags its own small loop (the per-dropped-frame np.insert) and notes the impact is negligible. Notably, the AI's code does not contain that O(n^2) np.insert loop at all, since it uses a single vectorised np.interp — so on this narrow axis it is marginally more efficient (at the accuracy cost rated in 4-d).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops named are the loops present in convert_data.py, and the per-trial list-of-arrays structure they build is what the target format requires."
+  },
+  "6-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answers N/A here; the AI's code does contain small redundancies the expert's does not — the motion energy is split into trials and then immediately re-concatenated inside discretize_me to recompute the session-pooled vector that existed one line earlier, the 180-sample time ramp is rebuilt for every trial, and brain_region_idx's zero vector is rebuilt per session. All are microseconds of work and none affect correctness (the concatenated vector is exactly me_binned, since session lengths are exact multiples of the trial length), so this is a cosmetic difference rather than a substantive one.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "These are accurately read off the code: discretize_me calls np.concatenate(me_trials) after split_trials produced them, and the time ramp and zeros arrays are constructed inside the per-trial / per-session loops."
+  },
+  "6-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answers N/A. The AI's code does one piece of genuinely wasted work: tstamps.npy is loaded for every session (~0.3-0.4 MB) and threaded into align_motion_energy, where it is never read. The waste itself is trivial, but it is the visible symptom of the alignment defect rated in 4-d — the information loaded is exactly what the alignment step needed. Two smaller items: compute_dff promotes the trace to float64 for filtering and casts back to float32, doubling peak memory and filter cost for no gain in stored precision; and dF/F is computed at 30 Hz and then averaged down 10x, discarding 90% of the computed samples — though that ordering is correct and unavoidable, since the 1800-frame maximin baseline must be estimated at native resolution, and the expert does the same.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Verified in the source: np.load of tstamps.npy in process_session with no consumer, and Fc.astype(np.float64) followed by dff.astype(np.float32) in compute_dff."
+  }
+}

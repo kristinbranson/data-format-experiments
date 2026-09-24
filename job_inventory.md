@@ -17,7 +17,8 @@ All data have been merged into `harbor-jobs`
   harbor 0.23.0, terminus capped at 800 turns).
 - **Refs**: reference solutions and reference statistics from before or after the 09-17
   merge-back (`harbor-tasks/changes_since_preprint.md`).
-- **Judges**: old = claude-opus-4-6 + gpt-5.4; new = claude-opus-5 + gpt-5.6-sol.
+- **Judges**: old = claude-opus-4-6 + gpt-5.4; new = claude-opus-5 + gpt-5.6-sol; both = the
+  trial carries verdicts from each set (footnote 7).
 - **Prompt**: v4 = `prompt_v4/` and minimal v1; v5 = `prompt_v5/` and minimal v2.
 - **Collected**: moved by `harbor-scripts/collect_cluster_results.py` in the data-format repo
   (`/groups/branson/home/bransonk/behavioranalysis/code/ScienceBenchmark/data-format`, which
@@ -29,15 +30,15 @@ All data have been merged into `harbor-jobs`
 |---|---|---|---|---|---|---|---|
 | 0 | `<task>/<agent>`¹ commit 0ffb910 | ALL | old¹ | old | old | v4 | maximal |
 | 1 | `<task>_minimal/<agent>`¹ commit 0ffb910 | ALL | old | old | old | v4 | minimal |
-| 2 | `<task>/`¹ | ALL | old¹ | new² | old | v4 | maximal |
-| 3 | `<task>_minimal/<agent>` | ALL | old | new² | old | v4 | minimal |
-| 4 | `<task>/<agent>-config_20260919` | ALL | new | new | new | v5³ | maximal |
-| 5 | `<task>_minimal/<agent>-config_20260919` | ALL | new | new | new | v5 | minimal |
-| 6 | `<task>/<terminus>-config_20260919` | ALL | new | new | new | v5 | maximal |
-| 7 | `<task>_minimal/<terminus>-config_20260919` | ALL | new | new | new | v5 | minimal |
-| 8 | `<task>_api/<agent>-config_20260919` | API | new | new | new | v5⁴ | api |
-| 9 | `<task>/<agent>-config_20260728-prompt_v5` | ΔPROMPT | old | new | old | v5 | maximal |
-| 10 | `<task>_minimal/<agent>-config_20260728-prompt_v5` | ΔPROMPT | old | new | old | v5 | minimal |
+| 2 | `<task>/`¹ | ALL | old¹ | new² | both⁷ | v4 | maximal |
+| 3 | `<task>_minimal/<agent>` | ALL | old | new² | both⁷ | v4 | minimal |
+| 4 | `<task>/<agent>-config_20260919` | ALL | new | new | both⁷ | v5³ | maximal |
+| 5 | `<task>_minimal/<agent>-config_20260919` | ALL | new | new | both⁷ | v5 | minimal |
+| 6 | `<task>/<terminus>-config_20260919` | ALL | new | new | both⁷ | v5 | maximal |
+| 7 | `<task>_minimal/<terminus>-config_20260919` | ALL | new | new | both⁷ | v5 | minimal |
+| 8 | `<task>_api/<agent>-config_20260919` | API | new | new | both⁷ | v5⁴ | api |
+| 9 | `<task>/<agent>-config_20260728-prompt_v5` | ΔPROMPT | old | new | both⁷ | v5 | maximal |
+| 10 | `<task>_minimal/<agent>-config_20260728-prompt_v5` | ΔPROMPT | old | new | both⁷ | v5 | minimal |
 | 11 | `allen2p/<agent>/<trial>/judge_replicates/config_20260728/judgerep<k>`⁶ | allen2p | old¹ | new⁶ | old | v4 | maximal |
 | 12 | `allen2p/<agent>/<trial>/judge_replicates/config_20260919/judgerep<k>`⁶ | allen2p | old¹ | new⁶ | new | v4 | maximal |
 
@@ -97,6 +98,19 @@ both sweeps were collected; the stuck-terminal cases among them were moved to
    sits inside the trial it rejudges, and `trial_metrics.py` does not count it. Both rows are
    committed together as `2e1c8115`; `judge_variability.md` in the data-format repo describes
    the experiment.
+7. Rows 2–10 carry verdicts from both judge sets. The judges each trial did not originally
+   have were run judges-only on 2026-09-23 (the data-format repo's `logs/judge_swap.md`), in
+   one layout for every trial:
+   - old judges: `verifier/judge/<judge>/` and the `llm_judge_<judge>_*` keys in `metrics.json`;
+   - new judges: `verifier/judge/<judge>-config_20260919/` and `llm_judge_<judge>_20260919_*`.
+
+   `reward.json`'s `process` and `reward` use the old judges in every row, so rows 4–8's values
+   changed on that date; their new-judge values remain in the `_20260919_` keys. Old-agent
+   trials that predate recording the judge model and CLI version had `llm_judge_<judge>_model`
+   and `_harness_version` filled in. One trial,
+   `majnik2025_minimal/codex/2026-07-28__22-20-13_trial1`, lacks the old judges'
+   `n_missing_questions` and `n_code_normalised`. Not covered: the `badtrial3` folders, `debug`,
+   `oracle`, the unsupervised judges, and the judge replicates of rows 11 and 12.
 
 ### Status and other contents
 

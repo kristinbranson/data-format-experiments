@@ -1,0 +1,149 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both the AI and the expert load the seven MATLAB v7.3 files with h5py and dereference the per-session `trace`, `position` and `blocked` object references. The AI additionally dereferences `envs` (geometry name) and reads `SFPs.shape` for validation, and it iterates a hard-coded animal list taken from the reference repo's main.py instead of globbing, which yields the identical set and order. It considered and rejected the joblib per-animal files on I/O grounds, which is a reasonable and well-documented choice. The load is verified against the paper's headline numbers (207 sessions, 5,413 unique neurons, 69,744 registered cell-sessions, geometry histogram 27/20x9), all of which match exactly - a stronger validation than the expert performed.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements exactly what is described: h5py.File per animal, `h5['envs'].shape[1]` sessions, `h5['envs'][0,i]` / `h5['blocked'][0,i]` and `h5['position'][i,0]` / `h5['trace'][i,0]` dereferencing, with shape assertions. The self-checks in `build_dataset` report all four paper-count matches as true in full_and_sample_stats.json, and I independently reproduced the 207-session / per-session field structure from QLAK-CA1-08.mat."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "One subject per .mat file / animal ID, all 7 retained, with `subject_idx` recording the animal for each session. Identical to the expert, except the AI hard-codes the animal list in the paper's own ordering rather than deriving it from filenames; the resulting list and order are the same.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`subjects` is `ANIMALS.copy()` and `subject_idx` appends `subject_idx` once per emitted session, converted to an int64 array. The verifier output confirms 7 subjects with 31/31/31/21/31/31/31 sessions. Minor cosmetic note that does not contradict the decision: in `--sample-only` mode all 7 names are still listed while only subject 0 is used; the full dataset (the deliverable) is unaffected."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Every recording day stored in each animal's file becomes one output session, in stored order, with no session excluded - the same as the expert. The AI went further by investigating the apparent 7x31=217 vs 207 discrepancy and establishing empirically that QLAK-CA1-51 genuinely contains 21 sessions, so that the raw files already give the paper's 207. It then encoded that as an assertion.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`n_sessions = h5['envs'].shape[1]` drives the loop and every session index is converted and appended. Output contains 207 sessions (verification_full_out.txt). The `raise` guards for <2 trials or no registered cells never fire on the real data, so no session is silently dropped."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Trials are contiguous non-overlapping 1-minute (1800-frame at 30 fps) windows from the start of the session, exactly as the instructions require and as the expert did. Two defensible differences: (a) the AI keeps the short final window rather than discarding the remainder, which preserves data and is explicitly justified ('the stored frame counts are slightly short... rather than silently drop data'); (b) windowing is applied after NaN-position frames have been removed, so a window is 1800 valid frames rather than 1800 wall-clock frames. (b) is a small unflagged drift from strict 60 s windows, but the number of NaN frames is tiny and trial counts (37-41/session) are consistent with ~40 min sessions. Note that the emitted trials are variable-length because of the later movement filter; that is assessed under 1-e/2-b, not here.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`for start in range(0, position.shape[0], TRIAL_FRAMES)` with `end = min(start+TRIAL_FRAMES, n)` implements contiguous 1800-frame windows including a short final one, and `TRIAL_FRAMES = 30*60 = 1800` is correct. The NaN-row removal genuinely precedes the loop, matching the description given above."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The expert applies no trial-level QC at all. The AI drops windows with no moving frames, fewer than 3 moving frames, fewer than 10 pooled bins, or an all-zero pooled neural matrix, and hard-fails a session with fewer than 2 surviving trials. Each rule is motivated: the all-zero/near-empty trials produced explicit warnings from the provided format checker, and the >=2-trials rule is a stated requirement of the target format. All drops are counted and logged per session in metadata, so the curation is auditable. This is strictly more careful than the reference and costs almost no data (worst session still retains 24 trials; 8,266 trials total).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "All four `continue` guards and the `raise ValueError` for <2 trials are present and in the described order, and the per-type counters are written into `session_info`. The full dataset passes `train_decoder.py --verify-only` with 'no errors or warnings', confirming the guards achieve their stated purpose."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Neural data comes solely from the per-session `trace` field, identical to the expert. The AI correctly identified these as the paper's already-extracted binary calcium rise-event vectors rather than raw fluorescence, so no event extraction is redone. `SFPs` is touched only for a cell-count sanity check and does not enter the data.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`trace = deref_array(h5, h5['trace'][session_index, 0])` is the only source of neural values, with an explicit assertion that `trace.shape[0] == position.shape[0]`."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The AI reproduces the reference repository's own decoder preprocessing: restriction to moving frames (Gaussian-smoothed speed > 5 cm/s, sigma=5 frames, per `decode_position_within(v_filt_size=5, v_thresh=5)`), Gaussian smoothing of the trace with sigma=3 frames, then 3-frame average pooling (per `fit_decoder`, which does exactly `pooling(gaussian_filter1d(traces, sigma=3, axis=0))` with AvgPool1d(3,3)). The expert applied none of these and stored the raw 30 Hz trace. Since the task explicitly demands the SAME processing as the reference code, and this decoder task is the same one the paper implements, the AI's choice is better grounded. The cost - trials become variable-length and no longer contiguous in wall-clock time - is real but is inherited from the paper's own decoder, which also concatenates only moving frames. Two minor deviations from the paper are not flagged by the AI: smoothing is applied per 1-minute trial rather than once per session (edge effects at trial boundaries), and the paper's `cell_threshold=5` sparsity filter is omitted (see 2-c).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`compute_movement_mask` computes ||diff*fps|| per frame, nan-safe, Gaussian-smooths with sigma=5 and thresholds at 5 cm/s - algebraically equivalent to the paper's threshold `v_thresh/bin_down` applied to bin-scaled coordinates. `gaussian_filter1d(..., sigma=3, axis=0)` then `avg_pool_2d(..., 3)` then `.T` yields (n_neurons, n_bins) float32, matching the description. `avg_pool_2d` correctly trims the trailing partial bin and averages, equivalent to AvgPool1d(kernel=3, stride=3)."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the expert, the AI keeps every cell registered on a session and drops only the unregistered (NaN) cells, giving exactly the paper's 69,744 cell-session total. The detection rule differs cosmetically (`~np.isnan(trace[0])`, first retained frame, vs the expert's all-NaN-column test) but is equivalent for this data, as confirmed by the exact 69,744 match. The decision to skip the paper's decoder-specific `cell_threshold=5` activity filter is shared with the expert and is defensible here, since that threshold is an internal step of the paper's Naive Bayes fitting rather than a dataset curation rule, and the downstream decoder is a different model. The AI's stated rationale (preserving the published per-session cell count) is explicit and reasonable.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`registered_mask = ~np.isnan(trace[0])` selects the columns, `np.nan_to_num` cleans residual non-finite values, and `brain_region_idx` is `np.zeros(registered_mask.sum())` so the neuron count is consistent with the neural matrices. The verifier reports 69,744 CA1 neurons across sessions, exactly the paper's number, confirming the filter behaves as described."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Both conclude there is no alignment event: the paradigm is continuous free exploration and trials are arbitrary 1-minute windows from session start. The AI is more complete than the expert here - it actually populates the required metadata fields (`temporal_alignment_event`, `off_start=None`, `off_end=None`, plus `task_description`), which the expert's metadata omits entirely.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "No alignment operation appears anywhere in the code; windows are cut from index 0 onward and the metadata fields state exactly that. Confirmed present in the saved pickle."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The AI rebins from 30 Hz to 100 ms bins by non-overlapping 3-frame average pooling, and reports `time_bin_size = 100.0`. This is precisely the reference code's `temporal_bin_size=3` used in `fit_decoder`/`test_decoder`, so it matches the paper's decoding representation, whereas the expert left the data at the native 33.33 ms. The AI weighed both options explicitly before choosing. Bin size is uniform across all trials and sessions as the format requires. One consequence it does not flag: because pooling happens after movement selection, a 100 ms bin can straddle non-contiguous wall-clock frames - but this is also true of the paper's own pipeline.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`TEMPORAL_BIN_MS = 1000.0*3/30 = 100.0` is written to metadata, and `avg_pool_2d(arr, 3)` performs the 3:1 non-overlapping mean on both trace and position. The saved pickle reports `time_bin_size: 100.0` and trial lengths (median 322 bins) consistent with ~32 s of movement per 60 s window."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Environment geometry* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Derived from the per-session `blocked` field (indices of walled-off 3x3 partitions, sentinel [-1] for the open square), identical to the expert. The AI started from hard-coded name-to-geometry templates, detected that they disagreed with `blocked`, and correctly chose `blocked` as authoritative - the right call, since `blocked` is the recorded ground truth. Its stated explanation for the disagreement ('asymmetric environments can appear in session-specific orientations') was wrong - the real cause was its own row/column ordering, which it never diagnosed - but the resulting decision is still the correct one.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`normalize_blocked(deref_numeric(h5, h5['blocked'][0, session_index]))` handles both the empty and [-1] cases and is the sole source of input values; `envs` is used only for statistics. The abandoned `get_env_mat` remains in the file but is never called, so it cannot affect the output."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Environment geometry*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "A static 9-element mask over the 3x3 grid with 1=open / 0=blocked, repeated for every trial of a session and stored as a 1-D (9,) array. This is the expert's encoding with the polarity inverted (expert used 1=blocked one-hot), which is informationally identical and equally justified; a 1-D static input is explicitly allowed by the target format. Important caveat, scored under 4-c rather than here: the flat ordering of this mask is row-major over the raw `blocked` indices (correct and identical to the expert's), but the AI's position-bin flattening uses the transposed axis order, so `input_names` (`env_open_rXcY`) and `output_values` (`rXcY`) do not actually refer to the same cells. The input values themselves are correct.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`open_mask_from_blocked` sets 0 at each blocked index over an array of ones, and a copy is appended per trial. Verified in sample_data.pkl: session 2 (env 't', blocked [3,5,6,8]) has input [1,1,1,0,1,0,0,1,0], exactly the complement of the raw blocked indices."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Mouse position* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The per-session `position` field (x-y tracking in cm, range ~0-75), the same source the expert used. The AI validates the (n_frames, 2) shape and its agreement with the trace length before use.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`position = deref_array(h5, h5['position'][session_index, 0])` with an explicit shape check is the only source of output values."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Mouse position*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Drop NaN frames, restrict to moving frames, divide both coordinates by a single session-level scale `(max over both axes + buffer)/3`, average-pool 3 frames, then floor and clip. The scale definition and the pool-then-floor ordering are copied faithfully from the reference code (`decode_position_within`: `bin_down = (behav_max.max()+buffer)/n_bins`; `test_decoder`: pool then `.astype(int)`), which is a closer match to the paper than the expert's fixed 75 cm / digitize approach. Using the per-session rather than per-animal maximum is a mild deviation from `decode_position_within` (which computes the max across days) but is harmless here: I checked that the recorded maximum is 73-75 cm in every session I inspected, so the derived bin size is ~25 cm as intended. The class-index flattening that happens in the same step is defective and is scored under 4-c.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each described step is present and in the stated order: NaN-row mask, `pos_trial[trial_movement]`, `pos_scaled = pos_trial/bin_down`, `avg_pool_2d(..., 3)`, `np.floor(...).astype(int)` then `np.clip(..., 0, 2)`. Output is stored as (1, n_bins) int64 with `output_names = ['position_bin']`, as described."
+  },
+  "4-c": {
+    "question": "How is `output` *Mouse position* thresholded into categories?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The 3x3 = 9-bin discretization is right, but the flattening uses `flat = bin_xy[:,0]*3 + bin_xy[:,1]`, the transpose of the axis order the `blocked` field actually uses (the expert uses `y_bin*3 + x_bin`). I verified this directly against the raw data: under the expert's ordering the occupancy of blocked bins is exactly 0.000 in every session of QLAK-CA1-08, while under the AI's ordering it reaches 0.66 (env 't'), 0.43 ('l'), 0.30 ('rectangle'), 0.24 ('i'), 0.08 ('u'). The AI then compounds this by remapping every sample that lands in a 'blocked' bin to the nearest open bin, on the stated premise that such samples are rare temporal-pooling artifacts. They are not: 441,410 of 2,569,384 samples (17.2%) were remapped, and because the remap is a deterministic bin-to-bin map it merges genuinely distinct locations into a single class. Verified in sample_data.pkl: session 2 ('t') emits 4 classes instead of 5, session 4 ('rectangle') 4 instead of 6, and session 7 ('l') collapses 5 occupied bins into just 2 classes (r0c0 and r2c2). This corrupts the decode target for every asymmetric geometry, breaks the intended correspondence between `input_names` and `output_values`, and will distort both the output distribution statistics and the reported decoder accuracy (0.7084 balanced accuracy is measured against partly merged, easier labels). The AI had two clear signals - its own 441k remap counter and the disagreement between `blocked` and its `get_env_mat` templates - and explained both away instead of testing occupancy against the mask.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code faithfully implements the (mistaken) decision as documented: `remap_invalid_bins` computes `flat = bin_xy[:,0]*3 + bin_xy[:,1]`, finds samples where the open mask is 0, and reassigns each to the nearest valid bin by Euclidean distance in (row, col) space, counting the reassignments. CONVERSION_NOTES.md and `metadata['output_processing']` describe exactly this behaviour, and the emitted labels in sample_data.pkl match it. The defect is in the decision, not in its implementation."
+  },
+  "4-d": {
+    "question": "How is `output` *Mouse position* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Position and trace are natively simultaneous in the source files, and the AI applies the identical NaN-frame mask, window slicing, movement mask and 3-frame pooling to both streams, so bin t of `output` and bin t of `neural` derive from the same three frames. Same conclusion and same mechanism as the expert, extended consistently to the extra selection steps the AI introduced, and matching the reference code where `behav` and `traces` share `vel_idx` and the same AvgPool1d.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Every selection is applied to both arrays in the same statement block, and a defensive `min_len` truncation guards against any residual length mismatch. The format verifier confirms equal T for neural and output across all 8,266 trials, with no warnings."
+  },
+  "5": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The AI handles strictly more cases than the expert and logs all of them. It drops NaN-position frames from both streams (preserving alignment), drops unregistered cells, zero-fills residual NaN/inf in registered traces, sanitises non-finite speed estimates before smoothing, and keeps rather than discards the short final window. Impossible states (no registered cells, <2 usable trials, non-finite arena extent, trace/position shape mismatch) raise loudly instead of being silently patched. Every drop and every remap is counted into `metadata['session_info']`, so the curation is fully auditable - the expert's solution only removes all-NaN neurons and silently discards the remainder frames. The one weakness is that the 441,410 remapped position samples are logged as a routine statistic rather than investigated as the anomaly they are (see 4-c).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "All five handling paths and all four raise-guards are present as described, and the per-session counters they feed are present in the saved pickle (e.g. session_info[2] records n_raw_frames 71866, n_moving_frames 35648, and n_remapped_invalid_position_bins 8009)."
+  },
+  "6-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The dominant cost is the same one the expert identified: bulk HDF5 reads of the per-session trace matrices from ~0.3-0.8 GB files. The AI reached this conclusion during the run ('The conversion is I/O-bound on the full dataset') and had already mitigated it by abandoning the slow whole-animal joblib loads in favour of targeted per-session HDF5 dereferencing. Its pipeline adds three further costs the expert's does not have - ~8,300 `gaussian_filter1d` calls, the 441k-iteration Python remap loop, and writing 3.6 GB of pickles across two files - but these remain secondary to I/O, and the extra smoothing/pooling cost buys fidelity to the paper's preprocessing. Neither solution documents the bottleneck in the script itself.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code's structure is consistent with the stated bottleneck: each session's full (~71,800 x n_cells) trace is materialised in memory via `deref_array`, and the switch away from joblib loading is actually implemented. No claim about performance in the code or notes is contradicted by the implementation."
+  },
+  "6-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answered N/A because their code has no such loops; the AI's has three vectorizable ones, so it is not a match, but the practical penalty is small and the structure is otherwise reasonable. The clearest miss is `remap_invalid_bins`, which loops in Python over all 441,410 invalid samples and recomputes the nearest valid bin each time, even though only 9 bins exist per session - a single 9-entry lookup table plus a fancy-index would replace the whole loop. Secondarily, `gaussian_filter1d` is re-entered once per trial (~8,300 times) where one call per session would do, and `deref_string` builds strings character by character. None of these dominates the I/O cost, and the per-trial smoothing loop has a partial justification (it prevents smoothing from leaking across trial boundaries), so this is an equally-defensible-but-untidy outcome rather than a wrong decision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops are present exactly as characterised, and each produces the result its surrounding code expects; the inefficiency does not change any output value."
+  },
+  "6-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answered N/A; the AI's code does repeat work, but deliberately and at low cost. `main()` calls `build_dataset` twice on the default path, so the first 11 sessions of QLAK-CA1-08 are fully re-read and re-converted to produce `sample_data.pkl` - roughly 5% duplicated work plus a second 109 MB write - rather than being sliced out of the already-built full dataset. `deref_string` on `envs` is called twice per session (once for the histogram in `build_dataset`, once inside `convert_session`), and per-session statistics are computed in `convert_session` and re-aggregated in `build_dataset`. The sample artifact is a reasonable thing to want; regenerating it from scratch in the same invocation is merely wasteful, not wrong.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The duplicated `build_dataset(sample_only=False)` / `build_dataset(sample_only=True)` calls and the two `deref_string` sites are literally present, and both produce correct (identical) results; the repetition costs time but does not corrupt output."
+  },
+  "6-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The expert answered N/A. The AI's code carries some genuinely unnecessary work, but most of it is cheap, intentional provenance tracking rather than waste: the `SFPs` shape reads, `envs` dereferencing, `EXPECTED_ENV_COUNTS` comparison and `checks` dict exist purely to validate the conversion against the paper's published counts, which is defensible and is what caught the 207-session question. Genuinely unnecessary are two dead functions - `get_env_mat` (27 lines of hard-coded geometry templates) and `blocked_indices_from_open_mask` - neither of which is ever called; the extra `sample_data.pkl` written on every full run; and the verbose per-session `session_info` records embedded in metadata, which the decoder ignores (though they are useful for audit). The leftover `get_env_mat` deserves a flag beyond mere untidiness: it encodes geometry templates that contradict the `blocked` field the code actually uses, and the unexamined discrepancy between them is the same axis-ordering confusion that produced the 4-c defect. The 441,410-sample remap is worse than unnecessary - it actively corrupts the labels - but that is scored at 4-c.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "I confirmed by grep that `get_env_mat` and `blocked_indices_from_open_mask` each appear exactly once in the file (their definitions) and are never invoked, and that the QC/statistics code paths are as described. None of this dead or auxiliary code alters the converted dataset."
+  }
+}

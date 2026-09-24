@@ -1,0 +1,219 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: a single sorted glob over `data/sub-*/*.nwb` finds all 174 session files, each is opened once with pynwb, and subjects/trials/units/behaviour are read from nwb.subject, nwb.trials, nwb.units and nwb.acquisition. The AI verified the resulting 174 files / 28 subjects / 272,227 units / 94,990 trials against dandiset.yaml and the papers, as the expert did. The only differences are cosmetic: a relative glob (requires running from /app, where the instructions specify the script lives) and a hand-picked pair of files in --sample mode.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The glob, sort and pynwb read are implemented exactly as described, the conversion log shows all 174 files visited, and the file handle is closed on every path including early returns."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: nwb.subject.subject_id is the per-session animal id, `subjects` is the sorted set of unique ids and `subject_idx` indexes into it. Yields 28 subjects, matching the dandiset and both papers.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "sorted(set(...)) plus a dict lookup produces subjects and subject_idx of length n_sessions in session order; the verification log reports 28 subjects over 151 sessions consistently."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The session boundary is the file boundary, exactly as in the reference — one NWB file is one session, order follows the sorted file list, and per-session provenance is kept in metadata['session_info']. (The additional session-level *exclusion* criteria, which drop 23 of 174 sessions, are a curation decision evaluated under 1-e; the splitting logic itself is identical. A minor difference: sessions are identified by file path rather than by nwb.identifier, which is less readable but unambiguous.)",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "One result dict per file, appended in order; neural/input/output/subject_idx/brain_region_idx are all built from the same ordered list, so session indices line up across fields. 151 sessions in the output matches the number of non-skipped files in the conversion log."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Trials are taken from the NWB trials table with one go cue per row from BehavioralEvents/go_start_times, the same choice the expert made, and for the same stated reason (the AI observed that sample_start_times has more events than trials because early licks replay the epoch, so the go cue is the unambiguous per-trial anchor). Each trial becomes one (n_neurons, 80) neural array with matching (2,80) input and (4,80) output.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Trial attributes are indexed with the same trial_idx used for go_times, so rows stay in register. The equality len(go_times) == len(nwb.trials) is assumed rather than asserted (the expert asserts it); I verified it holds in the files I checked, so the code is correct in practice, but it is one unchecked assumption."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "Two deviations, both of which a human should review. (1) Trial coverage: instead of matching trials.start_time against units/obs_intervals as the reference does, the AI uses the global span [min spike time, max spike time] over good units. This catches the main failure mode (ephys starting after behaviour) but cannot see gaps inside the recording, and leaves 2,304 trials (2.8%) with all-zero neural data in the released file — a defect the AI found, investigated, and deliberately left in ('shouldn't significantly affect decoder training'). It also never excludes free_water trials, which the reference identified as having no spikes despite being covered. (2) Session-level behavioural filtering (>65% correct, >=50 correct L and R) is applied and removes 22 further sessions, cutting the dataset to 151 sessions / 60,324 units / 81,188 trials versus the reference's 173 / 69,453 / 90,860. The criteria are genuinely quoted from the data paper, which makes this defensible in principle, but the paper reports those criteria as *already satisfied* by the 173 published sessions (correct rate range 65-99%), so finding 22 sessions below threshold is evidence the AI's recomputation differs from the paper's; the AI noticed the 151-vs-173 gap and rationalised it away rather than investigating. Keeping early-lick and ignore trials is correct and matches the expert's reasoning.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements the decision as stated in CONVERSION_NOTES Step 5 ('Filter trials by actual spike time range (not obs_intervals end)') and the session criteria exactly as described in Step 6. Note a documentation defect rather than a code defect: the call site is commented '# Get recording range from obs_intervals' and Step 3 of the notes also claims obs_intervals filtering, while neither the helper nor any other code reads obs_intervals."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same sources as the reference: units/spike_times for units with classification == 'good', with BehavioralEvents/go_start_times setting the window and units/anno_name giving each unit's region. spike_times is the only neural representation in the file.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "good_indices is derived from classification and used consistently to select spike trains and region labels, so neural rows and brain_region_idx entries correspond one-to-one; spot-checks in Step 10 recomputed rates from the raw file and matched exactly."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Spike counts per 50 ms bin divided by the bin width to give Hz, with no smoothing, normalisation or baseline subtraction — the same quantity the reference produces (and the same as the reference code's sliding_histogram(..., rate=True)). The AI explicitly justified using non-overlapping 50 ms bins rather than the reference code's 100 ms/50 ms sliding window because the instructions specify 50 ms bins.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "np.histogram over the 81 absolute edges then /bin_width gives Hz; the AI's own sanity check reloaded the NWB file and reproduced the stored rates with max diff 0.0. Only an inconsequential edge nuance: np.histogram closes the last bin on the right whereas the reference's searchsorted is half-open, which affects at most a spike landing exactly on the final edge."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the expert: keep units with units/classification == 'good' (the Chen/Liu QC classifier verdict), apply no individual metric thresholds, and explicitly reject the older, more permissive unit_quality label. The AI checked the outcome against the white paper (69,453 good units, 25.5%, vs 69,943 and 25.9%) and, like the expert, drops the one never-QC'd session. Requiring >=2 good units rather than >=1 is a trivially different but harmless threshold. Not applying the reference code's zero-variance neuron removal (check_fr) is reasonable since no neurons are pooled across sessions here.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "good_mask = classification == 'good' is applied before every neural read and before region labelling; per-session neuron counts in the verification log (mean 399.5) match the independent count the AI made from the raw files."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Alignment is to go-cue onset via BehavioralEvents/go_start_times, exploiting the fact that spikes and events share one session-absolute clock, so the relative bin grid is simply added to each trial's go time — identical to the reference, with no resampling or offset correction. metadata records the alignment event and off_start/off_end correctly.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "bin_edges = go_time + window_start + k*bin_width is used for the neural data, and the same go-cue-relative grid is reused for both inputs and the tongue output, so all streams share bin boundaries. The AI's raw-file spot-checks of specific trials confirm the alignment."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "50 ms non-overlapping bins spanning -2.5 s to +1.5 s = exactly 80 bins per trial for all trials and sessions, binned directly from spike times with no intermediate representation and no rebinning — exactly the instruction's specification and the same as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "N_TIMEBINS = 80 is derived from the constants and used everywhere; the verification log reports mean/min/max T = 80 for all 151 sessions, and metadata['time_bin_size'] = 50.0 ms."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time from tone onset in seconds* derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The input is not derived from any raw variable: the AI hard-codes TONE_ONSET_REL_GO = -1.85 s after inspecting the first five trials of one session, and never reads sample_start_times in the conversion script. The reference takes the last sample_start_times event before each trial's go cue. The constant is empirically wrong for a substantial minority of trials: I checked nine sessions spanning the dataset and the tone-to-go interval departs from 1.85 s on 2.4%-14.8% of trials, taking values of 0.95 s and 2.45 s (randomised delay durations) even on no-early-lick trials, and up to 3.8 s on early-lick trials where the sample epoch is replayed. The AI had itself observed that sample_start_times has more events than trials 'because of early lick replays' (trajectory step 21) and still concluded in its final review that 'tone onset is always at -1.85s relative to the go cue. This is correct.' The consequence is a decoder input that is byte-identical on every trial of every session and therefore carries no information, where the reference's varies per trial.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code implements exactly the decision documented in CONVERSION_NOTES Step 5 ('Tone at -1.85s rel to go'): a single constant offset applied to the bin centres. The verification log's constant [-0.6, 3.3] range in all 151 sessions confirms the implementation matches the stated intent."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time from tone onset in seconds*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The processing (bin centres minus a constant) inherits the error in 3-a: the per-trial go-minus-tone gap that the reference adds is replaced by a fixed 1.85 s, so the values are wrong by 0.9 s or more on roughly 2-15% of trials per session and identical across all trials otherwise. The arithmetic on bin centres is right; the missing per-trial term is not. The AI's only validation of this input was a range check ([-0.625, 3.325] equals [-2.5+1.85, 1.5+1.85]), which is circular — it can only confirm the constant it assumed.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "time_from_tone = BIN_CENTERS - TONE_ONSET_REL_GO is computed once per session, cast to float32, and stacked as row 0 of every trial's input, which is precisely the documented decision."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time from tone onset in seconds* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The alignment mechanism is the same as the reference: the input is defined on BIN_CENTERS, the centres of the identical go-cue-relative grid used to place the neural bin edges, so input bin k and neural bin k cover the same interval by construction. (The *value* placed on that grid is wrong for the reasons in 3-a/3-b, but the alignment itself is correct, and the --show-processing panels plot it against the neural raster for visual confirmation.)",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "BIN_CENTERS and the neural bin_edges are both generated from the same WINDOW_START/BIN_WIDTH constants, with centres offset by half a bin, so there is no possibility of a shift between the two streams."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `input` *Photostimulation* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI uses BehavioralEvents/photostim_start_times and photostim_stop_times where the reference uses the trials-table photostim_onset/photostim_duration columns. I checked two optogenetics sessions and the two representations are numerically identical (sorted absolute onsets agree to ~5e-13 s, and the event count equals the number of non-'N/A' trials), so this is a different but equally valid source — arguably simpler, since it avoids parsing 'N/A' strings and re-referencing onsets from trial start. The AI also verified that non-ogen sessions still carry the (empty) streams, so one code path handles both file types.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Both streams are read once per session and used consistently; the verification log shows input 1 in [0,1] for optogenetics sessions and [0,0] for the three sessions with no stimulation, as expected."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `input` *Photostimulation*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "A binary per-bin time series — 1 where the bin centre falls inside a stim interval, 0 elsewhere — which is exactly the reference's construction and satisfies the instruction's 'whether photostimulation is on at every time point'. Non-stim trials correctly yield an all-zero vector. The interval test is inclusive at the stop edge where the reference is half-open, which can differ only for a bin centre landing exactly on the offset.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_photostim_timeseries ORs the mask over all overlapping intervals into a zero-initialised vector; the AI's Step 10 spot-check against the raw file confirmed stim and non-stim trials are marked correctly."
+  },
+  "4-c": {
+    "question": "How is the `input` *Photostimulation* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Bin centres are converted to absolute time (go_time + BIN_CENTERS) and compared against absolute stim timestamps, which is the mirror image of the reference's approach (expressing stim times relative to the go cue) and gives the same result on the same grid as the firing rates. Selecting events by overlap with the trial window, rather than by trial row, additionally captures stimulation from an adjacent trial that physically extends into this trial's 4 s window — a small improvement in fidelity.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "abs_bin_centers = go_time + bin_centers uses the same grid as the neural bin edges, and the pre-filter (stops > window_start) & (starts < window_end) is a correct overlap test, so no in-window stimulation can be missed."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `output` *Lick direction choice* derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The AI equates choice with trials['trial_instruction'], i.e. the side the *tone instructed*, not the side the animal *licked*. The reference correctly derives choice from instruction x outcome (hit => instructed side, miss => the other side, ignore => no lick). On the AI's own distribution, 15.4% of trials are misses — where the animal licked the side opposite to the label stored — and 12.5% are ignores, where the animal did not lick at all but is still labelled with a lick direction. So roughly 28% of trials carry a wrong or undefined choice label, and the 'choice' decoder is in substantial part decoding the stimulus instead of the behaviour. The information needed was available and the AI saw it: trajectory step 21 records 'let me also check if there's a lick_direction field or if I need to infer it', and step 23 explored left_lick_times/right_lick_times, but the question was dropped and no justification for using the instruction appears anywhere in the notes or trajectory.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code faithfully implements the (mistaken) documented decision 'trial_instruction -> output[0], left=0, right=1'; the AI's raw-file spot-check confirms the values equal trial_instruction exactly."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `output` *Lick direction choice*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Beyond the wrong source variable, the discretisation itself violates the instruction, which specifies three classes 'left, right, no lick'. The AI emits only two (output_values[0] = ['left','right']), so the 12.5% of no-lick trials are folded into left or right and the class is unrecoverable downstream. Broadcasting the per-trial value across all 80 bins is fine and matches the reference. The silent CHOICE_MAP.get(..., 0) default would also map any unexpected string to 'left' rather than raising.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The mapping, the int64 dtype (chosen after the AI found decoder.py indexes output_values with the raw values), and the broadcast to 80 bins all implement the stated decision; output range 0 is [0,1] in every session, consistent with two classes."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `output` *Outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Taken directly from the trials-table `outcome` column, which already stores exactly the three categories the instructions ask for — the same source and reasoning as the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "nwb.trials['outcome'][:] is read once per session and indexed by trial; the AI's raw-file spot-check confirms an exact match, and the three classes appear in the verification log."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `output` *Outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: the fixed map {'ignore':0,'miss':1,'hit':2} following the instruction's ordering, broadcast across all 80 bins. The resulting 12.5%/15.4%/72.1% distribution is sensible and was checked against the paper's 84% control-trial correct rate.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Row 1 of each trial's output holds the mapped code repeated 80 times; output range 1 is [0,2] across sessions. The only blemish is the silent .get default of 0 for unexpected strings, which would mislabel as 'ignore' rather than fail loudly."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Early lick* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "From the trials-table `early_lick` column, the same explicit flag the reference uses; no derivation is needed. The AI also correctly reasoned that early-lick trials must be *kept* (unlike the reference code's get_regular_trial_mask, which drops them) because early lick is a required decoder output.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Read once per session and indexed by trial; the AI verified the values against the raw file, and the 88.8%/11.2% split is plausible for this task."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Early lick*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The fixed map {'no early':0,'early':1} following the instruction's ordering, broadcast across all 80 bins — the same as the reference. Broadcasting is appropriate because the lick that sets the flag falls in the sample/delay epoch, inside the -2.5 s window.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Row 2 holds the mapped code repeated 80 times, int64, with output range [0,1] in every session (and [0,0] in two sessions with no early licks, which is data-driven, not a bug)."
+  },
+  "8-a": {
+    "question": "What variables in the raw data is `output` *Tongue y-position* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The correct source: acquisition/BehavioralTimeSeries/Camera0_side_TongueTracking, column 1 of the (n_frames, 3) array, with its own timestamps — the same series and column the reference uses, and the AI confirmed the (tongue_x, tongue_y, tongue_likelihood) layout and the ~294 Hz rate from the data rather than assuming it. (That the third column, likelihood, is loaded but then ignored is the substance of 8-b/8-c.)",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "tongue_data_all[:,1] is the y column and tongue_ts_all its timestamps; both are read once per session and indexed consistently."
+  },
+  "8-b": {
+    "question": "What processing is involved in computing `output` *Tongue y-position*?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The per-bin mean is computed over *all* camera frames, with no likelihood masking, so frames in which the tongue is not protruding — where the DeepLabCut tracker still emits a position — are averaged in as if they were real measurements. The AI established the problem itself (trajectory step 34: 'tongue likelihood > 0.5 is only ~12.4% of the time (tongue mostly not visible during delay)... I should probably only use high-likelihood tongue detections') and then documented and implemented the opposite (Key Decision 3: 'Use all tongue y values regardless of likelihood') with no stated reason. The effect is not marginal: in sub-440957_ses-20190211 only 16.3% of frames have likelihood >= 0.5, and the 40th/60th percentiles computed over all frames are 262.44 and 262.98 (a 0.5-unit band) versus 257.76 and 270.32 (a 12.6-unit band) over tracked frames only, so the resulting quantity is dominated by untracked-frame noise rather than tongue position.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "get_tongue_y_for_trial does exactly what the notes describe — locate the window's frames, digitise them onto the 80-bin grid, and take the unmasked mean per bin, leaving NaN where a bin has no frames."
+  },
+  "8-c": {
+    "question": "How is `output` *Tongue y-position* thresholded into categories?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Two clear departures from the explicit specification. First, the instructions define four categories and name the fourth ('3: not visible'); the AI emits only three ('low','mid','high'), so there is no way to express that the tongue was not out — in the reference this class covers ~75% of bins. Second, bins with no camera frame at all (the video is trial-gated, so leading bins of short trials have none) are silently assigned class 1, 'mid', by the np.ones initialiser — a real, undocumented mislabel rather than an explicit missing-data code. Because the percentiles are taken over unmasked values (8-b), the three classes partition tracker noise: the verification log shows an essentially exact 0.400/0.200/0.400 split in nearly every session, which the AI read as confirmation ('expected from 40th/60th percentile split') rather than as a sign that the discretisation is not tracking a behavioural variable. The percentile scope (per session, over 50 ms bin means) is itself correct and close to the reference's choice.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The three-way percentile split documented in CONVERSION_NOTES Step 5 is implemented exactly, with per-session percentiles over pooled non-NaN bin means. The NaN->'mid' default is real behaviour of the code but is undocumented anywhere in the notes, so it is better characterised as an undocumented decision (counted against 8-c/9) than as a code/decision mismatch."
+  },
+  "8-d": {
+    "question": "How is `output` *Tongue y-position* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The same approach as the reference: camera timestamps share the session-absolute clock, so the trial's frame range is found by searchsorted at go-2.5 and go+1.5 and frames are assigned to bins built from go + BIN_CENTERS[0] - BIN_WIDTH/2 in 50 ms steps — the identical go-cue-locked grid used for the firing rates, with no interpolation or offset correction.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "abs_bin_edges is generated from the same constants as the neural bin_edges, and np.digitize(...) - 1 gives 0-based indices consistent with those edges, so tongue bin k and neural bin k cover the same interval. The --show-processing figure plots both on a shared axis."
+  },
+  "9": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The structural cases are handled sensibly and like the reference — the never-QC'd session is dropped (via <2 good units), sessions with <2 usable trials are dropped, and non-ogen sessions with empty photostim streams are handled by an explicit branch. But three handlers substitute a plausible-looking value for missing data instead of flagging it. (1) Bins and trials with no camera frames become tongue class 1, 'mid', indistinguishable from a real measurement, where the reference assigns an explicit 'not visible' class. (2) CHOICE_MAP/OUTCOME_MAP/EARLY_LICK_MAP all use .get(..., 0), so any unexpected string silently becomes 'left'/'ignore'/'no early' rather than raising. (3) 2,304 trials (2.8%) with all-zero neural data — trials falling in recording gaps that the spike-span filter cannot see — were found, investigated, and knowingly shipped; the reference eliminates these via obs_intervals plus free_water. None of the three defaults is documented in CONVERSION_NOTES.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each handler behaves as written: the early returns fire on the sessions the conversion log reports as skipped, the .get defaults are in place, and the np.ones initialiser produces the 'mid' fallback. The mismatch is between the code and the documentation (which is silent on the defaults), not between the code and the decisions the AI did state."
+  },
+  "10-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The profiling itself is done properly and the conclusion is right: three timers per session are printed as the instructions require, and the AI correctly identified firing-rate computation (1.6-7.1 s/session) as the bottleneck relative to loading (1.0-1.5 s) and input/output construction (0.2-0.5 s). What is concerning is the response: the AI estimated 17-25 minutes before the full run, which exceeds the instructions' explicit 15-minute threshold for optimising ('If full conversion time estimate is longer than 15 minutes, speed up the code'), and proceeded without any speed-up — the notes' 'Speed-ups Implemented' table is empty. The run took 19.1 minutes against the expert reference's 4.1 minutes on the same 174 files, a 4.6x gap attributable entirely to the avoidable inefficiencies in 10-b and 10-c.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The timing instrumentation is correctly placed around the three phases and the reported per-session and total figures in conversion_full_out.txt are internally consistent (1143.9 s over 174 files)."
+  },
+  "10-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The AI did not identify any vectorisation opportunity, yet the main one is substantial and the reference shows the fix. compute_firing_rates_session loops over trials *and* neurons, calling np.histogram once per pair (~216,000 calls per session for ~400 neurons x ~540 trials); the reference flattens all trials' edges into one array and does a single searchsorted+diff per neuron (~400 calls), which is the bulk of its 4.6x speed advantage. get_tongue_y_for_trial additionally loops over the 80 bins building a full boolean mask per bin where np.bincount would do, and the per-trial output construction does Python-level dict lookups that could be vectorised per session. The expert, by contrast, explicitly enumerated the two loops that remain in their code and argued why each is irreducible.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "Here the code contradicts the stated decision: CONVERSION_NOTES Step 6 claims 'compute_firing_rates_session: Vectorized histogram computation with searchsorted optimization', but the function is a doubly-nested Python loop in which searchsorted is used only to narrow the spike array before a per-neuron, per-trial scalar np.histogram call. The described vectorisation is not implemented."
+  },
+  "10-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The code repeats its single most expensive I/O and the AI never noticed. nwb.units['spike_times'][:] is materialised twice per session — once in get_recording_range and again in process_session — and each read pulls the ragged spike buffer for *all* units (e.g. ~1,950) even though only the ~460 good ones are used, so the dominant read is done twice over roughly 4x more data than needed. Bin edges are also rebuilt inside the per-trial loop (and again inside the tongue routine) instead of once as a relative grid, and already-sorted spike arrays are re-sorted with np.sort. The reference computes every quantity once in a single pass and says so. The notes' 'Code inefficiencies identified' section is empty.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The repeated work is a design choice rather than a deviation from a stated decision — the code does what its (silent) structure implies, and the duplicated reads produce consistent results, only slower."
+  },
+  "10-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Unlike the reference, which computes nothing it discards, the AI's script does a modest amount of wasted work, none of it affecting correctness: get_recording_range (a full spike-times read plus per-unit min/max scan) runs *before* the behavioural session criteria are evaluated, so that cost is thrown away for all 23 rejected sessions; auto_water and nwb.subject.description are read every session and never used in the output; spike times are re-sorted unnecessarily; and firing rates are computed for the 2,304 trials later found to be all-zero. Separately, simplify_brain_region runs a 90-entry substring scan per unit yet still leaves 138 distinct labels, many of them raw CCF strings, so the mapping is largely ineffective rather than discarded. These are minor and defensible as a readability/efficiency trade-off, which is why this is OK rather than CONCERNING, but reordering the session filter before the expensive read would have been free.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "All of the above is what the code actually does; there is no contradiction with any documented decision, since the notes do not claim these computations were avoided."
+  }
+}

@@ -1,0 +1,254 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the human reference, the AI restricts loading to the authors' curated ALM ephys manifests (`load<ANM>_ALMVideo.m`) rather than globbing /app/data, and reads both MATLAB v7.3 (h5py) and v5 (scipy.io) layouts. Where the human transcribed the 44 sessions into a hard-coded dict, the AI parses the manifests programmatically, stripping commented-out lines and extracting the `meta(end).date`/`meta(end).probe` pairs. The resulting session set is identical: 44 sessions (25 fixed-delay + 19 randomized-delay) across 14 mice, with the same per-subject session counts as the reference (EKH1 1, EKH3 1, JEB11 2, JEB12 2, JEB13 5, JEB14 4, JEB15 4, JEB19 4, JEB23 7, JEB24 8, JEB6 1, JEB7 2, JGR2 2, JGR3 1). Behaviour-only cohorts and the sessions the authors commented out are correctly excluded. Parsing is arguably more reproducible than transcription; the only downside is that the script silently produces zero sessions if /app/code is absent.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Verified: conversion_full_out.txt shows 'Curated sessions available: 44' and all 44 sessions processed, matching the reference session list exactly. I independently re-read the raw HDF5 file for JEB6_2021-04-18 and reproduced the stored neural matrices from raw spike arrays (max abs diff 7.6e-06), confirming the loader extracts the right fields from the v7.3 layout; labels reconstructed directly from the v5/v7.3 bp fields also match. Both format branches are exercised (v7.3 for most, v5 for JEB23/JEB24)."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference: the animal id is the prefix of the session name (equivalently the manifest file name), carried on each session and turned into a sorted unique `subjects` list with `subject_idx` per session. Same 14 subjects and same sessions-per-subject distribution as the human solution. This also sidesteps the fact that `obj.meta.anm` is missing in several files.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`subjects = sorted({sess['subject'] ...})` and `subject_idx` built from the same dict; verification_full_out.txt reports 14 subjects with per-subject session counts identical to reference_stats_full.json. Session order and subject_idx are consistent (sample pickle: subjects ['JEB23','JEB6'], subject_idx [1,0] for sessions [JEB6, JEB23])."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "One session = one (subject, date) manifest entry = one data_structure file, searched for in both ephys cohort folders so fixed-delay and randomized-delay sessions are handled uniformly and become one element each of neural/input/output — exactly the reference's treatment. The AI additionally enforces the paper's session-inclusion rule (>=10 units, plus >=2 trials for the decoder), which is defensible and in fact never triggers. Rich per-session metadata (cohort, raw/valid trial counts, unit counts, thresholds) is stored.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "44 sessions in the output, each a separate list entry, with per-session `session_info`. The two-folder lookup works for both cohorts (25 + 19 sessions as documented). No session was skipped, consistent with the logged unit counts (min 17 units)."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: a trial is one index into the per-trial Bpod fields of obj.bp (Ntrials rows), with one goCue per trial; traj entries and motion-energy cells are one per trial, and spikes carry their trial number, so no trial boundaries need reconstructing. The only difference is that the AI does not truncate per-trial fields to Ntrials as the human defensively does; I checked all 44 sessions and no field (hit/miss/no/early/autowater/R/L/stim.enable/goCue) or traj array is longer than Ntrials, so this has no effect here.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Per-trial arrays are indexed by trial number throughout and traj/me are iterated over range(Ntrials); raw_trials reported per session match Ntrials in the files (e.g. JEB6 382, JEB23_2023-10-18 416). Trial-to-spike mapping uses `unit['trial'] - 1`, correctly converting MATLAB 1-based trial numbers."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "Early-lick exclusion, the finite-goCue requirement, and the removal of post-recording trials (61 all-zero-neural trials in the two JEB24 sessions, the same count the human reference removes with its recording-length cutoff) all match the reference. But photostimulation trials are not excluded: `bp.stim.enable` is loaded and then never used, and metadata records `trial_exclusion: 'early_lick_only'`. Every condition in the authors' `getDefaultParams.m` carries `~stim.enable`, the paper treats photoinactivation as a separate experiment, and the AI's own Step 1 notes record that the reference 'commonly exclude stim.enable and early trials' — yet Step 10's reference-comparison table asserts 'Same base exclusion of early trials', so the omission is an undocumented oversight rather than a reasoned deviation. I measured the impact: 173 photoinactivation trials remain, concentrated in 5 sessions where ALM was optogenetically silenced (JEB15_2022-07-29 52/245 = 21% of the session, JEB6_2021-04-18 55/357 = 15%, JEB7_2021-04-29 39/284 = 14%, JEB7_2021-04-30 26, JGR3 1). This exactly accounts for the trial-count difference vs the reference (13,935 vs 13,762) and injects trials whose neural activity is experimentally perturbed into the decoder training set.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code faithfully implements the decision as the AI documented it (Key Decision 4 and metadata `trial_exclusion: 'early_lick_only'` mention only early-lick removal): `candidate_trials = np.flatnonzero(~early & np.isfinite(goCue))`, followed by the all-zero-neural mask. I confirmed on JEB6_2021-04-18 that 357 of 382 trials are kept, equal to the non-early trials, and that 55 of them are stim trials. The claim of equivalence to the reference in Step 10 is the inaccurate part, not the implementation of the stated rule."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical sources to the reference: obj.clu of the manifest-selected ALM probe(s), using each cluster's `quality`, `trial` (1-based) and `trialtm`, with `bp.ev.goCue` supplying the alignment. Two-probe manifest entries (e.g. JEB15 [1 2]) are concatenated into one population, as in the authors' loadSessionData. The v5 flat struct array and v7.3 per-probe cell array are both handled.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`selected_units` indexes `clu_probes[probe-1]` for each manifest probe and concatenates; I re-derived rates for JEB6 (manifest probe 2) directly from the HDF5 cluster arrays and matched the stored data exactly. Unit counts per session in conversion_full_out.txt are consistent with the selected probe's cluster count (e.g. JEB6 32 of 33 clusters pre-FR filter)."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Spike counts / bin width -> Hz, then a Gaussian smoothing, with no normalisation, baseline subtraction or z-scoring — the same representation as the reference (`trialdat`) and the human solution. The AI transcribes the authors' `mySmooth(x, 15, 'reflect')` literally, including the front-padding convention and the zeroing of the first half of the gausswin kernel that makes the filter causal; the human instead used a symmetric 14 ms Gaussian. Since the paper's own pipeline smooths causally, the AI's choice is at least as well justified; at 10 ms bins its effective kernel (sigma 2.8 samples = 28 ms, one-sided) is broader than the human's, which is a consequence of the bin-size choice rated in 2-e rather than a separate error.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Verified numerically: re-implementing the documented pipeline (10 ms histogram of trialtm - goCue, /DT, causal gausswin(15) with 15-sample front pad, trim) from the raw HDF5 file for JEB6_2021-04-18 reproduces all 357 x 29 x 500 stored values (np.allclose, max abs diff 7.6e-06). The MATLAB `trim = N+1` on 1-based indexing equals the Python `out[n:]`, and np.convolve 'same' with the half-zeroed kernel is genuinely causal, so the transcription is faithful. Smoothing is applied along the time axis (array transposed before/after)."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "BETTER",
+    "decision_correctness_justification": "The AI applies exactly the reference's curation: manifest ALM probe selection, the `findClusters.m` 'all' exclusion set {garbage, gabrga, noisy, real?} matched case-insensitively after stripping, then the paper's >1 Hz mean firing-rate cut ('all units with firing rates exceeding 1 Hz were included in all other analyses'), keeping multi-units. It also correctly resolved the lowFR=1 vs 0.5 discrepancy between WorkingWithDataObjs.m and getDefaultParams.m in favour of the methods text. The human reference additionally drops 'poor'-labelled units, which findClusters.m does not; I counted 267 'poor' clusters in a 12-session subsample, so this largely explains the 2,456 (AI) vs 1,954 (human) unit totals. The AI's count is markedly closer to the paper's reported recording totals (1,651 + 845 = 2,496; the AI's pre-1 Hz total is 2,513), so its filter is both more faithful to the reference code and better matched to the paper's statistics.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`matlab_quality_ok` strips and lower-cases before testing membership; the FR filter uses the mean of the smoothed rate over all kept trials and bins, mirroring removeLowFRClusters' mean over the PSTH. Independent recomputation on JEB6 reproduced both the pre-filter count (32) and the post-filter count (29) reported in the conversion log, and `keep_unit_idx` is used consistently to subset the region list."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the reference `alignSpikes.m` with `params.alignEvent = 'goCue'` and to the human solution: `trialtm - goCue[trial]`, a single subtraction, since trialtm is already on the behaviour clock relative to its own trial's start. Spikes outside the window and spikes of dropped trials are discarded; no interpolation or extra offset is applied to the neural stream.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`aligned = unit['trialtm'] - align_times[unit['trial'] - 1]` with `in_win = (aligned >= TMIN) & (aligned < TMAX)` and `bin_idx = floor((aligned - TMIN)/DT)` gives indices 0..499 with no off-by-one; the independent reconstruction from raw data matched bin-for-bin. The trial map correctly restricts spikes to kept trials."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI uses 10 ms bins over [-2.5, 2.5) s (500 bins) where the human uses the 5 ms of getDefaultParams.m (1000 bins); the window itself matches (params.tmin/tmax). The choice is explicitly reasoned and evidence-based: the AI grepped the reference code and found that `getDefaultParams.m` sets dt = 1/200 while the great majority of analysis/figure scripts (WorkingWithDataObjs.m, Figure 1/3/8, EDFigure 2/3, ParallelAnalysis, Behavior/*) set params.dt = 1/100, and that the paper's own choice/context decoders then aggregate to 75 ms bins. I confirmed those grep results against the reference code excerpts in the trajectory. Ten-millisecond bins are therefore equally defensible, and are still 7.5x finer than the paper's decoding bin; the cost is halved temporal resolution and a coarser effective smoothing kernel. One time grid is shared by all streams, and no rebinning/resampling of the neural data occurs.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "DT = 1/100 and the axis `np.arange(TMIN, TMAX+DT, DT)[:-1] + DT/2` yields exactly 500 centres from -2.495 to 2.495; verification_full_out.txt reports T = 500 for every session and input range [-2.5, 2.5]. metadata['time_bin_size'] = 10.0 matches. Spikes are histogrammed directly onto this grid with no intermediate binning."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time from go cue onset in seconds* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference: the input is not a raw variable but the centre of each bin of the go-cue-aligned window, i.e. the conversion's own time axis, defined over the paper's [-2.5, 2.5] s window. It is the single decoder input required by the task specification.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`build_time_axis()` returns the bin centres and `inp = time_axis[np.newaxis, :].astype(np.float32)` is stored as a (1, 500) array per trial; input_names = ['time_from_go_cue'] and the verifier reports input dimension 1 with range [-2.5, 2.5] for all 44 sessions."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time from go cue onset in seconds*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "None beyond constructing the bin-centre grid, exactly as in the human reference (and matching the reference code's `obj.time = edges + dt/2` convention in getSeq.m). The value is identical across trials and sessions, as it should be for a fixed alignment window.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The axis is built once per session from the module-level constants and copied per trial; the AI's own raw-data sanity check compared it with an independently constructed centred 10 ms grid (np.allclose, max diff 1.14e-07), which I consider consistent with the stored values I inspected in sample_data.pkl."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time from go cue onset in seconds* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "It is the neural binning grid itself: spike times relative to the go cue are assigned to bin floor((t - TMIN)/DT) of the same edges whose centres form the input, so bin k denotes the same interval in both streams, and the camera streams are interpolated onto the same centres. Identical in spirit and effect to the human solution.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`build_time_axis` and `bin_session_neural` both derive from `np.arange(TMIN, TMAX+DT, DT)`, so the centres and the histogram edges cannot drift apart; the camera interpolation targets `time_axis + ADVANCE_MOVEMENT` with ADVANCE_MOVEMENT = 0.0 (matching getDefaultParams). Sanity checks on the converted sample data show tongue visibility peaking 0.14-0.23 s after t = 0 and motion energy peaking ~0.4 s after t = 0, confirming no cross-stream misalignment."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `output` *Lick direction* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same raw fields as the reference (bp.R/bp.L plus bp.hit/bp.miss), with bp.no used explicitly to identify ignore trials. As the reference notes, the licked side is not recorded, so it must be reconstructed from instructed side x outcome; the AI states this explicitly (Key Decision 10: decode the actual lick side, not the instructed side).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "All five flags are loaded from both file formats and used in `lick_direction_value`. I reconstructed the labels directly from the raw HDF5 bp fields for all 357 kept trials of JEB6_2021-04-18 and they match the stored output channel exactly."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `output` *Lick direction*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Logically equivalent to the human reference: hit -> instructed side, miss -> opposite side, otherwise 'none'. The AI checks bp.no first and falls back to 'none' for any trial that is neither hit nor miss, which produces identical labels since the three flags are mutually exclusive. Class coding (left 0, right 1, none 2) and output_values match the task spec, and the per-trial value is broadcast over all 500 bins so the output is time-varying in shape, as the instructions prefer. Resulting distribution 0.423/0.444/0.134 vs the reference's 0.423/0.446/0.131 — the small difference is entirely attributable to the retained photostim trials.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Verified by independent recomputation from the raw file (exact array equality on 357 trials) and by the dataset-level distribution matching the reference to within 0.3%. `out[0, :] = value` correctly broadcasts, and OUTPUT_VALUES[0] = ['left','right','none'] matches the integer codes."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `output` *Behavioral context* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The single per-trial flag obj.bp.autowater, exactly as in the reference solution and as documented in the authors' own tutorial ('obj.bp.autowater=1 when water was delivered regardless of animal choice... can be used as a proxy for obtaining water-cued blocks and delayed-response blocks').",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`autowater` is read from both file formats and is the sole determinant of `context_value`. Independent recomputation on JEB6 matched exactly; the overall DR/WC split (0.901/0.099) matches the reference's (0.903/0.097)."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `output` *Behavioral context*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "A direct relabelling broadcast across bins. The AI codes DR = 0, WC = 1, the reverse of the human reference (WC = 0, DR = 1), but `output_values[1] = ['DR','WC']` matches its codes so the dataset is self-consistent and the task spec does not fix an ordering. Sessions with no water-cued block are correctly all-DR, which the AI flags in the notes.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`context_value` returns 1 iff autowater, `out[1, :]` broadcasts it, and OUTPUT_VALUES[1] is in the matching order, so the verifier's per-class report ('DR (0.901), WC (0.099)') is correctly labelled. Per-session ranges show [0,0] for the DR-only sessions, as expected."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `output` *Outcome* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "bp.miss and bp.hit, with everything else treated as an ignore — the same derivation as the human reference (which likewise does not need to read bp.no because the three flags are mutually exclusive). The AI loads bp.no as well and uses it only in the lick-direction logic.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`outcome_value` reads only hit/miss with an implicit ignore fallback; recomputation from the raw file for JEB6 matched all 357 trials, and the dataset-level distribution matches the reference."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `output` *Outcome*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical three-way relabelling and identical class codes to the reference and the task spec: miss -> incorrect (0), hit -> correct (1), otherwise ignore (2), broadcast across bins. Ignore trials are deliberately retained as a third class rather than dropped (as the paper does), which the instructions require. Distribution 0.121/0.746/0.134 vs the reference's 0.120/0.749/0.131.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Codes and OUTPUT_VALUES ordering agree; the ignore fraction equals the 'none' fraction of lick_direction in the verifier output (0.134 in both), which is the expected internal consistency check. Independent recomputation matched exactly."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Tongue velocity* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI uses the side camera's `tongue` marker only (obj.traj{1}, x/y columns), where the human reference combines the side `tongue` and the bottom `top_tongue` after per-view scaling. The side-view tongue is the canonical first entry in the authors' params.traj_features, and the reference code treats the two views as separate features rather than merging them, so a single-view choice is defensible; but it recovers less of the lick bout (I measured on JEB6_2021-04-18: side 11.3% of bins visible, bottom top_tongue 7.6%, union 12.7%), and the AI gives no justification for ignoring the second view. It relies on x/y already being NaN where tracking failed instead of applying an explicit likelihood cut; I verified on the raw files that isnan(x) is exactly likelihood <= 0.9, so this is equivalent to the reference's threshold.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`align_feature(raw, ..., 0, 'tongue')` reads view 0's featNames/ts/frameTimes and takes columns 0:2 of the named feature, with `get_feat_index` guarding against a missing name; the visibility mask is taken before any filling, as the decision states. The v7.3 ts tensor is transposed to (frames, 3, features) so both formats are indexed consistently."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Tongue velocity*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The processing chain follows the authors' kinematics code closely: interpolate x/y onto the analysis grid within contiguous tracked runs (findPosition.m), no smoothing for tongue features (the reference explicitly skips it), speed as the magnitude of the gradients of x and y with no baseline subtraction and no NaN filling (findVelocity.m applies those only to non-tongue features), and deliberate preservation of NaN so that invisibility can become its own class rather than the reference's velocity = 0 substitution. That last deviation is required by the decoder spec and is well argued in Key Decision 11. The human reference smooths the tongue position with a 5 ms Gaussian and differentiates against real frame times; the AI's unsmoothed, unit-spacing gradient is a monotone-equivalent speed for a per-session median split, so it is equally justified.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "np.gradient is a centred difference, so a NaN neighbour poisons the adjacent sample: the first and last bin of every contiguous run of visible tongue frames gets a NaN speed and is then labelled 'not visible' by discretize_visible_signal, contradicting the stated decision that class 2 means the tongue was not visible. I measured this on JEB6_2021-04-18 by running the AI's own align_feature/compute_speed: 11.34% of bins are visible but only 7.55% retain a finite speed, i.e. a third of the tracked tongue bins are mislabelled. This is a substantial part of why the dataset's tongue is 'not_visible' in 95.6% of bins versus 87.5% in the human reference, and it correspondingly shrinks the low/high classes to 2.2% each (reference: 6.2% each)."
+  },
+  "7-c": {
+    "question": "How is `output` *Tongue velocity* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Exactly the task specification and the same rule as the human reference: a per-session 50th-percentile threshold over the visible bins, class 0 below, class 1 at or above, class 2 where the tongue is not visible. The threshold is computed over all trials and bins of the session (not per trial) and is stored in metadata for inspection.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`discretize_visible_signal` computes np.nanpercentile(valid_vals, 50) over `visible & isfinite` samples and assigns 0/1/2 with no gaps or overlaps (high_mask is the complement of low_mask within the valid set), matching the spec's '< 50th' / '>= 50th' boundary. The thresholding logic itself is right; the population of bins it is applied to is affected by the defect noted in 7-b."
+  },
+  "7-d": {
+    "question": "How is `output` *Tongue velocity* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same as the reference and the human solution: a session-constant video offset from the bitcode pulse, vidshift = mode(sglx.bitcode.bitstart)/sglx.fs - mode(bp.ev.bitStart) (the authors' findVideoOffset.m), subtracted from frameTimes along with the trial's go cue, after which frames are placed on the shared 5 s / 500-bin grid. ADVANCE_MOVEMENT = 0.0 matches getDefaultParams.m. The AI resamples by linear interpolation onto bin centres (as the reference interp1 does) where the human averages frames within each bin — both are sound.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`find_video_offset` implements the mode-based formula (with a rounding-tolerant mode helper), and `align_feature` applies `frame_times - vidshift - align_times[tr_idx]`. Empirical alignment check on the converted sample data: tongue visibility across trials peaks at t = +0.23 s (JEB6) and +0.14 s (JEB23), i.e. just after the go cue, and is essentially zero during the delay — consistent with correct alignment and no sign error."
+  },
+  "8-a": {
+    "question": "What variables in the raw data is `output` *Paw velocity* derived from?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI uses both bottom-camera paw markers (top_paw and bottom_paw) and combines them; the human uses top_paw alone, arguing that bottom_paw drops out through the delay epoch. Both markers are listed in the authors' params.traj_features, so using both is defensible, and on the session I checked (JEB6_2021-04-18) bottom_paw was tracked in 98.6% of bins versus 94.9% for top_paw, so the human's reliability concern does not hold uniformly. The risk the AI does not discuss is that the two markers are different forepaws, so pooling them is a choice about what 'paw velocity' means rather than a noise-reduction step; combined with nearest-filling this drives the not-visible class down to 5.9% (reference 18.6%).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Both features are read from view 1 with per-feature visibility masks, and the code guards the all-missing case (`paw_speed[~paw_finite.any(axis=0)] = np.nan`) so a bin is only 'visible' if at least one marker was tracked, exactly as documented in Step 5."
+  },
+  "8-b": {
+    "question": "What processing is involved in computing `output` *Paw velocity*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "This is a faithful transcription of the reference non-tongue branch: interpolate positions onto the grid, nearest-fill missing coordinates, gradient, subtract the trial's baseline drift computed as median(diff(...)), nearest-fill the velocities, speed = hypot — including replicating the MATLAB quirk of using the x-component of basederiv for both axes. The two markers are then combined by an element-wise maximum, a reasonable summary of 'was a paw moving fast in this bin'. No cross-camera normalisation is needed since there is only one view, matching the human's reasoning.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`compute_speed` applies the baseline/fill branch only when 'tongue' is not in the feature name, matching findVelocity.m; NaN-safe guards prevent all-NaN slice errors. Because velocities are nearest-filled, no spurious NaN-edge loss occurs for the paw (unlike the tongue), so the visible mask and the finite-speed mask agree."
+  },
+  "8-c": {
+    "question": "How is `output` *Paw velocity* thresholded into categories?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical rule to the tongue and to the human reference, and exactly the task spec: per-session 50th percentile over visible bins, 0 below / 1 at-or-above / 2 not visible. The resulting near-balanced split (0.473/0.468/0.059) is what a median threshold should produce.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The same verified `discretize_visible_signal` is reused with the combined paw speed and the union visibility mask; the per-session threshold is stored in metadata['session_info'][i]['thresholds']['paw_velocity_median']."
+  },
+  "8-d": {
+    "question": "How is `output` *Paw velocity* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Identical to the tongue and to the human reference: the session video offset and the trial go cue are subtracted from the bottom camera's own frameTimes, and the result is placed on the shared 500-bin grid. Using each view's own frame times means the two cameras' frame counts need not agree, which is the same robustness the human reference builds in.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`align_feature(..., view_idx=1, ...)` reads `raw['traj'][1][tr_idx]['frameTimes']`, so paw features are timed by the bottom camera, not the side camera. The converted data shows the high-paw-velocity fraction rising around the go cue (peak at +0.12 s for JEB23), consistent with correct alignment."
+  },
+  "9-a": {
+    "question": "What variables in the raw data is `output` *Motion energy* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The standalone motionEnergy_<anm>_<date>.mat beside each session file — the same source as the human reference, and the one the authors' loadMotionEnergy.m uses — with the nested wrapper unwrapped recursively to reach the per-trial cell array, mirroring the reference's `if isstruct(me.data), me.data = me.data.data; end` guard. All 44 sessions have such a file, so no session loses motion energy.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The unwrap loop handles all three layouts present in the data (the AI's Step 10 notes record hitting the me.data.data variant), and a missing file degrades gracefully to class 2. One documentation/code gap: Step 4 said both the standalone file and the embedded obj.me would be normalised, but only the file path is implemented — this has no effect because the file exists for every included session, and the verifier shows motion energy present in all 44."
+  },
+  "9-b": {
+    "question": "What processing is involved in computing `output` *Motion energy*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "None beyond resampling, which is correct — the trace is already one scalar per frame after the paper's per-pixel differencing and 99th-percentile reduction, so there is nothing to smooth or differentiate. The AI interpolates onto the bin centres and nearest-fills the residual edge NaNs, a literal transcription of the reference's interp1 + fillmissing(...,'nearest'); the human instead leaves uncovered bins as NaN. Both are defensible; the AI's follows the reference code more closely, at the cost of fabricating values in the (few) edge bins with no frame coverage.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`interp_numeric` + `fill_nearest_1d` implement the documented behaviour; the AI independently re-derived the aligned, nearest-filled, median-thresholded motion energy for a trial of JEB24_2023-10-23 from the raw files and reported np.allclose. Note fill_nearest_1d does linear interpolation between finite indices rather than strict nearest, which is equivalent here because the NaNs are edge-only (flat extrapolation)."
+  },
+  "9-c": {
+    "question": "How is `output` *Motion energy* thresholded into categories?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Per-session 50th percentile with 0 below / 1 at-or-above, as specified, and the file's manually chosen moveThresh is correctly ignored in favour of the task's median split. The difference from the human is what class 2 means: because of the nearest-fill in 9-b, class 2 ('no_video') is never used, whereas the human reference marks 3.8% of bins as class 2 where no camera frame falls in the bin. The task labels this class 'no video' rather than 'not visible', so the AI's reading — reserve it for sessions with no motion-energy file — is a legitimate interpretation, and the resulting split (0.508/0.492) is properly balanced. The cost is that the third class is dead and the decoder's reported chance level for this output (1/3) is misleading.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`discretize_motion_energy` assigns 2 by default and overwrites with 0/1 on finite samples, and the missing-file path fills the whole session with 2; verification_full_out.txt confirms motion_energy has range [0, 1] in every session, consistent with the stated behaviour given that all files are present."
+  },
+  "9-d": {
+    "question": "How is `output` *Motion energy* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Same offset and same grid as the tracking, using the side camera's frame times because motion energy has one value per side-camera frame — identical to the human reference and to loadMotionEnergy.m. The AI additionally reproduces the reference's fallback for trials whose frameTimes are missing or NaN (synthetic 400 Hz times with a fixed 0.5 s shift), which is exactly the MATLAB catch branch.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "`align_motion_energy` indexes `raw['traj'][0]` for frame times and applies `frameTimes - vidshift - align_times[tr_idx]`; the fallback triggers on empty or non-finite frame times. Empirical check on converted data: the fraction of 'high' motion-energy bins peaks at +0.41 s (JEB6) and +0.44 s (JEB23) after the go cue and is low during the delay, the expected post-go-cue movement profile."
+  },
+  "10": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The same philosophy as the human reference — keep the trial, mark the gap — plus broader coverage of file-format defects. Trials flagged by NaN NdroppedFrames are skipped for kinematics and come out as 500 'not visible' bins (exactly the reference findPosition.m rule); absent frame times are replaced by synthetic 400 Hz times as the reference does; untracked frames keep their NaN for the tongue and are nearest-filled for the paw, following findVelocity.m; motion-energy edge NaNs are nearest-filled as in loadMotionEnergy.m; behavioural trials past the end of the recording are detected as all-zero neural matrices and dropped. Format-level defects (v7.3 vs v5, (n,1) vs (1,n) cells, missing obj.ex, char vs cell-ref probe.loc, site vs channel, nested me.data.data) are each handled explicitly and documented. Each feature is timed by its own camera, so mismatched frame counts between views are handled as in the human solution. Nothing is silently dropped and nothing is fabricated except the reference-sanctioned nearest fills.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "Each documented fallback exists in the code (the NdroppedFrames guard, the frameTimes synthesis in both align_feature and align_motion_energy, fill_nearest_1d for non-tongue features, the site/channel and probe_locs fallbacks, the me unwrap loop, the all-zero trial mask). The full run completed over all 44 sessions with 'Data format is valid, no errors or warnings', and no NaNs reach the output arrays (outputs are int64 categorical, inputs float32 finite)."
+  },
+  "11-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI measured and reported per-session timing (3.69 s/session, ~162 s total, in line with its 131 s sample-based estimate) and correctly concluded that no optimisation was needed against the instructions' 15-minute threshold. But it never identified which internal step dominates, despite the instructions asking for timing information to find bottlenecks: no per-step instrumentation exists, only a per-session wall clock. The true bottleneck is file reading — load_session_v73 dereferences one HDF5 cell per trial per field and materialises every DLC feature of both cameras — which is the same conclusion the human reference reaches and is equally irreducible, so the practical outcome is the same even though the diagnosis is missing.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The timing that is claimed is actually measured and printed (`time.perf_counter()` around each session, mean and extrapolated total at the end), and the reported 162 s total is consistent with the per-session figures in conversion_full_out.txt."
+  },
+  "11-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Leaving the remaining loops in place is a reasonable call — per-trial video loops are hard to vectorise because each trial has a different frame count (the human reference keeps the same loops for the same reason) and loading dominates the runtime anyway. However, the AI's own description overstates what it achieved ('Kept neural and video processing vectorized within trials wherever possible, with only session-level loops'): there are loops over units in bin_session_neural, over columns in smooth_causal_reflect, over trials in align_feature/compute_speed/align_motion_energy, and a Python-level `[t in trial_map for t in trial_idx]` membership test per unit. The spike counting in particular could have been a single histogram2d over all trials (as the human does), and the smoothing a single convolve1d. None of this affects correctness or materially affects runtime.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops that exist are functionally correct — verified by reproducing the neural output exactly — and per-trial work is genuinely vectorised inside each loop body. The mismatch is between the notes' description and the code's structure, not between the code and any implemented decision."
+  },
+  "11-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The human reference computes each session-level quantity once; the AI repeats a handful of cheap ones and documents none of this. find_video_offset(raw) is recomputed inside every align_feature call (tongue, top_paw, bottom_paw) and again in align_motion_energy — four times per session instead of once; parse_manifest_sessions() is re-run twice more inside print statements in main(); the bin grid is rebuilt per session and again inside bin_session_neural; and kinematics/motion energy are computed for all raw trials including the ones already excluded. Each of these is negligible next to file I/O (the offset is a mode over a few hundred values), so the practical effect is nil, but the question is not addressed in CONVERSION_NOTES.md at all. No file is read twice and no expensive computation is duplicated.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The repeated computations are deterministic and return the same value each time (mode_float over the same arrays, the same manifest parse), so the duplication costs time but cannot change results; the converted output is unaffected."
+  },
+  "11-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Comparable to the human reference, which also materialises unused fields while reading, but the AI does somewhat more of it and does not document any of it. The loader reads every DLC feature of both cameras for every trial although only tongue, top_paw and bottom_paw are used; it reads each cluster's whole-session spike times tm and its site/channel; it reads ev.sample, ev.delay, ev.reward, ev.lickL, ev.lickR and bp.L, none of which reach the output; moveThresh is parsed and unused; selected_units builds a per-unit region list that build_dataset then discards in favour of a hard-coded ['ALM']; and kinematics/motion energy are computed for trials that are later dropped. Since the per-trial HDF5 dereferencing of unused DLC features is the main runtime cost, this is the one place where trimming would actually have paid off. Everything computed after loading does end up in the pickle.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The unused work is inert: the discarded unit_regions list is consistent with the hard-coded ALM label (obj.ex.probe.loc reads 'R ALM' in the sessions I checked, and normalize_region maps it to 'ALM'), and the extra fields are simply never referenced. The output contains 2,456 ALM neurons with a single brain region, as reported."
+  }
+}

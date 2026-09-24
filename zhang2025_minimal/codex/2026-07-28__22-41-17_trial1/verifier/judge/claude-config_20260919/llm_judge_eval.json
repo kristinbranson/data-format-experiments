@@ -1,0 +1,226 @@
+{
+  "1-a": {
+    "question": "How are **all the data** for all subjects, sessions, and trials loaded in?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The AI bypasses the ONE API entirely and reads the cached ALF files directly, reconstructing each session path from bwm_release.csv (lab/Subjects/subject/date/NNN) and globbing alf/** with a 'take the lexicographically last revision folder' rule; the reference instead uses one.search/SessionLoader/SpikeSortingLoader. This does not match the reference, but it resolves to the same files (revision folders are named #YYYY-MM-DD# so max == latest, which is ONE's default), it is deterministic and network-free, and the AI validated it at release level: 459 sessions, 699 probes, 139 subjects and exactly 75,708 label>=1 units, all matching the data paper. It also loads the same dataset names the reference requires. The residual risk (hand-rolled revision resolution, no dataset hash check) is real but was checked against the paper's own totals, so the decision is equally well justified rather than worse.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "pick_latest/find_session_path/load_trials_table/load_good_units implement exactly the described direct-ALF loading, and the run log confirms 459/459 release sessions were visited with only 20 skipped for genuinely missing behavioural files."
+  },
+  "1-b": {
+    "question": "How are the data split into subjects (mice)?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Subject identity is taken verbatim from the release table's `subject` column, exactly as the reference takes it from one.search details; nothing is parsed out of paths. subjects/subject_idx are built per session in the required format. The only difference is ordering (first-encounter vs sorted), which is immaterial since subject_idx indexes the list it was built from. 135 subjects, identical to the reference's 135.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The subject_to_idx dict and subject_idx array implement the stated scheme; the delivered file reports nsubjects=135 with subject_idx of length 438."
+  },
+  "1-c": {
+    "question": "How are the data split into sessions?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "A session is the eid, as in the reference. The AI groups the per-probe rows of bwm_release.csv by eid (collapsing the 1-2 insertions of a session into one probe_name tuple) and treats each as one session, which is the same unit the release is organised by. Verified against the paper: 699 probe rows -> 459 sessions.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "groupby('eid') with probe_name aggregated as a sorted tuple, then one iteration per row; the merged probes are pooled downstream, matching the stated per-session unit."
+  },
+  "1-d": {
+    "question": "How are the data split into trials?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The trials table has one row per trial, so the split is given by the data; the AI uses those rows directly and defines each trial's window as stimOn_times + (-0.5, 1.5) s, identical to the reference.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "trials rows drive the mask, the intervals array and all per-trial indexing; the delivered dataset has 186,245 trials, close to the reference's 188,740."
+  },
+  "1-e": {
+    "question": "How are trials filtered based on quality controls?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The AI reproduces the reference repo's own mask exactly as prepare_data calls it (load_trials_and_mask with min_rt=0.08, max_rt=2.0, max_trial_len=10.0, exclude_nochoice=True, exclude_unbiased=False, default nan_exclude list), and adds the same wheel/camera window-coverage requirement the expert uses, plus the <2-trial session drop. It is if anything a closer match to the provided code than the expert's version, which omits max_trial_len and the feedbackType/feedback_times NaN checks. The one extra filter - dropping trials in which the whole population is silent for 2 s - is not in the reference and was introduced to silence validator warnings rather than on scientific grounds, but it affects a handful of trials and is documented. Resulting counts (438 sessions / 186,245 trials vs 441 / 188,740) are very close to the expert's.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "make_trial_mask implements every listed criterion (NaN comparisons correctly evaluate False and drop the trial), and final_mask = trial_mask & wheel_valid & whisker_valid & neural_valid plus the two <2-trial guards implement the rest; skip_reasons in the run log (20 missing-file, 1 too-few-trials) match the documented exclusions."
+  },
+  "2-a": {
+    "question": "What variables in the raw data is the `neural` data derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "spikes.times.npy and spikes.clusters.npy are the only sources of the binned array, with clusters.metrics.pqt (label) for QC and clusters.channels/channels.brainLocationIds_ccf_2017 for anatomy - the same information the reference gets from SpikeSortingLoader.load_spike_sorting + merge_clusters, just read from disk instead of through the loader.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "load_good_units loads exactly those arrays and passes only spike times/clusters into bin_spikes; the region labels it derives reproduce the reference's region counts (root 10,028, x 45, y 6 identical)."
+  },
+  "2-b": {
+    "question": "How is the `neural` data processed?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Probe merging (contiguous renumbering with an offset, concatenate, stable sort by time), 20 ms binning with a single bincount over a flattened unit-by-bin index, and no smoothing all match the reference. Two deviations: the array is left as raw spike counts rather than divided by the bin width to give Hz, and it is stored as float16 rather than float32. Counts vs rates is a constant rescaling that the decoder is indifferent to, and float16 represents small integer counts exactly (max observed 5 per bin), so neither is wrong - but neither is documented, and metadata carries no units field, so a reader cannot tell counts from rates. Equally justified, not better.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The renumbering/offset/merge/sort and the bincount implement the described pooling and binning; the delivered neural arrays are float16 with small integer values, consistent with 'spike counts, not divided by bin width'."
+  },
+  "2-c": {
+    "question": "How is the `neural` data filtered based on quality controls?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The main criterion - clusters.metrics.label >= 1.0, the data paper's stringent QC - matches the expert exactly, and the AI verified it reproduces the paper's 75,708 well-isolated units across all 699 probes. It differs by deliberately keeping units whose Beryl acronym is `void`, which the expert drops on the grounds that a void channel was placed outside the brain; 250 such units (0.34% of 72,757) survive, and the AI's region list has 2 extra entries vs the reference's 264. The AI documents the choice and argues it preserves release-level accounting for a pooled-population decoder, and the reference code itself does not drop void at load time, so it is defensible - but it is a small step away from the better-justified expert choice.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "good_mask = label >= 1.0 is the only cluster filter, matching the stated decision, and the delivered dataset does contain a 'void' region with 250 neurons exactly as the notes predict."
+  },
+  "2-d": {
+    "question": "How is the per-trial `neural` data aligned to the event described in the `instructions`?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "All IBL streams share one session clock, so alignment is a subtraction of the window start (stimOn_times - 0.5) from the spike times, putting stimulus onset at bin 25 of 100 - the same as the reference. The only quibble is that stim_on, intervals and spike_times are cast to float32, which quantises absolute times to ~1 ms late in a long session; that is far below the 20 ms bin and does not change the alignment.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "bin_spikes subtracts `start` (= stimOn - 0.5) before flooring into bins; the delivered data confirms it - the population firing rate rises at bin ~28-30, i.e. 60-100 ms after stimulus onset at bin 25, exactly as expected."
+  },
+  "2-e": {
+    "question": "What is the temporal resolution (time bin size) of the converted data? Is any temporal rebinning applied?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "20 ms bins, 100 bins over a 2 s window, identical for every trial and session, with no rebinning, resampling or smoothing of the neural data - exactly the reference configuration and the method paper's '2-s trials, each divided into 20-ms bins, producing T = 100 time steps'. metadata['time_bin_size'] = 20.0 ms.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "BIN_SIZE_S=0.02, NBINS=100 are used consistently for binning and for the metadata field; the verify stats report T_min = T_max = 100 for all 438 sessions."
+  },
+  "3-a": {
+    "question": "What variables in the raw data is `input` *Time since stimulus onset* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Derived from the fixed window around trials.stimOn_times, so a single constant 100-element vector serves every trial, as in the reference. The AI labels each bin by its end time (-0.48 .. 1.50) rather than its centre (-0.49 .. 1.49); this is a 10 ms convention difference, documented in metadata as 'bin end times relative to stimulus onset', and equally defensible.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "time_input = WINDOW[0] + BIN*arange(1, 101) produces exactly the documented bin-end grid, and the delivered input_range for this variable is [-0.48, 1.50]."
+  },
+  "3-b": {
+    "question": "What processing is involved in computing `input` *Time since stimulus onset*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "None - the vector is constructed analytically from the window and bin size and stacked into row 0 of each trial's (2,100) float32 input, exactly as the reference does with its bin centres.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The vstack of time_input with the broadcast trial number produces the (2,100) float32 input array the format requires."
+  },
+  "3-c": {
+    "question": "How is the `input` *Time since stimulus onset* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "It is the neural binning grid itself, index for index: neural bin j covers [stimOn-0.5+0.02j, stimOn-0.5+0.02(j+1)) and the time input at j is its right edge, so the two describe the same instant to within half a bin. Same approach as the reference (which uses centres).",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The same WINDOW/BIN constants generate both the spike bin index and the time row, so the correspondence is exact; this row is unaffected by the coordinate-origin bug that damages the behavioural rows."
+  },
+  "4-a": {
+    "question": "What variables in the raw data is `input` *Trial number in block* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "From trials.probabilityLeft, with a block boundary detected as a change of value between consecutive rows - the trials table carries no block id, so this is the same recovery the reference performs.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "compute_trial_number_in_block is called on the probabilityLeft column and nothing else feeds the value."
+  },
+  "4-b": {
+    "question": "What processing is involved in computing `input` *Trial number in block*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "A counter that resets at every change of probabilityLeft, computed over the full unfiltered trials table and only then indexed by the surviving trials - so a QC-rejected trial still advances the count and the number is the animal's true position in the block, which is exactly the reference's reasoning. The count is 1-based (1..99) where the reference is 0-based (0..98); an offset of one in a continuous decoder input is immaterial.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loop implements the stated reset rule, it is applied to trials['probabilityLeft'] before any masking, and the result is subset with selected_idx; the delivered input_range is [1.0, 99.0], consistent with 1-based counting over unfiltered trials."
+  },
+  "5-a": {
+    "question": "What variables in the raw data is `output` *Choice* derived from?",
+    "decision_correctness": "INCORRECT",
+    "decision_correctness_justification": "The source column (trials.choice) and the dropping of no-response (0) trials are right, but the sign convention is inverted. The AI maps IBL choice == -1 to 0/'left' and +1 to 1/'right'. ibllib's own code says the opposite: brainbox/behavior/training.py computes `rightward = trials.choice == -1` against a signed contrast defined as contrastRight - contrastLeft, and comments explicitly '# choice == -1 means contrast on right hand side'. The expert reference uses {1.0: 0 (left), -1.0: 1 (right)} accordingly. The delivered class fractions are the exact mirror of the reference's (0.4914/0.5086 vs 0.5075/0.4925), confirming the flip. Balanced accuracy is unaffected by a binary relabel, but every 'left'/'right' label in output_values is wrong, which would silently invert any interpretation of the decoder's predictions. Nothing in the notes or trajectory shows the convention being checked against ibllib or against feedbackType/contrastLeft.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "map_choice implements precisely the (incorrect) mapping documented in CONVERSION_NOTES.md §9 - '-1 -> left -> 0, +1 -> right -> 1' - and raises on any other value, so the code faithfully executes the decision the AI stated."
+  },
+  "5-b": {
+    "question": "What processing is involved in computing `output` *Choice*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Beyond the recoding (whose polarity error is scored in 5-a), there is no further processing: no-response trials are removed by the mask and the per-trial scalar is broadcast across all 100 bins so that all four outputs share one (4,100) int8 array. That matches the reference, and broadcasting is the format's preferred 'make it time-varying if at all possible'.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "np.full((1, NBINS), choice, dtype=np.int8) stacked into the output array implements exactly the stated broadcast, with no other transformation applied."
+  },
+  "6-a": {
+    "question": "What variables in the raw data is `output` *Prior probability of left* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "trials.probabilityLeft recoded 0.2->0, 0.5->1, 0.8->2, exactly as the instructions specify and as the reference does. Rounding to one decimal before comparison is a sensible guard against the float32 cast, and unexpected values raise rather than being coerced.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "map_probability_left implements the mapping with a hard failure on unknown values; the delivered output_range is [0,2] and the class fractions (0.4188/0.1406/0.4407) match the reference's (0.4180/0.1405/0.4415) to within the small difference in retained sessions."
+  },
+  "6-b": {
+    "question": "What processing is involved in computing `output` *Prior probability of left*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "None beyond the recoding. The unbiased 0.5 block is retained, matching the reference code's exclude_unbiased=False default and the expert's PRIOR mapping which also keeps 0.5; the value is broadcast constant over the 100 bins as int8, as for choice.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "No filter on probabilityLeft == 0.5 exists anywhere in the mask, metadata records 'exclude_unbiased_block': False, and the delivered minority-class fraction of 14.1% confirms the unbiased block is present."
+  },
+  "7-a": {
+    "question": "What variables in the raw data is `output` *Wheel speed* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The raw encoder arrays _ibl_wheel.timestamps.npy and _ibl_wheel.position.npy, turned into a velocity and then a speed via np.abs - the same derivation the reference obtains through SessionLoader.load_wheel.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "load_wheel_speed loads exactly those two arrays, checks their lengths match, and returns np.abs(velocity) with its time base."
+  },
+  "7-b": {
+    "question": "What processing is involved in computing `output` *Wheel speed*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The signal derivation is identical to the reference: interpolate_position(freq=1000) then velocity_filtered(fs=1000, corner_frequency=20, order=8) - the exact ibllib functions and the exact defaults SessionLoader.load_wheel uses - followed by np.abs to get speed in rad/s, then resampling onto the trial's 100-bin grid and tertile discretisation. The AI read the ibllib source specifically to match this rather than approximate it.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The resampling step does not implement the stated decision. In interpolate_behavior_into_trials the sample times are made relative to the window start (rel_t = t - beg, spanning 0..2 s) while the query grid x_interp is relative to stimulus onset (-0.48..1.50 s). The two origins differ by 0.5 s, so bins 0-24 fall before the data and np.interp clamps them to the first sample, and bins 25-99 return the trace 0.5 s earlier than the matching neural bin. Verified on the delivered /app/converted_data.pkl: in every session inspected 100% of trials have an identical wheel class across bins 0-24, and the trial-averaged wheel speed rises ~0.5 s after the population firing rate does. The wheel signal itself is computed correctly; the per-trial extraction of it is not."
+  },
+  "7-c": {
+    "question": "How is `output` *Wheel speed* thresholded into categories?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "np.digitize at the 1/3 and 2/3 quantiles, but computed globally over all bins of all 438 sessions rather than per session as the reference does. For wheel speed this is defensible: the trace is in rad/s, a physically calibrated unit comparable across rigs, so one global pair of thresholds (0.0076, 0.1741 rad/s) carries a consistent meaning everywhere, the global classes are exactly balanced, and the per-session balance stays reasonable (e.g. 0.39/0.31/0.31, 0.23/0.37/0.40). The AI's stated reasons - preserve rank information, avoid session-specific label drift - are sound for this variable. It is a different, roughly equally justified choice, not a better one, since per-session splits guarantee balance for every session's decoder.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "wheel_pool accumulates every retained bin, np.quantile([1/3, 2/3]) is taken once over the concatenation, and digitize_tertiles applies those two thresholds to every trial; the thresholds are recorded in metadata and the delivered global fractions are 0.3333/0.3333/0.3333 as intended."
+  },
+  "7-d": {
+    "question": "How is `output` *Wheel speed* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The stated decision is the reference's: every stream is on one session clock, so the wheel trace is simply evaluated at the same per-trial 100-bin positions as the spikes, giving a shared time axis bin for bin. As a decision that is correct; the failure is in execution (see code_correctness), and there is no sign the AI intended any offset.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The delivered alignment is wrong by 500 ms. Because interpolate_behavior_into_trials queries an onset-relative grid against window-relative sample times, wheel row bin j holds the speed at stimOn - 1.0 + 0.02(j+1) instead of stimOn - 0.5 + 0.02(j+1), and the first 25 bins are a flat clamp rather than data. Confirmed directly on /app/converted_data.pkl across sessions 0, 100, 300 and 437: wheel class constant over bins 0-24 in 100% of trials, and the movement onset appearing at bin ~55 instead of bin ~30. This is the most consequential defect in the conversion: two of the four decoder targets are misaligned with the neural data they are supposed to be decoded from."
+  },
+  "8-a": {
+    "question": "What variables in the raw data is `output` *Whisker motion energy* derived from?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The released <view>Camera.ROIMotionEnergy.npy with _ibl_<view>Camera.times.npy, left camera preferred and right as fallback - the same policy as the reference and as bin_behaviors in the provided code, which tries left-whisker-motion-energy then right. The AI further reproduces SessionLoader._check_video_timestamps exactly (trim leading timestamps when they outnumber frames, treat shorter timestamps as unusable), and documents that the fallback retains 6 sessions.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "_load_camera_stream's length handling is line-for-line equivalent to _check_video_timestamps, and load_whisker_motion_energy tries left then right; the per-session 'whisker_view' recorded in metadata shows the fallback firing for exactly the 6 documented sessions."
+  },
+  "8-b": {
+    "question": "What processing is involved in computing `output` *Whisker motion energy*?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "The released trace is used as-is with no filtering or normalisation, resampled onto the trial grid and then discretised - the same decision as the reference, and consistent with the method paper treating IBL's ROI motion energy as the target signal. NaN-containing windows are dropped rather than imputed.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "The whisker trace goes through the same interpolate_behavior_into_trials as the wheel and inherits the identical coordinate-origin defect: bins 0-24 clamped to a single value (100% of trials in every delivered session checked) and bins 25-99 shifted 0.5 s early relative to the neural bins. The 'resample onto the trial's bin grid' half of the stated processing is therefore not what the code does."
+  },
+  "8-c": {
+    "question": "How is `output` *Whisker motion energy* thresholded into categories?",
+    "decision_correctness": "CONCERNING",
+    "decision_correctness_justification": "The same global tertiles are applied to whisker motion energy, but unlike wheel speed this signal is in arbitrary, camera- and rig-dependent units (mean absolute inter-frame difference over a bounding box), and 6 sessions use the right camera, which is half resolution at a different frame rate. One global pair of thresholds (2.052, 6.332) therefore means different things in different sessions, and the delivered dataset shows the consequence: per-session class fractions such as 0.608/0.391/0.001 (session 100) and 0.939/0.061/0.000 (session 437), i.e. whole sessions containing essentially none of the 'high' class, where the reference's per-session percentiles give every session 1/3-1/3-1/3. This is not flatly wrong - it is a documented choice and rank information is preserved - but it destroys within-session class balance and makes part of the target predictable from session identity rather than from within-trial neural dynamics, which plausibly explains why the AI's whisker balanced accuracy (0.654) exceeds the reference's (0.585) while its wheel accuracy (0.595) is slightly below. A human should check this.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "whisker_pool/np.quantile/digitize_tertiles implement the global-tertile method exactly as described in CONVERSION_NOTES.md §10, and the thresholds are recorded in metadata."
+  },
+  "8-d": {
+    "question": "How is `output` *Whisker motion energy* aligned with the neural data?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Stated decision matches the reference: camera frame times are on the same session clock as the spikes, so the trace is evaluated at the same per-trial bin positions and the two share a time axis bin for bin.",
+    "code_correctness": "INCORRECT",
+    "code_correctness_justification": "Same defect as 7-d, since the same helper is used: whisker row bin j holds the motion energy at stimOn - 1.0 + 0.02(j+1), 0.5 s before neural bin j, with bins 0-24 clamped to a constant. Verified on the delivered pickle - whisker class constant over bins 0-24 in 100% of trials in sessions 0, 100, 300 and 437, and the trial-averaged whisker trace rising ~0.5 s after the neural response."
+  },
+  "9": {
+    "question": "How are minor mistakes in the data, e.g. missing data, handled?",
+    "decision_correctness": "MATCH",
+    "decision_correctness_justification": "Like the reference, bad data is dropped at the finest granularity available rather than patched: missing files skip the session (20 of them, all enumerated in the notes), a session with no good unit or fewer than 2 usable trials is skipped (1), trials with NaN in any required event or in the behavioural window are dropped, trials whose wheel/camera coverage does not reach both window edges to within one bin are dropped, and unexpected choice/probabilityLeft values raise instead of being coerced. The camera timestamp-length fix replicates ibllib's own repair. The AI also reconciles the resulting 438 sessions against the method paper's 433 and explains the difference. The blanket `except Exception` around a whole session is the one loose end - it would convert a genuine bug into a silent session drop - but it prints the exception type and tallies it in skip_reasons, and the tally came out empty, so nothing was hidden in this run.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The FileNotFoundError/Exception handlers, the None-returning branches of interpolate_behavior_into_trials, the two <2-trial guards and the no_good_units guard all implement the described behaviour, and the run log's skip_reasons ({missing_required_file: 20, too_few_trials_after_stream_alignment: 1}) matches the notes exactly."
+  },
+  "10-a": {
+    "question": "What are the most time-consuming steps of the code?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The cost profile is the same as the reference's - reading the two large spike arrays per probe dominates, followed by the stable argsort that merges probes and the per-trial binning/interpolation loops - so the AI's code is structured around the same bottleneck. It differs in running all 459 sessions serially in one process where the reference uses a 10-worker ProcessPoolExecutor, which is why the conversion took 1000 s; sessions are trivially independent here, so the parallelism was available and unused. The AI never analysed this (it only watched wall-clock progress), and it additionally re-ran the entire 1000 s conversion a second time purely to capture a console transcript. Acceptable but clearly leaves the easiest speed-up on the table.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The code does what is described - single-process, one session at a time, with spike-file I/O and the per-trial loops as the hot path - and the 1000 s figure in conversion_full_out.txt is consistent with that."
+  },
+  "10-b": {
+    "question": "What loops in the code could have been vectorized to improve efficiency?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "bin_spikes and interpolate_behavior_into_trials loop over trials exactly as the reference does, and the reference explicitly judges that not worth vectorising, so those match. build_output_trials adds a third per-trial loop that could have digitised each session's traces once as an array. The one genuinely gratuitous case is compute_trial_number_in_block, a pure-Python scalar loop over every trial of every session where the reference does the same thing in two vectorised pandas expressions ((p != p.shift()).cumsum() then groupby.cumcount()). The cost is small relative to spike I/O, so this is a minor quality difference rather than a wrong decision.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "The loops are present as described and produce correct results; compute_trial_number_in_block's scalar loop yields the documented 1-based reset-on-change counter (delivered range 1..99)."
+  },
+  "10-c": {
+    "question": "What processing does the code repeat multiple times?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "The reference answers N/A here; the AI's code does repeat a handful of cheap operations the reference does not - digitize_tertiles called per trial instead of once per session, the constant time/x_interp grids rebuilt per session and per call, the constant choice/prior rows rebuilt per trial, pick_latest re-globbing alf/** once per dataset, and the behavioural traces materialised twice (in records and again concatenated into wheel_pool/whisker_pool). None affects correctness and all are small against spike I/O, but they are avoidable and undocumented.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "These repetitions are literally what the code does; they produce the same values each time, so no result is affected."
+  },
+  "10-d": {
+    "question": "What unnecessary processing does the code do that is discarded in downstream analyses?",
+    "decision_correctness": "OK",
+    "decision_correctness_justification": "Where the reference answers N/A, the AI's pipeline does discard real work. It bins spikes and interpolates both behavioural streams for every trial in the table and only afterwards selects the survivors, so roughly a quarter to a third of the per-trial bincount/interp/float16 work is thrown away - the reference masks first and bins only kept trials. Separately, the global-tertile decision forces full-precision continuous wheel and whisker traces for all 186,245 trials to be held in memory for the entire run (and duplicated into the pooling lists) only to be reduced to int8 and discarded at the end. Minor extras: the neural_valid full scan over every binned trial, and a large metadata block the decoder never reads. All of this is wasteful rather than incorrect, and the peak memory is tolerable on the machine used, but it is a step down from the reference's per-session streaming.",
+    "code_correctness": "CORRECT",
+    "code_correctness_justification": "bin_spikes/interpolate_behavior_into_trials are demonstrably called on the full intervals array before selected_idx is applied, and wheel_cont/whisker_cont plus wheel_pool/whisker_pool are retained across all sessions until the final np.quantile - exactly the discarded work described."
+  }
+}
